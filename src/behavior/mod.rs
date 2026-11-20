@@ -4,6 +4,7 @@ pub mod fx;
 pub mod lines;
 pub mod play;
 mod memo;
+mod emotion;
 pub mod beat;
 pub mod dance;
 
@@ -238,6 +239,8 @@ pub struct Behavior {
     /// 新互动（behavior/play.rs）
     play: play::Play,
     memo: memo::MemoUi,
+    /// 情绪表情 + 长期记忆（behavior/emotion.rs）
+    mind: emotion::MindUi,
 }
 
 impl Behavior {
@@ -314,6 +317,7 @@ impl Behavior {
             outfits,
             play: play::Play::default(),
             memo: memo::MemoUi::default(),
+            mind: emotion::MindUi::default(),
         };
         b.mood_cls = b.stats.mood();
         b.next_blink = b.now + rand(2500.0, 6000.0) as u64;
@@ -355,6 +359,7 @@ impl Behavior {
             AppEvent::ChatCancel => self.close_chat(),
             AppEvent::ChatReply(r) => self.on_chat_reply(r),
             AppEvent::Speech { token, audio } => {
+                self.emotion_speech(token, audio.is_some());
                 if token != self.voice_req || token == 0 { return self.flush(out); }
                 let Some(a) = audio else { return self.flush(out) };
                 let same = self.bubble.as_ref().is_some_and(|b| b.token == token) && self.bubble_fade.on;
@@ -369,6 +374,7 @@ impl Behavior {
                 if let Some(b) = &mut self.bubble { b.hide_at = Some(now + 60_000); }
             }
             AppEvent::AudioDone { token } => {
+                self.emotion_audio_done(token);
                 let tail = self.memo.bubble_tail(token, now);
                 if self.voice_playing == Some(token) {
                     self.voice_playing = None;
@@ -411,6 +417,7 @@ impl Behavior {
             AppEvent::ClimbFailed => self.on_climb_failed(),
             AppEvent::PerchLost => self.on_perch_lost(),
             AppEvent::Memo(m) => self.on_memo(m),
+            AppEvent::Mind(m) => self.on_mind(m),
         }
         self.sync_play();
         self.build_scene();
@@ -624,6 +631,7 @@ impl Behavior {
         } else {
             self.tick_play();
         }
+        self.tick_mind();
     }
 
     // ============================================================ 基本动作
@@ -1157,6 +1165,7 @@ impl Behavior {
                 self.say(&pick(if on { lines::MOYU_ON } else { lines::MOYU_OFF }), 2600);
             }
             MenuAction::Memo(m) => self.on_memo_menu(m),
+            MenuAction::Mind(m) => self.on_mind_menu(m),
             MenuAction::ForgetChat => {
                 if self.io { crate::services::ai::clear_history(); }
                 self.play(Shot::Shake);
@@ -1234,6 +1243,8 @@ impl Behavior {
             return self.drink_honey();
         }
         // 「提醒我…」「记一下…」「我有什么待办」
+        // 「记住…」「忘掉…」「你记得我什么」
+        if self.mind_chat(&text) { return; }
         if self.memo_chat(&text) { return; }
         self.waiting = true;
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(false)));
@@ -1252,12 +1263,15 @@ impl Behavior {
     }
 
     fn on_chat_reply(&mut self, r: ChatReply) {
+        // 去掉情绪标签（气泡和 TTS 只拿干净文字）
+        let (r, emo) = self.emotion_split(r);
         self.waiting = false;
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(true)));
         if r.ok {
             self.act(Act::Chat);
             self.play(Shot::Bounce);
             self.set_state(St::Happy, None);
+            self.emotion_face(emo);
         } else {
             self.play(Shot::Shake);
             self.set_state(if r.need_key { St::Sit } else { St::Drag }, None);
@@ -1266,6 +1280,8 @@ impl Behavior {
         let ms = (2500 + r.text.encode_utf16().count() as u64 * 150).min(20_000);
         self.say_opts(&r.text, ms, true, if r.ok { SpeakKind::Chat } else { SpeakKind::Line });
         self.hold_timer(2500, StateAct::ChatIdle);
+        self.emotion_hold(emo);
+        self.mind_after_reply(r.ok);
     }
 
     // ============================================================ 提醒 / 番茄钟 / 摸鱼
