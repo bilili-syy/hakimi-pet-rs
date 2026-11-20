@@ -2,6 +2,7 @@
 //! 公开函数签名是约定，别改名改参数；内部实现随意。
 pub mod config;
 pub mod log;
+pub mod memo;
 pub mod paths;
 pub mod save;
 pub mod stats;

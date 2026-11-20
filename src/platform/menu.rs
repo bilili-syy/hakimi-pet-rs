@@ -139,6 +139,8 @@ pub fn init() {
         &item("center", "📍 叫她到屏幕中间"),
         &item("quit", "退出"),
     ]);
+    // 「📝 备忘录」子菜单插在换装后面
+    super::memo_menu::init(&root, costume_sub.id());
 
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(root.clone()))
@@ -215,6 +217,7 @@ pub fn refresh() {
             let _ = t.set_tooltip(Some(if running { "哈基米 · 番茄钟进行中" } else { "哈基米" }));
         }
     });
+    super::memo_menu::refresh(POPUP_OPEN.with(|p| p.get()));
 }
 
 /// 在光标处弹出右键菜单（模态，返回时点击已进队列）
@@ -233,6 +236,7 @@ pub fn popup() {
 
 /// 删除托盘图标（退出时）
 pub fn shutdown() {
+    super::memo_menu::shutdown();
     MENUS.with(|m| {
         if let Ok(mut g) = m.try_borrow_mut() {
             *g = None;
@@ -292,7 +296,9 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
         "center" => A::CallToCenter,
         "quit" => A::Quit,
         _ => {
-            if let Some(m) = id.strip_prefix("pomo:") {
+            if let Some(a) = super::memo_menu::parse(id) {
+                a
+            } else if let Some(m) = id.strip_prefix("pomo:") {
                 A::PomodoroStart(m.parse().ok()?)
             } else if let Some(c) = id.strip_prefix("costume:") {
                 A::Costume(c.to_string())
