@@ -54,6 +54,8 @@ pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
     history.push(json!({ "role": "user", "text": user_text, "t": now_ms() }));
     let start = history.len().saturating_sub(MAX_HISTORY);
     let system = persona(&c, ctx);
+    // 角色包的 persona 追加在末尾（内置哈基米原样）
+    let system = crate::core::skin::with_persona(system);
     let r = if c.provider == "openai" {
         call_openai(&c, &system, &history[start..])
     } else {

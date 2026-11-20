@@ -113,6 +113,8 @@ fn cache_dir() -> PathBuf { crate::core::paths::tts_cache_dir() }
 
 /// 内置 → 缓存（命中缓存会更新修改时间，LRU）
 pub fn read_cache(t: &TtsConfig, text: &str, mood: Option<VoiceMood>) -> Option<Vec<u8>> {
+    // 角色包的 voiceDir（文件名规则同内置台词）优先；放不出来的格式跳过
+    if let Some(b) = crate::core::skin::voice_line(text).filter(|b| super::audio::can_decode(b)) { return Some(b); }
     if let Some(b) = bundled(t, text).filter(|_| bundled_playable()) { return Some(b.to_vec()); }
     for k in [cache_key(t, text, mood), text_key(t, text)] {
         let file = cache_dir().join(format!("{k}.wav"));
