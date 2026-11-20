@@ -12,7 +12,7 @@ pub const COSTUMES: [(&str, &str); 4] =
     [("", "🤍 原装卫衣"), ("xmas", "🎄 圣诞小红裙"), ("maid", "🎀 女仆装"), ("jk", "🏫 JK 水手服")];
 pub const OUTFITS: [(&str, &str); 3] = [("santa", "🎅 圣诞帽"), ("glasses", "👓 圆眼镜"), ("scarf", "🧣 四色围巾")];
 /// 番茄钟项在顶层菜单里的位置
-const POMO_POS: usize = 10;
+const POMO_POS: usize = 15;
 /// 托盘左键单击的伪菜单 id
 pub const TRAY_LEFT: &str = "tray:left";
 
@@ -124,15 +124,20 @@ pub fn init() {
 
     let _ = root.append_items(&[
         &item("chat", "💬 和哈基米聊天"),
-        &item("feed", "🐟 喂小鱼干"),
-        &item("pat", "✋ 摸摸头"),
+        &item("feed", "🐟 扔小鱼干（拖到她嘴边也行）"),
+        &item("feednow", "🍽️ 直接喂到嘴里"),
+        &item("pat", "✋ 摸摸头（滚轮也能撸）"),
         &item("honey", "🍯 喂蜂蜜水（喝完跑得飞快）"),
+        &item("game", "🪶 小游戏：逗猫棒"),
         &item("song", "🎵 哈基米之歌"),
         &item("songdir", "📂 放歌的文件夹（把歌拖进去）"),
         &item("status", "📊 看看状态"),
+        &item("checkin", "📅 今日签到"),
+        &item("weather", "🌦️ 天气播报"),
         &sep(),
         &item("sleep", "💤 去睡觉"),
         &item("walk", "🚶 去溜达"),
+        &item("climb", "🧗 爬到当前窗口上"),
         &pomo_sub, // POMO_POS
         &costume_sub,
         &dance_sub,
@@ -142,6 +147,8 @@ pub fn init() {
         &item("center", "📍 叫她到屏幕中间"),
         &item("quit", "退出"),
     ]);
+    // 「📝 备忘录」子菜单插在换装后面
+    super::memo_menu::init(&root, costume_sub.id());
 
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(root.clone()))
@@ -218,6 +225,7 @@ pub fn refresh() {
             let _ = t.set_tooltip(Some(if running { "哈基米 · 番茄钟进行中" } else { "哈基米" }));
         }
     });
+    super::memo_menu::refresh(POPUP_OPEN.with(|p| p.get()));
 }
 
 /// 在光标处弹出右键菜单（模态，返回时点击已进队列）
@@ -236,6 +244,7 @@ pub fn popup() {
 
 /// 删除托盘图标（退出时）
 pub fn shutdown() {
+    super::memo_menu::shutdown();
     MENUS.with(|m| {
         if let Ok(mut g) = m.try_borrow_mut() {
             *g = None;
@@ -269,6 +278,11 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
     Some(match id {
         "chat" => A::Chat,
         "feed" => A::Feed,
+        "feednow" => A::FeedNow,
+        "game" => A::Game,
+        "checkin" => A::CheckIn,
+        "weather" => A::WeatherReport,
+        "climb" => A::Climb,
         "pat" => A::Pat,
         "honey" => A::Honey,
         "song" => A::Song,
@@ -290,7 +304,9 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
         "center" => A::CallToCenter,
         "quit" => A::Quit,
         _ => {
-            if let Some(m) = id.strip_prefix("pomo:") {
+            if let Some(a) = super::memo_menu::parse(id) {
+                a
+            } else if let Some(m) = id.strip_prefix("pomo:") {
                 A::PomodoroStart(m.parse().ok()?)
             } else if let Some(d) = id.strip_prefix("dance:") {
                 A::Dance(d.to_string())
@@ -329,5 +345,10 @@ mod tests {
         assert_eq!(parse_id("dance:disco", off), Some(A::Dance("disco".into())));
         assert_eq!(parse_id("dance:", off), Some(A::Dance(String::new())));
         assert_eq!(parse_id("nope", off), None);
+        assert_eq!(parse_id("game", off), Some(A::Game));
+        assert_eq!(parse_id("feednow", off), Some(A::FeedNow));
+        assert_eq!(parse_id("checkin", off), Some(A::CheckIn));
+        assert_eq!(parse_id("weather", off), Some(A::WeatherReport));
+        assert_eq!(parse_id("climb", off), Some(A::Climb));
     }
 }

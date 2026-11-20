@@ -273,6 +273,32 @@ pub fn parse_openai(json: &Value) -> Result<String, AiError> {
     Ok(text.trim().to_string())
 }
 
+/// 一次性提问：不带聊天记录、不写 chat.json、温度 0。给备忘录的时间提取用（services::memo_parse）。
+/// 返回的错误只是给日志看的描述，不含 Key。
+pub fn ask_once(system: &str, user: &str) -> Result<String, String> {
+    let c = crate::core::config::get();
+    if c.api_key.is_empty() {
+        return Err("no api key".into());
+    }
+    let history = [json!({ "role": "user", "text": user })];
+    let r = if c.provider == "openai" {
+        let base = if c.base_url.is_empty() { "https://api.openai.com/v1" } else { c.base_url.as_str() };
+        let base = base.strip_suffix('/').unwrap_or(base);
+        let auth = format!("Bearer {}", c.api_key);
+        let mut body = openai_body(&c.model, system, &history);
+        body["temperature"] = json!(0);
+        post(&format!("{base}/chat/completions"), &[("Authorization", &auth)], &body).and_then(|j| parse_openai(&j))
+    } else {
+        let base = if c.base_url.is_empty() { "https://generativelanguage.googleapis.com/v1beta" } else { c.base_url.as_str() };
+        let base = base.strip_suffix('/').unwrap_or(base);
+        let url = format!("{base}/models/{}:generateContent", encode_component(&c.model));
+        let mut body = gemini_body(&c.model, system, &history);
+        body["generationConfig"]["temperature"] = json!(0);
+        post(&url, &[("x-goog-api-key", &c.api_key)], &body).and_then(|j| parse_gemini(&j))
+    };
+    r.map_err(|e| e.detail)
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }

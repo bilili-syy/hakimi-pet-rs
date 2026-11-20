@@ -233,6 +233,8 @@ pub struct Routine {
     pub song: bool,
     /// 歌放不了/提前放完后已经换成内置鼓点
     pub fallback: bool,
+    /// 坐在窗口顶上跳：原地跳，不挪窗口
+    pub still: bool,
 }
 
 impl Routine {
@@ -255,6 +257,7 @@ impl Routine {
             nudges: 0,
             song: false,
             fallback: false,
+            still: false,
         }
     }
 
@@ -316,7 +319,7 @@ impl Routine {
             cues.push(Cue::Beat(n));
             self.spawn(n, now);
             let (idx, _, into) = self.score.step_at(n as f64 + 1e-6);
-            if self.score.steps[idx].nudge && (into.round() as i64) % 2 == 0 {
+            if !self.still && self.score.steps[idx].nudge && (into.round() as i64) % 2 == 0 {
                 let dir = if self.nudges.is_multiple_of(2) { 1 } else { -1 };
                 self.nudges += 1;
                 cues.push(Cue::Nudge(dir));
@@ -446,6 +449,9 @@ impl Behavior {
     /// 菜单「跳个舞」
     pub(super) fn start_routine(&mut self, id: &str) {
         let score = find(id);
+        // 跟逗猫棒一样：正在玩/输入框里打了字/等 AI 回复时不开跳
+        if self.play.game.is_some() || self.chat_busy() || self.waiting { return; }
+        self.yield_chat();
         if self.stats.data.energy < TIRED_ENERGY {
             self.play(Shot::Shake);
             self.say(&pick(TOO_TIRED), 2600);
@@ -459,6 +465,7 @@ impl Behavior {
         self.set_state(St::Dance, None);
         let now = self.now;
         let mut r = Routine::new(score, now);
+        r.still = self.play.perch.is_some();
         let path = if self.io { crate::services::songs::pick() } else { None };
         let tok = self.next_token();
         self.song = Some(tok);
