@@ -166,6 +166,9 @@ impl SpriteCache {
 
     pub fn clear(&mut self) { self.entries.clear(); }
 
+    /// 丢掉键满足条件的缓存图（换皮肤时释放旧皮肤的图）
+    pub fn forget(&mut self, pred: impl Fn(&str) -> bool) { self.entries.retain(|e| !pred(&e.0)); }
+
     pub fn get_or(&mut self, key: &str, size: (u32, u32), make: impl FnOnce() -> Option<Pixmap>) -> Option<Rc<Pixmap>> {
         self.tick += 1;
         if let Some(e) = self.entries.iter_mut().find(|e| e.0 == key && e.1 == size) {

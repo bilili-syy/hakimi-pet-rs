@@ -4,6 +4,7 @@
 pub mod anim;
 pub mod dance;
 pub mod shapes;
+pub mod skin_loader;
 pub mod sprites;
 pub mod text;
 pub mod toy;
@@ -210,6 +211,8 @@ impl Renderer {
     /// 画一帧到内部缓冲；没变化返回 false
     pub fn update(&mut self, scene: &Scene, scale: f32) -> bool {
         let scale = if scale.is_finite() && scale > 0.1 { scale } else { 1.0 };
+        // 换了角色包：旧皮肤的图已释放，这一帧必须重画
+        if skin_loader::sync(&mut self.sprites) { self.last = None; }
         if let Some((s, sc)) = &self.last
             && s == scene
             && *sc == scale
@@ -282,7 +285,10 @@ impl Renderer {
         let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..Default::default() };
 
         let layers = sprites::layers_for(scene.face, &scene.costume, &scene.outfits);
-        let base = self.sprites.asset(&layers.base, sw, sh);
+        // 角色包：当前皮肤有这个表情就用它（不画哈基米专属的尾巴/星星/配件），没有就回退内置
+        let skin = skin_loader::base(&mut self.sprites, scene.face, sw, sh);
+        let layers = match &skin { Some((k, _)) => skin_loader::strip_layers(layers, k), None => layers };
+        let base = skin.map(|s| s.1).or_else(|| self.sprites.asset(&layers.base, sw, sh));
         if let Some(base) = &base {
             if scene.glow {
                 let key = format!("glow:{}", layers.base);
