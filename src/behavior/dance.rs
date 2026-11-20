@@ -15,8 +15,8 @@ use crate::render::dance::{self as kf, Move, Pose};
 use crate::render::{FxShape, FxSprite, Xf, anim};
 use crate::types::{Audio, Face, WinCmd};
 
-/// 跳舞时的帧间隔（40fps）；跳完回到原来的空闲帧率
-pub const FRAME_MS: u32 = 25;
+/// 跳舞时的帧间隔（≈60fps，和灵动待机一致）；跳完回到原来的空闲帧率
+pub const FRAME_MS: u32 = 16;
 /// 窗口左右挪一下的距离（逻辑像素）
 const NUDGE_PX: f32 = 10.0;
 /// 换动作时的混合时长（拍）
@@ -793,7 +793,8 @@ mod tests {
         run(&mut b, 25_100, 31_000);
         assert!(!b.animating());
         let (ms, _) = run(&mut b, 31_025, 31_025);
-        assert!(ms > FRAME_MS || b.next_due().is_some_and(|d| d <= 31_025 + ms as u64));
+        // 舞蹈和灵动待机现在都是 ≈60fps，这里只确认已经不走舞蹈的固定帧了
+        assert!(b.routine.is_none() && ms <= super::super::IDLE_FRAME_MS);
     }
 
     #[test]
