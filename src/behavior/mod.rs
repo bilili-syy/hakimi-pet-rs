@@ -2,6 +2,7 @@
 //! 原版的 setTimeout/setInterval 全部换成「到期时间」，在 frame() 里统一推进。
 pub mod fx;
 pub mod lines;
+pub mod play;
 
 use crate::core::stats::{Act, ActResult, MoodLevel, Stats};
 use crate::render::{BubbleView, Rect, Scene, StatusView, Xf, ZGlyph, anim};
@@ -61,7 +62,11 @@ impl St {
 
 /// 一次性反馈动画（play(cls)）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Shot { Bounce, Squash, Shake }
+pub enum Shot { Bounce, Squash, Shake, Jump }
+
+impl Shot {
+    fn dur(self) -> u64 { if self == Shot::Jump { 750 } else { 500 } }
+}
 
 /// #pet 当前生效的动画（CSS 层叠的结果）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +227,9 @@ pub struct Behavior {
 
     costume: String,
     outfits: Vec<String>,
+
+    /// 新互动（behavior/play.rs）
+    play: play::Play,
 }
 
 impl Behavior {
@@ -295,6 +303,7 @@ impl Behavior {
             song: None,
             costume,
             outfits,
+            play: play::Play::default(),
         };
         b.mood_cls = b.stats.mood();
         b.next_blink = b.now + rand(2500.0, 6000.0) as u64;
@@ -379,7 +388,14 @@ impl Behavior {
                 self.cmds.push(WinCmd::Show);
                 self.react(St::Happy, 1500, Some(pick(lines::PEEK)));
             }
+            AppEvent::Cursor { x, y } => self.on_cursor(x, y),
+            AppEvent::Weather(w) => self.on_weather(w),
+            AppEvent::Toy(t) => self.on_toy(t),
+            AppEvent::Perched(k) => self.on_perched(k),
+            AppEvent::ClimbFailed => self.on_climb_failed(),
+            AppEvent::PerchLost => self.on_perch_lost(),
         }
+        self.sync_play();
         self.build_scene();
         self.flush(out);
     }
@@ -387,6 +403,7 @@ impl Behavior {
     pub fn frame_at(&mut self, now: u64, out: &mut Vec<WinCmd>) -> u32 {
         self.now = now;
         self.run_timers();
+        self.sync_play();
         self.build_scene();
         self.flush(out);
         self.next_interval()
@@ -419,6 +436,7 @@ impl Behavior {
             if let Some(d) = &self.dance { consider(d.next_beat, 5); }
             if let Some(h) = self.bubble.as_ref().and_then(|b| b.hide_at) { consider(h, 6); }
             if let Some(h) = self.status_hide_at { consider(h, 7); }
+            if let Some(d) = self.play.next_due() { consider(d, 8); }
             let Some((due, k)) = best else { break };
             // 计时器按「到期那一刻」执行（帧间隔可能比计时器粗）
             self.now = due;
@@ -450,6 +468,7 @@ impl Behavior {
                     self.status_hide_at = None;
                     self.status_fade.set(false, due);
                 }
+                8 => self.on_play_timer(),
                 _ => break,
             }
         }
@@ -464,12 +483,14 @@ impl Behavior {
         if let Some(d) = &self.dance { v.push(d.next_beat); }
         if let Some(Some(h)) = self.bubble.as_ref().map(|b| b.hide_at) { v.push(h); }
         if let Some(h) = self.status_hide_at { v.push(h); }
+        if let Some(d) = self.play.next_due() { v.push(d); }
         v.into_iter().min()
     }
 
     fn animating(&self) -> bool {
         let now = self.now;
-        self.shot.is_some_and(|(_, t)| now < t + 500)
+        self.shot.is_some_and(|(s, t)| now < t + s.dur())
+            || self.play_animating()
             || self.chase.is_some_and(|t| now < t + 1800)
             || self.dragging_cls
             || matches!(self.state, St::Walk | St::Dance | St::Fall)
@@ -525,8 +546,11 @@ impl Behavior {
                 if self.now >= self.fast_until { self.say(&pick(lines::SLOW), 2000); }
             }
             Later::Greet => {
+                let slot = self.greet_slot_line();
                 let line = if Self::is_night() {
                     pick(lines::NIGHT)
+                } else if let Some(l) = slot {
+                    l
                 } else if self.saved_existed && self.away_min >= 60.0 {
                     pickv(lines::back(&lines::fmt_away(self.away_min)))
                 } else {
@@ -577,6 +601,8 @@ impl Behavior {
             self.go_beg();
         } else if free && hunger < 30.0 && self.now.saturating_sub(self.last_beg) > 120_000 {
             self.go_beg();
+        } else {
+            self.tick_play();
         }
     }
 
@@ -626,6 +652,7 @@ impl Behavior {
     /// 互动并检查亲密度是否升级
     fn act(&mut self, kind: Act) -> ActResult {
         let before = self.stats.level().0;
+        self.maybe_checkin(kind);
         let r = self.stats.act(kind);
         let (idx, name) = self.stats.level();
         if idx > before { self.later(2700, Later::LevelUp(name)); }
@@ -681,6 +708,8 @@ impl Behavior {
             level: self.stats.level().1.to_string(),
             affection: d.affection,
             moyu,
+            checkin: Some((self.stats.data.checkin_streak, self.stats.data.checkin_total)),
+            weather: self.weather_text(),
             opacity: 1.0,
         });
         self.status_fade.set(true, self.now);
@@ -692,6 +721,7 @@ impl Behavior {
     fn think(&mut self) {
         if matches!(self.state, St::Drag | St::Fall) || self.chat_busy() { return; }
         self.yield_chat();
+        if self.think_play() { return; }
         let m = self.stats.mood();
         let energy = self.stats.data.energy;
         let r = fastrand::f64();
@@ -726,6 +756,8 @@ impl Behavior {
     }
 
     fn go_walk(&mut self) {
+        if self.play.perch == Some(crate::types::PerchKind::WindowTop) { return self.jump_down(); }
+        self.play.perch = None;
         self.walk_dir = if fastrand::bool() { -1 } else { 1 };
         self.set_state(St::Walk, None);
         let fast = self.now < self.fast_until;
@@ -840,7 +872,11 @@ impl Behavior {
                 Zone::Bubble => {}
                 Zone::Pet => { self.down = Some(Down { sx, sy, lx: None, dir: 0, flips: Vec::new() }); self.dragging = false; }
             },
+            MouseEv::Wheel { delta, x, y } => {
+                if self.zone(x, y) == Zone::Pet { self.on_wheel(delta); }
+            }
             MouseEv::Move { x, y, sx, sy } => {
+                if self.down.is_none() { self.on_cursor(x, y); }
                 if self.down.is_some() { self.on_drag_move(sx, sy); } else if self.zone(x, y) == Zone::Pet { self.on_rub(x, y); }
             }
             MouseEv::Up { button: Button::Left, .. } => {
@@ -871,6 +907,7 @@ impl Behavior {
             self.dragging = true;
             self.dragging_cls = true;
             self.act(Act::Drag);
+            self.drag_started_play();
             self.set_state(St::Drag, None);
             self.say(&pick(lines::DRAG), 1500);
         }
@@ -983,11 +1020,13 @@ impl Behavior {
         if fastrand::f64() < 0.3 {
             if great { self.fx(FxKind::Heart, 3) } else { self.fx(FxKind::Spark, 6) }
         }
+        if let Some(l) = self.affinity_line() { return self.react(St::Love, 2000, Some(l)); }
         let l = if great && fastrand::bool() { lines::POKE_GREAT } else { lines::POKE };
         self.react(St::Happy, 1200, Some(pick(l)));
     }
 
     fn on_landed(&mut self, big: bool) {
+        if self.landed_play() { return; }
         self.play(Shot::Squash);
         if self.land_shaken {
             self.land_shaken = false;
@@ -1017,7 +1056,12 @@ impl Behavior {
             self.yield_chat();
         }
         match a {
-            MenuAction::Feed => {
+            MenuAction::Feed => self.toss_food(),
+            MenuAction::Game => self.start_game(),
+            MenuAction::CheckIn => self.do_checkin(true),
+            MenuAction::WeatherReport => self.weather_report(true),
+            MenuAction::Climb => self.start_climb(crate::types::PerchKind::WindowTop, true),
+            MenuAction::FeedNow => {
                 let was_starving = self.stats.data.hunger < 15.0;
                 if self.act(Act::Feed) == ActResult::Full {
                     self.play(Shot::Shake);
@@ -1259,7 +1303,7 @@ impl Behavior {
     // ============================================================ 场景
     fn current_pet_anim(&self) -> PetAnim {
         let now = self.now;
-        if let Some((s, t)) = self.shot && now < t + 500 { return PetAnim::Shot(s); }
+        if let Some((s, t)) = self.shot && now < t + s.dur() { return PetAnim::Shot(s); }
         if self.chase.is_some_and(|t| now < t + 1800) { return PetAnim::Chase; }
         if self.dragging_cls { return PetAnim::Wiggle; }
         match self.state {
@@ -1289,6 +1333,7 @@ impl Behavior {
             PetAnim::Shot(Shot::Bounce) => run(450.0, Some(1), anim::bounce),
             PetAnim::Shot(Shot::Squash) => run(400.0, Some(1), anim::squash),
             PetAnim::Shot(Shot::Shake) => run(400.0, Some(1), anim::shake),
+            PetAnim::Shot(Shot::Jump) => run(700.0, Some(1), anim::jump),
             PetAnim::Chase => run(600.0, Some(3), anim::chase),
             PetAnim::Wiggle => run(350.0, None, anim::wiggle),
             PetAnim::Walk(fast) => run(if fast { 250.0 } else { 500.0 }, None, anim::walk),
@@ -1326,7 +1371,9 @@ impl Behavior {
 
     fn build_scene(&mut self) {
         let now = self.now;
-        let pet = self.pet_xf();
+        let mut pet = self.pet_xf();
+        let (lean, tilt) = self.play.lean_at(now);
+        pet.rot += tilt;
         let (tail, star) = self.tail_star();
         let bubble = self.bubble.as_ref().and_then(|b| {
             let op = self.bubble_fade.value(now);
@@ -1357,12 +1404,13 @@ impl Behavior {
         self.scene = Scene {
             face: self.face,
             costume: self.costume.clone(),
-            outfits: self.outfits.clone(),
+            outfits: self.weather_outfits(),
             pet,
             flip,
             tail,
             star,
             glow: self.glow,
+            lean,
             bubble,
             status,
             zzz,

@@ -144,6 +144,14 @@ pub fn post_json_via(agent: &ureq::Agent, url: &str, headers: &[(&str, &str)], b
     Ok((status, text))
 }
 
+/// GET，返回 (HTTP 状态码, 响应文本)。响应体最多 limit 字节
+pub fn get_text(url: &str, timeout_secs: u64, limit: u64) -> Result<(u16, String), ureq::Error> {
+    let mut res = agent(timeout_secs).get(url).call()?;
+    let status = res.status().as_u16();
+    let text = res.body_mut().with_config().limit(limit).read_to_string()?;
+    Ok((status, text))
+}
+
 /// 网络类错误（连不上/DNS/TLS/代理），对应原版 `net::ERR_*` / `fetch failed`
 pub fn is_network_error(e: &ureq::Error) -> bool {
     matches!(

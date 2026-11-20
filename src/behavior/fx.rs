@@ -2,7 +2,7 @@
 use crate::render::{FxShape, FxSprite, Xf, anim};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FxKind { Heart, Note, Spark, Sweat, Anger, Tear, Honey, Dizzy, Exclaim }
+pub enum FxKind { Heart, Note, Spark, Sweat, Anger, Tear, Honey, Dizzy, Exclaim, Rain, Snow }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Motion { Rise, Burst, Pop, Fall }
@@ -61,20 +61,21 @@ impl Fx {
             let shape = match kind {
                 FxKind::Heart => FxShape::Heart,
                 FxKind::Note => FxShape::Note((i % 3) as u8),
-                FxKind::Sweat | FxKind::Tear => FxShape::Drop,
+                FxKind::Sweat | FxKind::Tear | FxKind::Rain => FxShape::Drop,
                 FxKind::Anger => FxShape::Anger,
                 _ => FxShape::Spark,
             };
             let motion = match kind {
                 FxKind::Spark => Motion::Burst,
-                FxKind::Tear => Motion::Fall,
+                FxKind::Tear | FxKind::Rain | FxKind::Snow => Motion::Fall,
                 FxKind::Anger | FxKind::Sweat => Motion::Pop,
                 _ => Motion::Rise,
             };
             let color = match kind {
                 FxKind::Heart => if i % 2 == 1 { 0xea4335 } else { 0xff7eb6 },
                 FxKind::Honey => 0xfbbc04,
-                FxKind::Sweat | FxKind::Tear => DROP_BLUE,
+                FxKind::Sweat | FxKind::Tear | FxKind::Rain => DROP_BLUE,
+                FxKind::Snow => 0xbfe3ff,
                 FxKind::Anger => ANGER_RED,
                 _ => FX_COLORS[i % 4],
             };
@@ -84,6 +85,7 @@ impl Fx {
                 FxKind::Anger => (x, y) = (140.0, 18.0),
                 FxKind::Sweat => (x, y) = (150.0, 40.0),
                 FxKind::Tear => (x, y) = (if i % 2 == 1 { 72.0 } else { 128.0 }, 100.0),
+                FxKind::Rain | FxKind::Snow => (x, y) = (rand(10.0, 180.0), rand(-50.0, 30.0)),
                 FxKind::Spark => {
                     (x, y) = (96.0, 50.0);
                     let a = i as f32 / n as f32 * std::f32::consts::TAU;

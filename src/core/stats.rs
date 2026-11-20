@@ -40,6 +40,16 @@ pub struct StatsData {
     pub last_tick: f64,
     pub total_feeds: u32,
     pub first_met: f64,
+    /// 上次签到的日期 "YYYY-MM-DD"（当地时间），"" = 没签过
+    pub checkin_last: String,
+    /// 连续签到天数
+    pub checkin_streak: u32,
+    /// 累计签到天数
+    pub checkin_total: u32,
+    /// 逗猫棒小游戏最高分
+    pub game_best: u32,
+    /// 上次早间天气播报的日期 "YYYY-MM-DD"
+    pub weather_report_last: String,
     /// 存档里的其它字段原样保留（原版 `{...DEFAULT, ...saved}` 会带着它们写回）
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -49,6 +59,7 @@ impl Default for StatsData {
         let now = now_ms();
         Self {
             hunger: 80.0, mood: 80.0, energy: 80.0, affection: 0.0, last_tick: now, total_feeds: 0, first_met: now,
+            checkin_last: String::new(), checkin_streak: 0, checkin_total: 0, game_best: 0, weather_report_last: String::new(),
             extra: Map::new(),
         }
     }
@@ -66,6 +77,45 @@ impl StatsData {
 /// stats.js 里 mood() 的返回值
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoodLevel { Starving, Hungry, Exhausted, Sad, Great, Normal }
+
+/// 一次签到的结果
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CheckIn {
+    pub streak: u32,
+    pub total: u32,
+    /// 这次加了多少亲密度
+    pub bonus: f64,
+}
+
+/// "YYYY-MM-DD" → 自 1970-01-01 起的天数（公历；格式不对返回 None）
+pub fn day_number(date: &str) -> Option<i64> {
+    let mut it = date.trim().splitn(3, '-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let d: i64 = it.next()?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) { return None; }
+    // Howard Hinnant 的 days_from_civil
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
+}
+
+/// 签到的纯逻辑：今天签过返回 None；昨天签过 → 连续 +1，否则从 1 重来
+pub fn next_streak(last: &str, today: &str, streak: u32) -> Option<u32> {
+    let t = day_number(today)?;
+    match day_number(last) {
+        Some(l) if l == t => None,
+        Some(l) if l == t - 1 => Some(streak.saturating_add(1).max(1)),
+        _ => Some(1),
+    }
+}
+
+/// 签到加的亲密度：2 + 连续天数（最多 +7）
+pub fn checkin_bonus(streak: u32) -> f64 { 2.0 + streak.min(7) as f64 }
 
 /// act() 的种类
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -148,6 +198,28 @@ impl Stats {
         ActResult::Ok
     }
 
+    /// 今日签到；今天已经签过返回 None
+    pub fn checkin(&mut self, today: &str) -> Option<CheckIn> {
+        let s = &mut self.data;
+        let streak = next_streak(&s.checkin_last, today, s.checkin_streak)?;
+        let bonus = checkin_bonus(streak);
+        s.checkin_last = today.to_string();
+        s.checkin_streak = streak;
+        s.checkin_total = s.checkin_total.saturating_add(1);
+        s.affection += bonus;
+        s.mood = clamp(s.mood + 5.0);
+        Some(CheckIn { streak, total: s.checkin_total, bonus })
+    }
+
+    /// 今天签过没有
+    pub fn checked_in(&self, today: &str) -> bool { self.data.checkin_last == today }
+
+    /// 小游戏/摸摸等额外奖励：直接加亲密度和心情
+    pub fn reward(&mut self, affection: f64, mood: f64) {
+        self.data.affection += affection.max(0.0);
+        self.data.mood = clamp(self.data.mood + mood);
+    }
+
     /// (等级下标, 等级名)：初次见面/眼熟/朋友/好朋友/形影不离/家人
     pub fn level(&self) -> (usize, &'static str) {
         let mut out = (0, LEVELS[0].1);
@@ -189,7 +261,7 @@ mod tests {
     const MIN: f64 = 60000.0;
 
     fn data(h: f64, m: f64, e: f64, a: f64) -> StatsData {
-        StatsData { hunger: h, mood: m, energy: e, affection: a, last_tick: T0, total_feeds: 0, first_met: T0, extra: Map::new() }
+        StatsData { hunger: h, mood: m, energy: e, affection: a, last_tick: T0, total_feeds: 0, first_met: T0, extra: Map::new(), ..Default::default() }
     }
     fn approx(a: f64, b: f64) { assert!((a - b).abs() < 1e-9, "{a} != {b}"); }
 
@@ -328,6 +400,55 @@ mod tests {
         assert_eq!(m(30.0, 76.0, 15.0), MoodLevel::Great);
         assert_eq!(m(30.0, 75.0, 15.0), MoodLevel::Normal);
         assert_eq!(m(30.0, 25.0, 15.0), MoodLevel::Normal);
+    }
+
+    #[test]
+    fn day_numbers() {
+        assert_eq!(day_number("1970-01-01"), Some(0));
+        assert_eq!(day_number("2026-03-01").unwrap() - day_number("2026-02-28").unwrap(), 1);
+        assert_eq!(day_number("2024-03-01").unwrap() - day_number("2024-02-28").unwrap(), 2);
+        assert_eq!(day_number("2027-01-01").unwrap() - day_number("2026-12-31").unwrap(), 1);
+        assert_eq!(day_number(""), None);
+        assert_eq!(day_number("2026-13-01"), None);
+    }
+
+    #[test]
+    fn checkin_streak() {
+        assert_eq!(next_streak("", "2026-11-20", 0), Some(1));
+        assert_eq!(next_streak("2026-11-19", "2026-11-20", 3), Some(4));
+        assert_eq!(next_streak("2026-11-20", "2026-11-20", 3), None);
+        assert_eq!(next_streak("2026-11-17", "2026-11-20", 3), Some(1));
+        assert_eq!(next_streak("2026-12-31", "2027-01-01", 9), Some(10));
+        assert_eq!(next_streak("garbage", "2026-11-20", 9), Some(1));
+        let (mut s, _) = Stats::load_at(Some(data(50.0, 50.0, 50.0, 0.0)), T0);
+        let c = s.checkin("2026-11-19").unwrap();
+        assert_eq!((c.streak, c.total), (1, 1));
+        approx(c.bonus, 3.0);
+        assert!(s.checkin("2026-11-19").is_none());
+        assert!(s.checked_in("2026-11-19"));
+        let c = s.checkin("2026-11-20").unwrap();
+        assert_eq!((c.streak, c.total), (2, 2));
+        approx(s.data.affection, 3.0 + 4.0);
+        // 连续 30 天封顶 +9
+        approx(checkin_bonus(30), 9.0);
+    }
+
+    #[test]
+    fn checkin_fields_roundtrip() {
+        let mut d = data(50.0, 50.0, 50.0, 0.0);
+        d.checkin_last = "2026-11-20".into();
+        d.checkin_streak = 5;
+        d.game_best = 7;
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["checkinLast"], "2026-11-20");
+        assert_eq!(v["checkinStreak"], 5);
+        assert_eq!(v["gameBest"], 7);
+        let back = StatsData::from_value(v);
+        assert_eq!(back.checkin_streak, 5);
+        // 老存档没有这些字段：默认值
+        let old = StatsData::from_value(serde_json::json!({"hunger": 10, "checkinStreak": "bad"}));
+        assert_eq!(old.checkin_streak, 0);
+        assert_eq!(old.hunger, 10.0);
     }
 
     #[test]

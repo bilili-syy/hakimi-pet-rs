@@ -5,3 +5,4 @@ pub mod audio;
 pub mod net;
 pub mod songs;
 pub mod tts;
+pub mod weather;
