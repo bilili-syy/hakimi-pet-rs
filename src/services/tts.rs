@@ -399,6 +399,19 @@ pub fn speak(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMood>
     if spawned.is_err() { answer(seq, None); }
 }
 
+/// 插队预合成（快到点的备忘提醒这类马上要用的话）：放到预合成队列最前面，半秒后开始
+pub fn prewarm_now(items: Vec<(String, Option<VoiceMood>)>) {
+    let mut st = state();
+    for it in items.into_iter().rev() {
+        if !st.warm.iter().any(|w| *w == it) { st.warm.push_front(it); }
+    }
+    let soon = Instant::now() + Duration::from_millis(500);
+    st.warm_at = Some(st.warm_at.map_or(soon, |a| a.min(soon)));
+    ensure_worker(&mut st);
+    drop(st);
+    WAKE.notify_all();
+}
+
 /// 后台慢慢预合成固定台词（最多 300 条），前台说话时让路
 pub fn prewarm(items: Vec<(String, Option<VoiceMood>)>) {
     let mut st = state();

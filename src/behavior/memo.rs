@@ -3,7 +3,7 @@
 use super::{Behavior, Bubble, Later, Shot, St, StateAct, lines, pick};
 use crate::core::memo::{self as store, Dt, Now};
 use crate::services::memo_parse::{self as mp, Parsed};
-use crate::types::{ChatInputCmd, ChatReply, MemoAct, MemoEv, MemoHit, SpeakKind, WinCmd};
+use crate::types::{ChatInputCmd, ChatReply, MemoAct, MemoEv, MemoHit, SpeakKind, VoiceMood, WinCmd};
 use super::fx::FxKind;
 
 /// 提醒气泡留多久（没点她的话）
@@ -61,7 +61,20 @@ pub fn alert_lines(hits: &[MemoHit]) -> (String, String) {
     }
 }
 
+/// 单条准点提醒要念的话和语气（平台层拿去提前合成，到点直接命中缓存；clone 现合成要好几秒）
+pub fn memo_voice(text: &str) -> (String, Option<VoiceMood>) {
+    let (_, v) = alert_lines(&[MemoHit { id: 0, text: text.to_string(), late: false }]);
+    // memo_due 先切到 Surprised 再念，语气跟着它
+    (v, St::Surprised.voice_mood())
+}
+
 impl Behavior {
+    /// 提醒语音还在合成/在放：别的台词只换气泡，不掐它（之前被「不许拎哈基米」顶掉过）
+    pub(super) fn memo_voice_busy(&self, token: u64) -> bool {
+        let mt = self.memo.bubble_token;
+        mt != 0 && token != mt && self.memo.active(self.now) && (self.voice_req == mt || self.voice_playing == Some(mt))
+    }
+
     fn memo_now(&self) -> Dt {
         if self.io { Now::get().dt } else { self.memo.test_now.unwrap_or_else(|| Dt::new(2026, 1, 1, 12, 0).unwrap_or(Dt::from_min(0))) }
     }
@@ -194,7 +207,7 @@ impl Behavior {
                 self.say(&if n > 0 { format!("清掉了 {n} 条做完的喵") } else { "没有做完的可以清喵".into() }, 2200);
             }
             // 平台层打开文件
-            MemoAct::OpenFile => {}
+            MemoAct::OpenFile | MemoAct::OpenWindow => {}
         }
     }
 

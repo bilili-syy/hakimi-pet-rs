@@ -4,6 +4,7 @@ pub mod fx;
 pub mod lines;
 pub mod play;
 mod memo;
+pub use memo::memo_voice;
 mod emotion;
 mod skin;
 pub mod beat;
@@ -726,6 +727,7 @@ impl Behavior {
 
     /// 气泡先出，声音随后到；新台词会打断旧的
     fn voice(&mut self, text: &str, kind: SpeakKind, token: u64) {
+        if self.memo_voice_busy(token) { return; }
         self.stop_voice();
         if self.routine.is_some() { return; } // 跳舞时不念（内置鼓点走语音声道）；放歌时照念，audio 混音、压低音乐
         self.voice_req = token;

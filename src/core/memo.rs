@@ -298,6 +298,19 @@ impl Book {
         item
     }
 
+    /// 备忘录窗口里改一条：内容/时间/重复都换掉，重新算「没响过」
+    pub fn update(&mut self, id: u64, text: &str, time: Option<Dt>, repeat: Repeat) -> bool {
+        let Some(i) = self.get_mut(id) else { return false };
+        let repeat = if time.is_none() { Repeat::None } else { repeat };
+        i.text = text.trim().to_string();
+        i.time = time.map(|t| if repeat == Repeat::None { t } else { repeat.first_from(t) }).map(Dt::fmt);
+        i.repeat = repeat;
+        i.done = false;
+        i.fired = false;
+        i.snooze = None;
+        true
+    }
+
     pub fn get(&self, id: u64) -> Option<&Item> { self.items.iter().find(|i| i.id == id) }
     fn get_mut(&mut self, id: u64) -> Option<&mut Item> { self.items.iter_mut().find(|i| i.id == id) }
 
@@ -551,6 +564,15 @@ pub fn delete(id: u64) -> bool {
     with(|s| {
         unring(s, &[id]);
         let c = s.book.delete(id);
+        if c { save(s); }
+        c
+    })
+}
+
+pub fn update(id: u64, text: &str, time: Option<Dt>, repeat: Repeat) -> bool {
+    with(|s| {
+        unring(s, &[id]);
+        let c = s.book.update(id, text, time, repeat);
         if c { save(s); }
         c
     })

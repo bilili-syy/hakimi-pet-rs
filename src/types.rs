@@ -207,6 +207,8 @@ pub enum MemoAct {
     /// 稍后 10 分钟再提醒（正在响的那些）
     Snooze,
     OpenFile,
+    /// 设置窗口的「备忘录」页
+    OpenWindow,
     ClearDone,
 }
 
