@@ -7,6 +7,7 @@ mod memo;
 mod skin;
 pub mod beat;
 pub mod dance;
+mod live;
 mod chatvoice;
 
 use crate::core::stats::{Act, ActResult, MoodLevel, Stats};
@@ -98,8 +99,6 @@ enum Later {
     Prewarm,
     /// 语音回答：等某一句合成超时（token）
     ChatVoiceTimeout(u64),
-    BlinkEnd,
-    DoubleBlink,
     /// 备忘提醒：点她之后确认「知道了」（等等看是不是双击）
     MemoAck,
 }
@@ -194,6 +193,8 @@ pub struct Behavior {
     state_timer: Option<(u64, StateAct)>,
     laters: Vec<(u64, Later)>,
     next_blink: u64,
+    /// 伪 Live2D：眨眼排程、口型包络、呼吸相位（behavior/live.rs）
+    live: live::LiveState,
 
     shot: Option<(Shot, u64)>,
     chase: Option<u64>,
@@ -228,6 +229,8 @@ pub struct Behavior {
     chatting: bool,
     /// 测试用：io=false 时假装输入框里有字（真机读 platform::chat_has_text）
     pub(crate) fake_chat_text: bool,
+    /// 测试用：io=false 时假装的语音音量（真机读 services::audio::level）
+    pub(crate) fake_level: f32,
     waiting: bool,
     pomo_running: bool,
 
@@ -266,7 +269,7 @@ impl Behavior {
 
     /// 不读磁盘的构造（测试和 new 共用）
     pub fn with(tx: EventSender, stats: Stats, saved_existed: bool, away_min: f64, costume: String, outfits: Vec<String>, io: bool) -> Self {
-        let costume = if ["xmas", "maid", "jk"].contains(&costume.as_str()) { costume } else { String::new() };
+        let costume = crate::core::costume::normalize(&costume).to_string();
         let mut b = Self {
             tx,
             scene: Scene::default(),
@@ -289,6 +292,7 @@ impl Behavior {
             state_timer: None,
             laters: Vec::new(),
             next_blink: 0,
+            live: live::LiveState::new(0),
             shot: None,
             chase: None,
             dragging_cls: false,
@@ -317,6 +321,7 @@ impl Behavior {
             last_beg: 0,
             chatting: false,
             fake_chat_text: false,
+            fake_level: 0.0,
             waiting: false,
             pomo_running: false,
             token_seq: 0,
@@ -333,7 +338,7 @@ impl Behavior {
             memo: memo::MemoUi::default(),
         };
         b.mood_cls = b.stats.mood();
-        b.next_blink = b.now + rand(2500.0, 6000.0) as u64;
+        b.next_blink = b.live.blink.next;
         b.later(600, Later::Greet);
         b.later(5000, Later::Prewarm);
         b.build_scene();
@@ -546,6 +551,7 @@ impl Behavior {
             else if self.animating() { ANIM_FRAME_MS }
             else if self.state == St::Sleep { SLEEP_FRAME_MS }
             else { IDLE_FRAME_MS };
+        let base = base.min(self.live_interval());
         match self.next_due() {
             Some(d) if d > self.now => base.min((d - self.now).min(u32::MAX as u64) as u32).max(1),
             Some(_) => 1,
@@ -604,26 +610,11 @@ impl Behavior {
                 if self.io { crate::services::tts::prewarm(items); }
             }
             Later::ChatVoiceTimeout(t) => self.cv_timeout(t),
-            Later::BlinkEnd => { if self.face == Face::Blink { self.show(Face::Idle); } }
             Later::MemoAck => self.memo_ack(),
-            Later::DoubleBlink => {
-                if self.face == Face::Idle {
-                    self.show(Face::Blink);
-                    self.laters.push((self.now + 120, Later::BlinkEnd));
-                }
-            }
         }
     }
 
-    /// 眨眼：2.5~6 秒一次，偶尔连眨两下
-    fn on_blink(&mut self) {
-        if self.face == Face::Idle && matches!(self.state, St::Idle | St::Walk) {
-            self.show(Face::Blink);
-            self.later(140, Later::BlinkEnd);
-            if fastrand::f64() < 0.25 { self.later(300, Later::DoubleBlink); }
-        }
-        self.next_blink = self.now + rand(2500.0, 6000.0) as u64;
-    }
+    // 眨眼（on_blink）：2~6 秒一次、偶尔连眨两下，用眼部贴片淡入淡出 → behavior/live.rs
 
     /// 每 20 秒结算一次数值，并处理「饿了主动讨食」「睡饱自己醒」
     fn on_tick(&mut self) {
@@ -1148,9 +1139,9 @@ impl Behavior {
             MenuAction::Costume(id) => {
                 // 「🎭 角色」子菜单（skin:…）
                 if self.on_skin_menu(&id) { return; }
-                let id = if ["xmas", "maid", "jk"].contains(&id.as_str()) { id } else { String::new() };
+                let id = crate::core::costume::normalize(&id).to_string();
                 if id == self.costume { return; }
-                if self.io { let v = id.clone(); crate::core::config::update(|c| c.costume = v); }
+                if self.io { let v = crate::core::costume::config_value(&id); crate::core::config::update(|c| c.costume = v); }
                 self.costume = id;
                 self.outfit_changed(true, false);
             }
@@ -1169,7 +1160,7 @@ impl Behavior {
                 } else {
                     (self.costume.clone(), self.outfits.clone())
                 };
-                self.costume = if ["xmas", "maid", "jk"].contains(&c.as_str()) { c } else { String::new() };
+                self.costume = crate::core::costume::normalize(&c).to_string();
                 self.outfits = o;
                 self.say(&pick(lines::RELOADED), 2600);
             }
@@ -1443,7 +1434,9 @@ impl Behavior {
 
     fn build_scene(&mut self) {
         let now = self.now;
+        let live = self.live_view();
         let mut pet = self.pet_xf();
+        if self.live_replaces_breathe() && matches!(self.pet_anim.0, PetAnim::Breathe | PetAnim::BreatheSlow) { pet = Xf::ID; }
         let (lean, tilt) = self.play.lean_at(now);
         pet.rot += tilt;
         let (tail, star) = self.tail_star();
@@ -1487,6 +1480,7 @@ impl Behavior {
             status,
             zzz,
             fx: self.fx.sprites(now),
+            live,
         };
         self.apply_dance_scene();
     }

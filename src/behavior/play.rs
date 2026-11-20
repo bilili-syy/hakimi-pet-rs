@@ -824,7 +824,7 @@ impl Behavior {
     pub(super) fn weather_outfits(&self) -> Vec<String> {
         let mut o = self.outfits.clone();
         let cold = self.play.weather.as_ref().is_some_and(|w| w.temp_c <= 5.0);
-        if cold && self.costume.is_empty() && !o.iter().any(|x| x == "scarf") { o.push("scarf".into()); }
+        if cold && crate::core::costume::is_base(&self.costume) && !o.iter().any(|x| x == "scarf") { o.push("scarf".into()); }
         o
     }
 

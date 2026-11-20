@@ -55,14 +55,31 @@ pub fn outfit_offset(face: Face) -> Option<(f32, f32)> {
     }
 }
 
+/// 默认水手服：和原装卫衣一样走分层（尾巴/星星单独动），其余表情按 costume_alias 退到 8 张基本姿势
+const SAILOR_FACES: [&str; 4] = ["drag", "sit", "sleep", "think"];
+
+fn sailor_layers(face: Face) -> (String, Option<(bool, bool)>) {
+    if let Some(l) = layered(face) {
+        return (format!("outfits/sailor/layered/{}.png", face.stem()), Some(l));
+    }
+    let n = costume_alias(face.stem());
+    if SAILOR_FACES.contains(&n) {
+        return (format!("outfits/sailor/{n}.png"), None);
+    }
+    // 别名落到分层的那几张（happy / eat / idle / hungry）
+    let f = match n { "happy" => Face::Happy, "eat" => Face::Eat, "hungry" => Face::Hungry, _ => Face::Idle };
+    (format!("outfits/sailor/layered/{}.png", f.stem()), layered(f))
+}
+
+/// costume：core::costume 的 id。"" / "hoodie" = 原装卫衣（sprites/），"sailor" = 默认水手服，其余 = outfits/<id>/
 pub fn layers_for(face: Face, costume: &str, outfits: &[String]) -> Layers {
-    let l = if costume.is_empty() { layered(face) } else { None };
-    let base = if !costume.is_empty() {
-        costume_src(costume, face)
-    } else if l.is_some() {
-        format!("sprites/layered/{}.png", face.stem())
-    } else {
-        format!("sprites/{}.png", face.stem())
+    let (base, l) = match costume {
+        "" | "hoodie" => match layered(face) {
+            Some(l) => (format!("sprites/layered/{}.png", face.stem()), Some(l)),
+            None => (format!("sprites/{}.png", face.stem()), None),
+        },
+        "sailor" => sailor_layers(face),
+        c => (costume_src(c, face), None),
     };
     let hat = outfits.iter().any(|o| o == "santa");
     Layers {
@@ -229,13 +246,47 @@ mod tests {
         for f in Face::ALL {
             let l = layers_for(f, "", &[]);
             assert!(crate::assets::get(&l.base).is_some(), "{}", l.base);
-            for c in ["xmas", "maid", "jk"] {
+            for (c, _) in crate::core::costume::COSTUMES {
                 let l = layers_for(f, c, &[]);
-                assert!(crate::assets::get(&l.base).is_some(), "{}", l.base);
+                assert!(crate::assets::get(&l.base).is_some(), "{c} {}", l.base);
             }
         }
         for p in [TAIL, STAR, "outfits/santa.png", "outfits/glasses.png", "outfits/scarf.png"] {
             assert!(crate::assets::get(p).is_some(), "{p}");
+        }
+    }
+
+    #[test]
+    fn layers_sailor_default() {
+        // 默认水手服保留尾巴/星星分层动画
+        let l = layers_for(Face::Idle, "sailor", &[]);
+        assert_eq!(l.base, "outfits/sailor/layered/idle.png");
+        assert!(l.tail && l.star);
+        assert_eq!(layers_for(Face::Walk2, "sailor", &[]).base, "outfits/sailor/layered/walk2.png");
+        let l = layers_for(Face::Happy, "sailor", &[]);
+        assert!(l.star && !l.tail);
+        // 别名：love → happy（分层），stare → think，yawn → idle（分层）
+        let l = layers_for(Face::Love, "sailor", &[]);
+        assert_eq!(l.base, "outfits/sailor/layered/happy.png");
+        assert!(l.star && !l.tail);
+        assert_eq!(layers_for(Face::Stare, "sailor", &[]).base, "outfits/sailor/think.png");
+        assert_eq!(layers_for(Face::Sleep, "sailor", &[]).base, "outfits/sailor/sleep.png");
+        assert!(layers_for(Face::Yawn, "sailor", &[]).tail);
+        assert!(!layers_for(Face::Idle, "sailor", &["santa".into()]).star);
+        // 原装卫衣："" 和 "hoodie" 一样
+        assert_eq!(layers_for(Face::Idle, "hoodie", &[]), layers_for(Face::Idle, "", &[]));
+        assert_eq!(layers_for(Face::Shy, "hoodie", &[]).base, "sprites/shy.png");
+        assert_eq!(layers_for(Face::Cry, "swim", &[]).base, "outfits/swim/hungry.png");
+    }
+
+    #[test]
+    fn new_outfit_sprites_are_400x587() {
+        for (c, _) in crate::core::costume::COSTUMES {
+            for f in Face::ALL {
+                let p = layers_for(f, c, &[]).base;
+                let png = Pixmap::decode_png(crate::assets::get(&p).unwrap()).unwrap();
+                assert_eq!((png.width(), png.height()), (400, 587), "{p}");
+            }
         }
     }
 

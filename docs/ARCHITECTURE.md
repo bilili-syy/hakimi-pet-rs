@@ -103,3 +103,8 @@ src/
 - 菜单：菜单表 `COSTUME` 末尾一行 `Gen("skin")`，由 `platform/skin_menu.rs` 生成「🎭 角色」子菜单，菜单 id `skin:<id>` / `skin:@open` / `skin:@reload` 都映射成 `MenuAction::Costume("skin:…")`（types.rs 冻结，没加变体）；行为层 `behavior/skin.rs` 认前缀，`skin:@open` 由平台层 on_menu 打开文件夹。
 - 钩子（只加不删）：`render/mod.rs`（update 开头 sync、draw_pet 选底图）、`behavior/mod.rs`（new 里 init、Costume 分支、say_opts 换台词）、`services/ai.rs`（system prompt 末尾追加 persona）、`services/tts.rs`（read_cache 先查 voiceDir）。
 - 存档新增字段（save.json）：`skin`（皮肤 id，缺省 = `hakimi`），存在 StatsData.extra 里，别的字段照旧保留。
+
+## 换装（feat/outfits）
+- 清单在 `core/costume.rs` 的 `COSTUMES`（菜单顺序、文字）；加一套衣服 = 放 `assets/outfits/<id>/` 8 张（idle/happy/drag/sit/sleep/eat/think/hungry，400×587）+ 加一行。
+- 默认是奶白水手服 `sailor`：config.json 里写 `""`（和 Electron 版互通，老配置的 `""` 也就换成了新默认）；原装卫衣是 `hoodie`。
+- 水手服走分层：`outfits/sailor/layered/{idle,blink,walk1,walk2,happy,eat,hungry}.png` + 原来的 tail/star 层；drag/sit/sleep/think 单张，其余表情按 `costume_alias` 回落。

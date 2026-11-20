@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(skin::saved_id(&b.stats.data.extra), "hakimi");
         assert!(b.calls.iter().any(|c| c == "skin:hakimi"));
         // 换角色不动整套衣服
-        assert_eq!(b.scene.costume, "");
+        assert_eq!(b.scene.costume, crate::core::costume::DEFAULT);
         // 不存在的包：不写存档，提示一句
         b.stats.data.extra.remove(skin::SAVE_KEY);
         menu(&mut b, "skin:不存在的包", 6000);
@@ -123,7 +123,7 @@ mod tests {
         menu(&mut b, skin::MENU_RELOAD, 9000);
         assert!(b.bubble.as_ref().is_some_and(|x| x.text.starts_with("找到 0 个角色包")));
         menu(&mut b, skin::MENU_OPEN, 12000);
-        assert_eq!(b.scene.costume, "");
+        assert_eq!(b.scene.costume, crate::core::costume::DEFAULT);
         // 普通换装照旧
         menu(&mut b, "maid", 15000);
         assert_eq!(b.scene.costume, "maid");

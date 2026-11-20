@@ -107,7 +107,7 @@ pub struct Config {
     pub user_name: String,
     pub reminders: Reminders,
     pub tts: TtsConfig,
-    /// "" / xmas / maid / jk
+    /// "" = 默认水手服 / hoodie / pajama / idol / swim / xmas / maid / jk（见 core::costume）
     pub costume: String,
     /// santa / glasses / scarf
     pub outfit: Vec<String>,
@@ -128,7 +128,7 @@ const DOC_FIELDS: [(&str, &str); 8] = [
     ("_proxy说明", "留空=跟随系统代理；也可填 http://127.0.0.1:7890 这样的地址"),
     ("_userName说明", "哈基米怎么称呼你，留空就叫「你」"),
     ("_reminders说明", "喝水/起身提醒间隔（分钟，0=关闭）；offWork 下班提醒时间，留空=关闭"),
-    ("_outfit说明", "换装：costume 是整套衣服（空=原装卫衣，xmas=圣诞小红裙，maid=女仆装，jk=JK水手服）；outfit 是配件，可同时戴多个（santa=圣诞帽、glasses=圆眼镜、scarf=四色围巾）。右键「换装」里点就行"),
+    ("_outfit说明", "换装：costume 是整套衣服（空=默认奶白水手服，hoodie=原装卫衣，pajama=猫耳睡衣，idol=偶像演出服，swim=泳装，xmas=圣诞小红裙，maid=女仆装，jk=JK水手服）；outfit 是配件，可同时戴多个（santa=圣诞帽、glasses=圆眼镜、scarf=四色围巾）。右键「换装」里点就行"),
     ("_moyu说明", "摸鱼监督：前台窗口是视频/社交/购物/游戏（keywords 匹配窗口标题，processes 匹配进程名）连续 minutes 分钟就来催你；番茄钟期间 pomodoroMinutes 分钟就催。只在本机判断，不记录窗口标题。enabled=false 关闭"),
     ("_tts说明", "语音用小米 MiMo TTS。apiKey 填 MiMo 开放平台的 Key；mode: clone=固定哈基米声线（默认）/ preset=预置音色(voice 填 冰糖、茉莉)/ design=按 style 文字现设计；speak: all=所有气泡都念 / chat=只念聊天回复 / off；volume 0~1"),
 ];
