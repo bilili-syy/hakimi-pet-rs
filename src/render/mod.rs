@@ -304,6 +304,7 @@ impl Renderer {
         // 角色包：当前皮肤有这个表情就用它（不画哈基米专属的尾巴/星星/配件），没有就回退内置
         let skin = skin_loader::base(&mut self.sprites, scene.face, sw, sh);
         let layers = match &skin { Some((k, _)) => skin_loader::strip_layers(layers, k), None => layers };
+        let skinned = skin.is_some();
         let base = skin.map(|s| s.1).or_else(|| self.sprites.asset(&layers.base, sw, sh));
         if let Some(base) = &base {
             if scene.glow {
@@ -330,7 +331,16 @@ impl Renderer {
             }
             // 眨眼 / 张嘴贴片：脸那一块随扭曲整体平移
             let lv = &scene.live;
-            if lv.blink > 0.003 || lv.mouth > 0.003 {
+            if (lv.blink > 0.003 || lv.mouth > 0.003) && skinned {
+                // 角色包：用包里和底图同尺寸的 blink / mouthOpen 叠加层，不盖哈基米的贴片
+                let head = body.pre_translate(0.0, -live::row_lift(lv, live::FACE_V));
+                for (name, a) in [("blink", lv.blink), ("mouthOpen", lv.mouth)] {
+                    if a > 0.003 && let Some(o) = skin_loader::overlay(&mut self.sprites, name, sw, sh) {
+                        let pp = PixmapPaint { opacity: a.min(1.0), ..paint };
+                        pm.draw_pixmap(0, 0, o.as_ref().as_ref(), &pp, head.pre_concat(to_box(&o)), None);
+                    }
+                }
+            } else if lv.blink > 0.003 || lv.mouth > 0.003 {
                 let pt = self.patches.get(scene.face, &scene.costume, (sw, sh));
                 let head = body.pre_translate(0.0, -live::row_lift(lv, live::FACE_V)).pre_concat(to_box(base));
                 for (p, a) in [(&pt.blink, lv.blink), (&pt.mouth, lv.mouth)] {
