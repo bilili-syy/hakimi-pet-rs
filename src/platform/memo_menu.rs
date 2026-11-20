@@ -4,7 +4,7 @@
 use crate::core::memo::{self as store, Now};
 use crate::types::{MemoAct, MenuAction};
 use std::cell::RefCell;
-use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{MenuItem, PredefinedMenuItem, Submenu};
 
 /// 子菜单里最多列多少条
 const MAX_ITEMS: usize = 20;
@@ -19,14 +19,12 @@ thread_local! {
     static MM: RefCell<Option<MemoMenu>> = const { RefCell::new(None) };
 }
 
-/// 插到 root 里 after 那一项的后面（找不到就放最后）
-pub fn init(root: &Menu, after: &MenuId) {
+/// 建「📝 备忘录」子菜单并返回它（菜单表 menu::MENU 里 `Gen("memo")` 那一格由 menu.rs 放进去）
+pub fn init() -> Submenu {
     let sub = Submenu::new("📝 备忘录", true);
-    let items = root.items();
-    let pos = items.iter().position(|k| k.id() == after).map(|p| p + 1).unwrap_or(items.len());
-    let _ = root.insert(&sub, pos);
-    MM.with(|m| *m.borrow_mut() = Some(MemoMenu { sub, shown: None }));
+    MM.with(|m| *m.borrow_mut() = Some(MemoMenu { sub: sub.clone(), shown: None }));
     refresh(false);
+    sub
 }
 
 /// 菜单文字里的 & 是助记符，要转义；太长的截断

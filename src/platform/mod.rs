@@ -14,6 +14,7 @@ mod memo_menu;
 mod skin_menu;
 mod menu;
 mod perch;
+mod settings;
 mod sys;
 mod timers;
 mod toy;
@@ -50,7 +51,11 @@ pub(crate) const WM_APP_SECOND: u32 = WM_APP + 3;
 const WM_APP_DPI: u32 = WM_APP + 4;
 /// 自动化/自测用：PostMessage(hwnd, WM_APP+9, i, 0) 等于点了 DEBUG_MENU[i] 那个菜单项
 const WM_APP_DEBUG_MENU: u32 = WM_APP + 9;
-const DEBUG_MENU: [&str; 10] = ["feed", "feednow", "game", "climb", "weather", "checkin", "status", "walk", "pat", "dance:"];
+/// 10 = 打开设置窗口，11 = 打开聊天框
+const DEBUG_MENU: [&str; 12] =
+    ["feed", "feednow", "game", "climb", "weather", "checkin", "status", "walk", "pat", "dance:", "settings", "chat"];
+/// 自测用：PostMessage(hwnd, WM_APP+10, 0, 0) = 在她身上弹出右键菜单（截图用）
+const WM_APP_DEBUG_POPUP: u32 = WM_APP + 10;
 const TIMER_ID: usize = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_POWERBROADCAST: u32 = 0x0218;
@@ -64,6 +69,8 @@ const EVENT_FRAME_GAP: u64 = 16;
 
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static SCALE_BITS: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0f32
+/// 系统 DPI 缩放（不含用户在设置里选的大小倍数）
+static DPI_BITS: AtomicU32 = AtomicU32::new(0x3f80_0000);
 static EVENT_QUEUE: Mutex<VecDeque<AppEvent>> = Mutex::new(VecDeque::new());
 pub(crate) static MENU_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 /// 番茄钟结束时间（epoch 毫秒），0 = 没开
@@ -112,8 +119,11 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
     };
     MAIN_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
 
-    let scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
-    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let dpi = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
+    let dpi = if dpi > 0.0 { dpi } else { 1.0 };
+    DPI_BITS.store(dpi.to_bits(), Ordering::Relaxed);
+    // 实际缩放 = 系统 DPI × 设置里的「哈基米大小」
+    let scale = dpi * crate::core::config::get().scale;
     SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
     let w = (WIN_W as f32 * scale).round() as i32;
     let h = (WIN_H as f32 * scale).round() as i32;
@@ -172,6 +182,10 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
     unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            // 设置窗口：Tab 切换、回车保存、Esc 取消
+            if settings::dialog_message(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -575,7 +589,8 @@ fn after(a: MenuAction) {
             }
         }
         MenuAction::AutoStart(on) => sys::set_autostart(on),
-        MenuAction::OpenSettings => {
+        MenuAction::OpenSettings => settings::open(0),
+        MenuAction::OpenConfigFile => {
             let f = crate::core::paths::config_file();
             if !f.exists() {
                 crate::core::config::reload(); // 确保文件存在且字段齐全
@@ -594,9 +609,11 @@ fn after(a: MenuAction) {
         }
         MenuAction::ReloadSettings => {
             let cfg = crate::core::config::get();
+            let dpi = f32::from_bits(DPI_BITS.load(Ordering::Relaxed));
             with(|s| {
                 s.reminders = Reminders::schedule(&cfg.reminders, now);
                 s.set_watch(cfg.moyu.enabled, now);
+                s.set_scale(dpi * cfg.scale);
             });
         }
         MenuAction::Moyu(on) => {
@@ -1226,6 +1243,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 menu::refresh();
                 LRESULT(0)
             }
+            WM_TIMER if wp.0 == menu::TRAY_CLICK_TIMER => {
+                menu::tray_click_timer();
+                LRESULT(0)
+            }
+            WM_APP_DEBUG_POPUP => {
+                menu::popup();
+                LRESULT(0)
+            }
             WM_TIMER if wp.0 == TIMER_ID => {
                 tick();
                 LRESULT(0)
@@ -1238,7 +1263,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_APP_DPI => {
                 let dpi = wp.0 as f32;
                 if dpi > 0.0 {
-                    with(|s| s.set_scale(dpi / 96.0));
+                    let dpi = dpi / 96.0;
+                    DPI_BITS.store(dpi.to_bits(), Ordering::Relaxed);
+                    let user = crate::core::config::get().scale;
+                    with(|s| s.set_scale(dpi * user));
                     rearm();
                 }
                 LRESULT(0)

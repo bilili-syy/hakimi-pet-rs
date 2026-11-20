@@ -419,6 +419,33 @@ fn request_once(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_secs
     Ok(wav)
 }
 
+// ------------------------------------------------------------------ 设置窗口「试听」
+
+/// 试听用的一句（内置录音里也有，没填 Key 时 clone 模式直接放内置的）
+pub const SAMPLE: &str = "喵？找哈基米有事吗～";
+
+/// 用设置窗口里还没保存的语音设置合成一句（阻塞，后台线程调）。失败返回中文原因（不含 Key）
+pub fn synth_test(t: &TtsConfig, text: &str) -> Result<Vec<u8>, String> {
+    if t.api_key.trim().is_empty() { return Err("还没填 MiMo Key".into()); }
+    let mut t = t.clone();
+    t.api_key = t.api_key.trim().to_string();
+    request_once(&t, &clean(text), None, 25).map_err(|f| {
+        let m = f.msg;
+        if m.contains("HTTP 401") || m.contains("HTTP 403") {
+            "MiMo Key 不对或已失效".into()
+        } else if m.contains("429") {
+            "请求太频繁（限流），过 10 秒再试".into()
+        } else if m == "timeout" {
+            "连接超时，检查一下网络".into()
+        } else if m.starts_with("HTTP ") {
+            let s: String = m.chars().take(80).collect();
+            format!("合成失败：{s}")
+        } else {
+            "连不上 MiMo 服务器，检查一下网络".into()
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

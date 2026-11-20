@@ -30,13 +30,12 @@ fn label(s: &str, max: usize) -> String {
     t.replace('&', "&&")
 }
 
-/// 追加到「换装」子菜单末尾
-pub fn init(costume_sub: &Submenu) {
+/// 建「🎭 角色」子菜单（菜单表 menu.rs 的 `Gen("skin")`，放在「👗 换装」末尾）
+pub fn init() -> Submenu {
     let sub = Submenu::new("🎭 角色", true);
-    let _ = costume_sub.append(&PredefinedMenuItem::separator());
-    let _ = costume_sub.append(&sub);
-    SM.with(|m| *m.borrow_mut() = Some(SkinMenu { sub, items: Vec::new(), shown: None }));
+    SM.with(|m| *m.borrow_mut() = Some(SkinMenu { sub: sub.clone(), items: Vec::new(), shown: None }));
     refresh(false);
+    sub
 }
 
 pub fn refresh(popup_open: bool) {
