@@ -93,6 +93,8 @@ pub enum MenuAction {
     Tts(bool), TtsChatOnly(bool), Moyu(bool),
     ForgetChat, OpenDataDir, AutoStart(bool),
     ToggleVisible, CallToCenter, Quit,
+    /// 跳个舞：舞谱 id（behavior::dance::SCORES），"" = 随机挑一支
+    Dance(String),
 }
 
 // ---------------------------------------------------------------- 事件
