@@ -11,15 +11,17 @@
 
 mod chat;
 mod menu;
+mod perch;
 mod sys;
 mod timers;
+mod toy;
 mod watch;
 #[cfg(test)]
 mod selftest;
 
 use crate::types::{
-    AppEvent, Button, ChatInputCmd, EventSender, Frame, Handler, MenuAction, MouseEv, PomodoroEv, WIN_H, WIN_W,
-    WinCmd,
+    AppEvent, Button, ChatInputCmd, EventSender, Frame, Handler, MenuAction, MouseEv, PerchKind, PomodoroEv, ToyCmd,
+    ToyEv, ToyKind, WIN_H, WIN_W, WinCmd,
 };
 use chat::Chat;
 use std::cell::{Cell, RefCell};
@@ -147,6 +149,12 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
             chat,
             quitting: false,
             shown_once: false,
+            hop: None,
+            perch: None,
+            toy: None,
+            cursor_poll: 0,
+            cursor_next: 0,
+            last_cursor: (i32::MIN, i32::MIN),
         })
     });
     menu::init();
@@ -188,6 +196,8 @@ pub fn open_path(path: &std::path::Path) {
 // ---------------------------------------------------------------- 状态
 
 struct Walk {
+    /// 在追道具（走完发 Toy(Reached) 而不是 WalkDone）
+    chase: bool,
     dir: i32,
     speed: f32,
     distance: f32,
@@ -196,6 +206,28 @@ struct Walk {
     min_x: f32,
     max_x: f32,
 }
+
+/// 跳上窗口/屏幕边的抛物线
+struct Hop {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    t0: u64,
+    dur: u64,
+    arc: f32,
+    kind: PerchKind,
+    target: Option<(HWND, perch::R)>,
+}
+
+/// 正坐在某个窗口上沿
+struct Perch {
+    hwnd: HWND,
+    rect: perch::R,
+    next: u64,
+}
+
+const PERCH_CHECK: u64 = 250;
 
 struct Fall {
     vy: f32,
@@ -249,6 +281,13 @@ struct Plat {
     chat: Option<Chat>,
     quitting: bool,
     shown_once: bool,
+    hop: Option<Hop>,
+    perch: Option<Perch>,
+    toy: Option<toy::Toy>,
+    /// 光标轮询间隔（0 = 关）
+    cursor_poll: u32,
+    cursor_next: u64,
+    last_cursor: (i32, i32),
 }
 
 enum Pending {
@@ -320,8 +359,14 @@ fn rearm() {
         }
         let now = now_ms();
         let mut due = s.next_frame;
-        if s.walk.is_some() || s.fall.is_some() {
+        if s.phys_active() {
             due = due.min(s.phys_last + PHYS_STEP);
+        }
+        if let Some(p) = &s.perch {
+            due = due.min(p.next);
+        }
+        if s.cursor_poll > 0 {
+            due = due.min(s.cursor_next);
         }
         if let Some(t) = s.watch_next {
             due = due.min(t);
@@ -348,6 +393,8 @@ fn tick() {
     let mut evs = Vec::new();
     let pomo_done = with(|s| {
         s.physics(now, &mut evs);
+        s.check_perch(now, &mut evs);
+        s.poll_cursor(now, &mut evs);
         s.timers(now, &mut evs)
     })
     .unwrap_or(false);
@@ -394,10 +441,36 @@ fn apply(out: Vec<WinCmd>) {
             WinCmd::WalkStop => {
                 with(|s| s.walk = None);
             }
+            WinCmd::CursorPoll(ms) => {
+                with(|s| {
+                    s.cursor_poll = ms;
+                    s.cursor_next = now_ms();
+                });
+            }
+            WinCmd::Climb(kind) => {
+                if let Some(ev) = with(|s| s.climb(kind)).flatten() {
+                    emit(ev);
+                }
+            }
+            WinCmd::Unperch => {
+                with(|s| {
+                    s.perch = None;
+                    s.hop = None;
+                    s.walk = None;
+                    s.start_fall();
+                });
+            }
+            WinCmd::Toy(t) => {
+                if let Some(ev) = with(|s| s.toy_cmd(t)).flatten() {
+                    emit(ev);
+                }
+            }
             WinCmd::DragMove { sx, sy } => {
                 with(|s| {
                     s.fall = None;
                     s.walk = None;
+                    s.hop = None;
+                    s.perch = None;
                     s.move_to(sx - s.drag_off.0, sy - s.drag_off.1);
                 });
             }
@@ -604,6 +677,8 @@ impl Plat {
     fn call_to_center(&mut self) {
         self.walk = None;
         self.fall = None;
+        self.hop = None;
+        self.perch = None;
         let wa = self.work_area();
         let x = (wa.left as f32 + (wa.right - wa.left) as f32 * 0.62 - self.w as f32 / 2.0).round() as i32;
         self.move_to(x, wa.bottom - self.h);
@@ -615,7 +690,9 @@ impl Plat {
         let m = 20.0 * self.scale;
         let min_x = wa.left as f32 - m;
         let max_x = ((wa.right - self.w) as f32 + m).max(min_x);
-        self.walk = Some(Walk { dir: dir.signum(), speed, distance, moved: 0.0, xf: self.x as f32, min_x, max_x });
+        self.walk = Some(Walk { chase: false, dir: dir.signum(), speed, distance, moved: 0.0, xf: self.x as f32, min_x, max_x });
+        self.perch = None;
+        self.hop = None;
         self.phys_last = now_ms();
         self.phys_acc = 0;
     }
@@ -632,8 +709,16 @@ impl Plat {
         self.phys_acc = 0;
     }
 
+    fn phys_active(&self) -> bool {
+        self.walk.is_some()
+            || self.fall.is_some()
+            || self.hop.is_some()
+            || self.toy.as_ref().is_some_and(|t| t.falling || t.kind == ToyKind::Teaser)
+    }
+
     fn physics(&mut self, now: u64, evs: &mut Vec<AppEvent>) {
-        if self.walk.is_none() && self.fall.is_none() {
+        self.hop_step(now, evs);
+        if !self.phys_active() {
             self.phys_last = now;
             self.phys_acc = 0;
             return;
@@ -673,12 +758,19 @@ impl Plat {
             let x = w.xf.round() as i32;
             let done = hit_edge || w.moved >= w.distance;
             if done {
+                let chase = w.chase;
                 self.walk = None;
-                evs.push(AppEvent::WalkDone { hit_edge });
+                if chase {
+                    let ok = self.toy_dx().is_some_and(|dx| dx.abs() as f32 <= 60.0 * s);
+                    evs.push(AppEvent::Toy(ToyEv::Reached { ok }));
+                } else {
+                    evs.push(AppEvent::WalkDone { hit_edge });
+                }
             }
             let y = self.y;
             self.move_to(x, y);
         }
+        self.toy_step(evs);
     }
 
     /// 提醒 / 番茄钟 / 摸鱼采样。返回番茄钟是否刚结束（要刷新菜单）
@@ -799,6 +891,207 @@ impl Plat {
         let cx = (lp.0 & 0xffff) as u16 as i16 as i32;
         let cy = ((lp.0 >> 16) & 0xffff) as u16 as i16 as i32;
         (cx as f32 / self.scale, cy as f32 / self.scale, self.x + cx, self.y + cy)
+    }
+}
+
+// ---------------------------------------------------------------- 新互动：光标、爬窗口、小道具
+impl Plat {
+    /// 她嘴巴的屏幕位置（立绘 400×587 里约 (168, 235)，盒子 200×293 在窗口 (20, 67)）
+    fn mouth(&self) -> (i32, i32) {
+        (self.x + (104.0 * self.scale) as i32, self.y + (185.0 * self.scale) as i32)
+    }
+
+    fn poll_cursor(&mut self, now: u64, evs: &mut Vec<AppEvent>) {
+        if self.cursor_poll == 0 || now < self.cursor_next {
+            return;
+        }
+        self.cursor_next = now + self.cursor_poll as u64;
+        if !self.is_visible() {
+            return;
+        }
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_err() {
+            return;
+        }
+        let rel = (p.x - self.x, p.y - self.y);
+        if rel == self.last_cursor {
+            return;
+        }
+        self.last_cursor = rel;
+        evs.push(AppEvent::Cursor { x: rel.0 as f32 / self.scale, y: rel.1 as f32 / self.scale });
+    }
+
+    /// 开始跳上窗口/屏幕边；不行返回 ClimbFailed
+    fn climb(&mut self, kind: PerchKind) -> Option<AppEvent> {
+        if self.fall.is_some() || self.hop.is_some() || !self.is_visible() {
+            return Some(AppEvent::ClimbFailed);
+        }
+        let cx = self.x + self.w / 2;
+        let (target, to) = match kind {
+            PerchKind::WindowTop => {
+                let own: Vec<HWND> = std::iter::once(self.hwnd).chain(self.toy.as_ref().map(|t| t.hwnd)).collect();
+                let Some((h, r)) = perch::foreground(&own) else { return Some(AppEvent::ClimbFailed) };
+                let work: perch::R =
+                    work_area_at(POINT { x: (r.l + r.r) / 2, y: r.t.max(0) + 10 }, MONITOR_DEFAULTTONEAREST).into();
+                let Some(to) = perch::window_perch(r, work, cx, self.w, self.h, self.scale) else {
+                    return Some(AppEvent::ClimbFailed);
+                };
+                (Some((h, r)), to)
+            }
+            PerchKind::ScreenSide => (None, perch::side_perch(self.work_area().into(), cx, self.w, self.h)),
+        };
+        self.walk = None;
+        self.perch = None;
+        let (x0, y0) = (self.x as f32, self.y as f32);
+        let (x1, y1) = (to.0 as f32, to.1 as f32);
+        let dist = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt() / self.scale;
+        let dur = (450.0 + dist * 0.6).clamp(450.0, 1300.0) as u64;
+        let arc = 50.0 * self.scale + (y0 - y1).max(0.0) * 0.15;
+        self.hop = Some(Hop { x0, y0, x1, y1, t0: now_ms(), dur, arc, kind, target });
+        self.phys_last = now_ms();
+        self.phys_acc = 0;
+        None
+    }
+
+    fn hop_step(&mut self, now: u64, evs: &mut Vec<AppEvent>) {
+        let Some(h) = &self.hop else { return };
+        let p = (now.saturating_sub(h.t0) as f32 / h.dur as f32).min(1.0);
+        let x = h.x0 + (h.x1 - h.x0) * p;
+        let y = h.y0 + (h.y1 - h.y0) * p - h.arc * 4.0 * p * (1.0 - p);
+        let (kind, target) = (h.kind, h.target);
+        self.move_to(x.round() as i32, y.round() as i32);
+        if p >= 1.0 {
+            self.hop = None;
+            if let Some((hwnd, rect)) = target {
+                // 跳的途中窗口没了/挪了：直接掉下去
+                if !perch::usable(hwnd) || perch::frame_rect(hwnd).is_none_or(|r| perch::moved(r, rect)) {
+                    self.start_fall();
+                    evs.push(AppEvent::PerchLost);
+                    return;
+                }
+                self.perch = Some(Perch { hwnd, rect, next: now + PERCH_CHECK });
+            }
+            evs.push(AppEvent::Perched(kind));
+        }
+    }
+
+    /// 坐着的窗口还在不在原地；不在了就掉下去
+    fn check_perch(&mut self, now: u64, evs: &mut Vec<AppEvent>) {
+        let Some(p) = &mut self.perch else { return };
+        if now < p.next {
+            return;
+        }
+        p.next = now + PERCH_CHECK;
+        let ok = perch::usable(p.hwnd) && perch::frame_rect(p.hwnd).is_some_and(|r| !perch::moved(r, p.rect));
+        if !ok {
+            self.perch = None;
+            self.start_fall();
+            evs.push(AppEvent::PerchLost);
+        }
+    }
+
+    /// 道具中心相对她身体中线（物理像素）
+    fn toy_dx(&self) -> Option<i32> {
+        let t = self.toy.as_ref()?;
+        Some(t.center().0 - (self.x + self.w / 2))
+    }
+
+    fn toy_floor(&self, t: &toy::Toy) -> i32 {
+        let wa = work_area_at(POINT { x: t.x + t.size / 2, y: t.y + t.size / 2 }, MONITOR_DEFAULTTONEAREST);
+        // 小鱼干画在 64 格子中间偏下，底下留了一截透明
+        wa.bottom - t.size + (16.0 * self.scale) as i32
+    }
+
+    fn toy_cmd(&mut self, cmd: ToyCmd) -> Option<AppEvent> {
+        match cmd {
+            ToyCmd::Spawn { kind, side, offset } => {
+                self.toy = None;
+                let size = (crate::render::toy::TOY * self.scale).round() as i32;
+                let (x, y) = if kind == ToyKind::Teaser {
+                    let mut p = POINT::default();
+                    unsafe {
+                        let _ = GetCursorPos(&mut p);
+                    }
+                    self.teaser_pos(p.x, p.y)
+                } else {
+                    let wa = self.work_area();
+                    let cx = self.x + self.w / 2;
+                    let off = (offset * self.scale) as i32;
+                    let mut x = cx + side.signum() * off - size / 2;
+                    if x < wa.left || x + size > wa.right {
+                        x = cx - side.signum() * off - size / 2;
+                    }
+                    (x.clamp(wa.left, wa.right - size), (self.y + (67.0 * self.scale) as i32).max(wa.top))
+                };
+                let mut t = toy::Toy::create(kind, x, y, self.scale)?;
+                t.falling = kind != ToyKind::Teaser;
+                self.toy = Some(t);
+                self.phys_last = now_ms();
+                self.phys_acc = 0;
+                None
+            }
+            ToyCmd::Fall => {
+                if let Some(t) = &mut self.toy {
+                    t.falling = true;
+                    t.vy = 0.0;
+                    self.phys_last = now_ms();
+                }
+                None
+            }
+            ToyCmd::Chase { speed } => {
+                let dx = self.toy_dx()?;
+                let reach = (40.0 * self.scale) as i32;
+                if dx.abs() <= reach {
+                    return Some(AppEvent::Toy(ToyEv::Reached { ok: true }));
+                }
+                self.start_walk(dx.signum(), (dx.abs() - reach / 2) as f32, speed);
+                if let Some(w) = &mut self.walk {
+                    w.chase = true;
+                }
+                None
+            }
+            ToyCmd::Remove => {
+                self.toy = None;
+                None
+            }
+        }
+    }
+
+    /// 逗猫棒窗口位置：毛球对准光标
+    fn teaser_pos(&self, cx: i32, cy: i32) -> (i32, i32) {
+        let (tx, ty) = crate::render::toy::TEASER_TIP;
+        (cx - (tx * self.scale) as i32, cy - (ty * self.scale) as i32)
+    }
+
+    fn toy_step(&mut self, evs: &mut Vec<AppEvent>) {
+        let Some(kind) = self.toy.as_ref().map(|t| t.kind) else { return };
+        if kind == ToyKind::Teaser {
+            let mut p = POINT::default();
+            if unsafe { GetCursorPos(&mut p) }.is_ok() {
+                let (x, y) = self.teaser_pos(p.x, p.y);
+                if let Some(t) = &mut self.toy {
+                    t.move_to(x, y);
+                }
+            }
+            return;
+        }
+        let floor = match &self.toy {
+            Some(t) if t.falling && !t.dragging => self.toy_floor(t),
+            _ => return,
+        };
+        let s = self.scale;
+        let pet_cx = self.x + self.w / 2;
+        let Some(t) = &mut self.toy else { return };
+        t.vy += 1.6 * s;
+        let mut y = t.y as f32 + t.vy;
+        if y >= floor as f32 {
+            y = floor as f32;
+            t.falling = false;
+            t.vy = 0.0;
+            evs.push(AppEvent::Toy(ToyEv::Landed { dx: (t.center().0 - pet_cx) as f32 / s }));
+        }
+        let x = t.x;
+        t.move_to(x, y.round() as i32);
     }
 }
 
@@ -967,6 +1260,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                     MouseEv::Move { x, y, sx, sy }
                 });
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wp.0 >> 16) & 0xffff) as u16 as i16 as i32;
+                let sx = (lp.0 & 0xffff) as u16 as i16 as i32;
+                let sy = ((lp.0 >> 16) & 0xffff) as u16 as i16 as i32;
+                if let Some(ev) = with(|s| MouseEv::Wheel { delta, x: (sx - s.x) as f32 / s.scale, y: (sy - s.y) as f32 / s.scale }) {
+                    emit(AppEvent::Mouse(ev));
+                    pump();
+                }
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {

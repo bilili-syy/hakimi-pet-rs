@@ -12,7 +12,7 @@ pub const COSTUMES: [(&str, &str); 4] =
     [("", "🤍 原装卫衣"), ("xmas", "🎄 圣诞小红裙"), ("maid", "🎀 女仆装"), ("jk", "🏫 JK 水手服")];
 pub const OUTFITS: [(&str, &str); 3] = [("santa", "🎅 圣诞帽"), ("glasses", "👓 圆眼镜"), ("scarf", "🧣 四色围巾")];
 /// 番茄钟项在顶层菜单里的位置
-const POMO_POS: usize = 10;
+const POMO_POS: usize = 15;
 /// 托盘左键单击的伪菜单 id
 pub const TRAY_LEFT: &str = "tray:left";
 
@@ -117,15 +117,20 @@ pub fn init() {
 
     let _ = root.append_items(&[
         &item("chat", "💬 和哈基米聊天"),
-        &item("feed", "🐟 喂小鱼干"),
-        &item("pat", "✋ 摸摸头"),
+        &item("feed", "🐟 扔小鱼干（拖到她嘴边也行）"),
+        &item("feednow", "🍽️ 直接喂到嘴里"),
+        &item("pat", "✋ 摸摸头（滚轮也能撸）"),
         &item("honey", "🍯 喂蜂蜜水（喝完跑得飞快）"),
+        &item("game", "🪶 小游戏：逗猫棒"),
         &item("song", "🎵 哈基米之歌"),
         &item("songdir", "📂 放歌的文件夹（把歌拖进去）"),
         &item("status", "📊 看看状态"),
+        &item("checkin", "📅 今日签到"),
+        &item("weather", "🌦️ 天气播报"),
         &sep(),
         &item("sleep", "💤 去睡觉"),
         &item("walk", "🚶 去溜达"),
+        &item("climb", "🧗 爬到当前窗口上"),
         &pomo_sub, // POMO_POS
         &costume_sub,
         &sep(),
@@ -261,6 +266,11 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
     Some(match id {
         "chat" => A::Chat,
         "feed" => A::Feed,
+        "feednow" => A::FeedNow,
+        "game" => A::Game,
+        "checkin" => A::CheckIn,
+        "weather" => A::WeatherReport,
+        "climb" => A::Climb,
         "pat" => A::Pat,
         "honey" => A::Honey,
         "song" => A::Song,
@@ -317,5 +327,10 @@ mod tests {
         assert_eq!(parse_id(TRAY_LEFT, off), Some(A::ToggleVisible));
         assert_eq!(parse_id("quit", off), Some(A::Quit));
         assert_eq!(parse_id("nope", off), None);
+        assert_eq!(parse_id("game", off), Some(A::Game));
+        assert_eq!(parse_id("feednow", off), Some(A::FeedNow));
+        assert_eq!(parse_id("checkin", off), Some(A::CheckIn));
+        assert_eq!(parse_id("weather", off), Some(A::WeatherReport));
+        assert_eq!(parse_id("climb", off), Some(A::Climb));
     }
 }
