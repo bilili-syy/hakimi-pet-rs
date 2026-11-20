@@ -16,6 +16,7 @@ mod skin_menu;
 mod menu;
 mod perch;
 mod power;
+mod sense;
 mod settings;
 mod sys;
 mod timers;
@@ -478,6 +479,10 @@ fn tick() {
         menu::refresh();
     }
     memo_prewarm();
+    // 场景感知：走开/回来、打字、晃鼠标、全屏、音乐
+    if let Some(h) = with(|s| s.hwnd) {
+        sense::maybe_poll(now, h, &mut evs);
+    }
     for e in evs {
         emit(e);
     }

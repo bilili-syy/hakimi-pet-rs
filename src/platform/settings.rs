@@ -134,6 +134,7 @@ const ID_PLAY_RESULT: i32 = 142;
 const ID_AUTOSTART: i32 = 150;
 const ID_SCALE: i32 = 151;
 const ID_FPS: i32 = 164;
+const ID_BIRTHDAY: i32 = 165;
 const ID_CITY: i32 = 152;
 const ID_MOYU: i32 = 153;
 const ID_MOYU_MIN: i32 = 154;
@@ -718,7 +719,9 @@ impl Dlg {
         self.label(p, "天气城市", [X0, 118.0, LW, 26.0]);
         let city = self.edit(p, ID_CITY, 0, [FX, 118.0, 170.0, 26.0]);
         cue(city, "留空 = 自动定位");
-        self.hint(p, "如：北京、上海", [FX + 178.0, 118.0, FW - 178.0, 26.0]);
+        self.label(p, "主人生日", [FX + 184.0, 118.0, 64.0, 26.0]);
+        let bd = self.edit(p, ID_BIRTHDAY, 0, [FX + 250.0, 118.0, FW - 250.0, 26.0]);
+        cue(bd, "如 4-3");
         self.button(p, ID_MOYU, "摸鱼监督（看视频/刷社交太久会来催你）", BS_AUTOCHECKBOX, [X0, 156.0, 360.0, 24.0]);
         self.label(p, "连续摸鱼", [X0 + 18.0, 186.0, 70.0, 26.0]);
         self.edit(p, ID_MOYU_MIN, ES_NUMBER, [X0 + 88.0, 186.0, 46.0, 26.0]);
@@ -807,6 +810,7 @@ impl Dlg {
         combo_set(self.c(ID_SCALE), nearest_scale(c.scale));
         combo_set(self.c(ID_FPS), FPS.iter().position(|x| x.0 == crate::core::config::clamp_fps(c.fps)).unwrap_or(1));
         set_text(self.c(ID_CITY), &c.weather_city);
+        set_text(self.c(ID_BIRTHDAY), &c.birthday);
         set_checked(self.c(ID_MOYU), c.moyu.enabled);
         set_text(self.c(ID_MOYU_MIN), &c.moyu.minutes.to_string());
         set_text(self.c(ID_MOYU_POMO), &c.moyu.pomodoro_minutes.to_string());
@@ -1008,6 +1012,8 @@ impl Dlg {
         c.scale = SCALES[combo_sel(self.c(ID_SCALE)).min(SCALES.len() - 1)].0;
         c.fps = FPS[combo_sel(self.c(ID_FPS)).min(FPS.len() - 1)].0;
         c.weather_city = get_text(self.c(ID_CITY)).trim().to_string();
+        let bd = get_text(self.c(ID_BIRTHDAY));
+        c.birthday = crate::behavior::norm_birthday(&bd).unwrap_or_default();
         c.moyu.enabled = checked(self.c(ID_MOYU));
         let num = |id: i32, name: &str, max: u32| -> Result<u32, (u8, String)> {
             parse_minutes(&get_text(self.c(id)), max).ok_or((2, format!("「{name}」要填 0~{max} 的整数")))
@@ -1063,7 +1069,7 @@ fn differs(a: &Config, b: &Config) -> bool {
             c.user_name.clone(),
             format!("{:?}{:?}{:?}{:?}{:?}{:?}{}", c.tts.enabled, c.tts.chat_voice_reply, c.tts.speak, c.tts.api_key, c.tts.mode, c.tts.voice, c.tts.style),
             ((c.tts.volume * 100.0).round() as i32, (c.scale * 100.0).round() as i32),
-            c.weather_city.clone(),
+            (c.weather_city.clone(), c.birthday.clone()),
             (c.moyu.enabled, c.moyu.minutes, c.moyu.pomodoro_minutes, c.reminders.water, c.reminders.stand_up),
             c.reminders.off_work.clone(),
         )

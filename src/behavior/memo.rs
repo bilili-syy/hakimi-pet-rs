@@ -125,6 +125,9 @@ impl Behavior {
         token
     }
 
+    /// 这个 token 是提醒的（叮咚/提醒语音）
+    pub(super) fn memo_token(&self, t: u64) -> bool { t != 0 && t == self.memo.bubble_token }
+
     /// 提醒还响着（没点、没过 ALERT_MS）：发呆换动作/打招呼/天气这些闲事先别来盖掉提醒气泡
     pub(super) fn memo_ringing(&self) -> bool { self.memo.active(self.now) }
 

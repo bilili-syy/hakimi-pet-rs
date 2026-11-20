@@ -7,12 +7,13 @@ use crate::types::{Face, VoiceMood};
 
 /// 只用现有立绘名
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Emotion { Happy, Love, Shy, Surprised, Cry, Hiss, Think, Dizzy, Stare, Yawn, Idle }
+pub enum Emotion { Happy, Love, Shy, Surprised, Cry, Hiss, Think, Dizzy, Stare, Yawn, Idle, Pout, Smug, Confused, Scared, Starry, Puff }
 
 impl Emotion {
-    pub const ALL: [Emotion; 11] = [
+    pub const ALL: [Emotion; 17] = [
         Emotion::Happy, Emotion::Love, Emotion::Shy, Emotion::Surprised, Emotion::Cry, Emotion::Hiss,
         Emotion::Think, Emotion::Dizzy, Emotion::Stare, Emotion::Yawn, Emotion::Idle,
+        Emotion::Pout, Emotion::Smug, Emotion::Confused, Emotion::Scared, Emotion::Starry, Emotion::Puff,
     ];
 
     pub fn label(self) -> &'static str { self.face().stem() }
@@ -30,6 +31,12 @@ impl Emotion {
             Emotion::Stare => Face::Stare,
             Emotion::Yawn => Face::Yawn,
             Emotion::Idle => Face::Idle,
+            Emotion::Pout => Face::Pout,
+            Emotion::Smug => Face::Smug,
+            Emotion::Confused => Face::Confused,
+            Emotion::Scared => Face::Scared,
+            Emotion::Starry => Face::Starry,
+            Emotion::Puff => Face::Puff,
         }
     }
 
@@ -37,11 +44,11 @@ impl Emotion {
     /// 同一种表情不管是标签给的还是状态给的，念出来语气一样，缓存键也一样（能互相命中）
     pub fn voice_mood(self) -> VoiceMood {
         match self {
-            Emotion::Happy | Emotion::Love | Emotion::Shy => VoiceMood::Happy,
-            Emotion::Cry | Emotion::Dizzy => VoiceMood::Sad,
+            Emotion::Happy | Emotion::Love | Emotion::Shy | Emotion::Smug | Emotion::Starry => VoiceMood::Happy,
+            Emotion::Cry | Emotion::Dizzy | Emotion::Pout | Emotion::Scared => VoiceMood::Sad,
             Emotion::Yawn => VoiceMood::Sleepy,
-            Emotion::Hiss => VoiceMood::Mad,
-            Emotion::Think => VoiceMood::Think,
+            Emotion::Hiss | Emotion::Puff => VoiceMood::Mad,
+            Emotion::Think | Emotion::Confused => VoiceMood::Think,
             Emotion::Surprised | Emotion::Stare | Emotion::Idle => VoiceMood::Calm,
         }
     }
@@ -55,14 +62,20 @@ impl Emotion {
             return Some(*e);
         }
         Some(match s {
-            "joy" | "smile" | "excited" | "glad" => Emotion::Happy,
+            "joy" | "smile" | "glad" => Emotion::Happy,
+            "excited" | "sparkle" | "amazed" | "stars" => Emotion::Starry,
+            "sulk" | "sulky" | "wronged" | "pouting" => Emotion::Pout,
+            "proud" | "smirk" | "cocky" => Emotion::Smug,
+            "puzzled" | "huh" | "question" => Emotion::Confused,
+            "scare" | "afraid" | "fear" | "frightened" => Emotion::Scared,
+            "huff" | "humph" | "tsundere" | "pouty" => Emotion::Puff,
             "heart" | "loving" | "affection" => Emotion::Love,
             "blush" | "shyness" | "embarrassed" => Emotion::Shy,
             "surprise" | "shock" | "shocked" | "wow" => Emotion::Surprised,
             "sad" | "crying" | "tear" | "tears" => Emotion::Cry,
             "angry" | "mad" | "anger" | "annoyed" => Emotion::Hiss,
             "thinking" | "thoughtful" | "curious" => Emotion::Think,
-            "confused" | "giddy" => Emotion::Dizzy,
+            "giddy" => Emotion::Dizzy,
             "staring" | "speechless" => Emotion::Stare,
             "sleepy" | "tired" | "yawning" => Emotion::Yawn,
             "neutral" | "calm" | "normal" | "none" => Emotion::Idle,
@@ -72,7 +85,7 @@ impl Emotion {
 }
 
 /// 写进系统提示词的一句
-pub const PROMPT: &str = "每条回复的最开头必须先写一个表情标签，只能从这些里选一个：[happy] [love] [shy] [surprised] [cry] [hiss] [think] [dizzy] [stare] [yawn] [idle]（hiss 是生气哈气），例如「[happy]答对啦，快夸我喵！」。标签只写一次，正文里不要再出现方括号标签。";
+pub const PROMPT: &str = "每条回复的最开头必须先写一个表情标签，只能从这些里选一个：[happy] [love] [shy] [surprised] [cry] [hiss] [think] [dizzy] [stare] [yawn] [idle] [pout] [smug] [confused] [scared] [starry] [puff]（hiss 是炸毛哈气，puff 是鼓着脸赌气，pout 是委屈嘟嘴，smug 是得意，confused 是听不懂歪头，scared 是害怕，starry 是兴奋星星眼），例如「[happy]答对啦，快夸我喵！」。标签只写一次，正文里不要再出现方括号标签。";
 
 const OPENS: [char; 3] = ['[', '【', '［'];
 const CLOSES: [char; 3] = [']', '】', '］'];

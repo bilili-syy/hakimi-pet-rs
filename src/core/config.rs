@@ -106,6 +106,8 @@ pub struct Config {
     /// 空 = 跟随系统代理
     pub proxy: String,
     pub user_name: String,
+    /// 主人生日「月-日」（如 04-03），那天开机她会先祝你生日快乐；空 = 不知道
+    pub birthday: String,
     pub reminders: Reminders,
     pub tts: TtsConfig,
     /// "" = 默认水手服 / hoodie / pajama / idol / swim / xmas / maid / jk（见 core::costume）
@@ -147,6 +149,7 @@ impl Default for Config {
             base_url: String::new(),
             proxy: String::new(),
             user_name: String::new(),
+            birthday: String::new(),
             reminders: Reminders::default(),
             tts: TtsConfig::default(),
             costume: String::new(),
