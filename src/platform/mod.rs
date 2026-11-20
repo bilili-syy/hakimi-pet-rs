@@ -2,6 +2,8 @@
 //! 托盘与右键菜单、聊天输入框、单实例、开机自启、摸鱼监督、提醒与番茄钟。
 //! 公开函数签名是约定，别改名改参数；内部实现随意。
 #![allow(dead_code)]
+mod timers;
+mod watch;
 use crate::types::{EventSender, Handler};
 
 /// 创建窗口、托盘，跑消息循环直到退出。
