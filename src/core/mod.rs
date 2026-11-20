@@ -3,6 +3,7 @@
 pub mod config;
 pub mod log;
 pub mod memo;
+pub mod memory;
 pub mod paths;
 pub mod save;
 pub mod stats;
