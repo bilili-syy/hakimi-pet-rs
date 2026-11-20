@@ -1,6 +1,12 @@
 //! config.json（字段名、默认值和 Electron 版 ai.js DEFAULT_CONFIG 完全一致，两版互通）
-//! TODO(B)：load 时把缺的字段补齐写回文件（Electron 版行为）；保留 _说明 等未知字段（已用 extra 兜住）
+//!
+//! 载入规则照搬 ai.js loadConfig：
+//! `{ ...DEFAULT_CONFIG, ...saved, reminders: {...}, tts: {...}, moyu: {...} }`——顶层浅合并，
+//! 三个子对象再各自浅合并；未知字段（`_说明`、用户自己加的键）原样保留；载入后把完整模板写回文件。
+//! 比原版多做一点防护：某个字段类型不对（比如 `"water": "45"`）只把这一个字段换回默认值，
+//! 不会因为一个字段把整份设置清空。
 #![allow(dead_code)]
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::RwLock;
@@ -13,9 +19,12 @@ pub struct Reminders {
     pub stand_up: u32,
     /// "18:00"，空 = 关
     pub off_work: String,
+    /// 未知字段原样保留
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 impl Default for Reminders {
-    fn default() -> Self { Self { water: 45, stand_up: 60, off_work: "18:00".into() } }
+    fn default() -> Self { Self { water: 45, stand_up: 60, off_work: "18:00".into(), extra: Map::new() } }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,6 +39,9 @@ pub struct TtsConfig {
     /// all / chat / off
     pub speak: String,
     pub volume: f32,
+    /// 未知字段原样保留
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 impl Default for TtsConfig {
     fn default() -> Self {
@@ -41,6 +53,7 @@ impl Default for TtsConfig {
             style: "十八岁左右的元气少女猫娘，声音清亮甜美、略带奶音，说话轻快俏皮，句尾喜欢拖长撒娇。".into(),
             speak: "all".into(),
             volume: 0.9,
+            extra: Map::new(),
         }
     }
 }
@@ -53,6 +66,9 @@ pub struct MoyuConfig {
     pub pomodoro_minutes: u32,
     pub keywords: Vec<String>,
     pub processes: Vec<String>,
+    /// 未知字段原样保留
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 impl Default for MoyuConfig {
     fn default() -> Self {
@@ -70,6 +86,7 @@ impl Default for MoyuConfig {
                 "steam", "steamwebhelper", "genshinimpact", "yuanshen", "leagueclient", "league of legends",
                 "douyin", "bilibili", "qqmusic", "cloudmusic",
             ]),
+            extra: Map::new(),
         }
     }
 }
@@ -96,8 +113,23 @@ pub struct Config {
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
+
+/// Electron 版 DEFAULT_CONFIG 里的说明字段（原样，用户第一次打开设置文件时能看到）
+const DOC_FIELDS: [(&str, &str); 8] = [
+    ("_说明", "填好 apiKey 后保存，右键哈基米「重新加载设置」即可生效。provider 可选 gemini 或 openai（任何 OpenAI 兼容接口）。"),
+    ("_baseUrl说明", "gemini 留空即可；openai 兼容接口填到 /v1 为止，例如 https://api.openai.com/v1"),
+    ("_proxy说明", "留空=跟随系统代理；也可填 http://127.0.0.1:7890 这样的地址"),
+    ("_userName说明", "哈基米怎么称呼你，留空就叫「你」"),
+    ("_reminders说明", "喝水/起身提醒间隔（分钟，0=关闭）；offWork 下班提醒时间，留空=关闭"),
+    ("_outfit说明", "换装：costume 是整套衣服（空=原装卫衣，xmas=圣诞小红裙，maid=女仆装，jk=JK水手服）；outfit 是配件，可同时戴多个（santa=圣诞帽、glasses=圆眼镜、scarf=四色围巾）。右键「换装」里点就行"),
+    ("_moyu说明", "摸鱼监督：前台窗口是视频/社交/购物/游戏（keywords 匹配窗口标题，processes 匹配进程名）连续 minutes 分钟就来催你；番茄钟期间 pomodoroMinutes 分钟就催。只在本机判断，不记录窗口标题。enabled=false 关闭"),
+    ("_tts说明", "语音用小米 MiMo TTS。apiKey 填 MiMo 开放平台的 Key；mode: clone=固定哈基米声线（默认）/ preset=预置音色(voice 填 冰糖、茉莉)/ design=按 style 文字现设计；speak: all=所有气泡都念 / chat=只念聊天回复 / off；volume 0~1"),
+];
+
 impl Default for Config {
     fn default() -> Self {
+        let mut extra = Map::new();
+        for (k, v) in DOC_FIELDS { extra.insert(k.into(), Value::String(v.into())); }
         Self {
             provider: "gemini".into(),
             api_key: String::new(),
@@ -110,38 +142,187 @@ impl Default for Config {
             costume: String::new(),
             outfit: Vec::new(),
             moyu: MoyuConfig::default(),
-            extra: Map::new(),
+            extra,
         }
     }
+}
+
+/// 把一个 JSON 对象转成 T：整体能转就直接转；否则逐个字段试，类型不对的字段换回默认值。
+pub(crate) fn lenient<T: DeserializeOwned + Serialize + Default>(obj: Map<String, Value>) -> T {
+    if let Ok(t) = serde_json::from_value::<T>(Value::Object(obj.clone())) { return t; }
+    let defaults = match serde_json::to_value(T::default()) { Ok(Value::Object(m)) => m, _ => Map::new() };
+    let mut fixed = Map::new();
+    for (k, v) in obj {
+        let mut probe = Map::new();
+        probe.insert(k.clone(), v.clone());
+        if serde_json::from_value::<T>(Value::Object(probe)).is_ok() {
+            fixed.insert(k, v);
+        } else if let Some(d) = defaults.get(&k) {
+            fixed.insert(k, d.clone());
+        }
+    }
+    serde_json::from_value(Value::Object(fixed)).unwrap_or_default()
+}
+
+/// 子对象浅合并：`{ ...DEFAULT.x, ...(saved.x || {}) }`。saved.x 不是对象就当没有。
+fn sub<T: DeserializeOwned + Serialize + Default>(saved: Option<&Value>) -> Value {
+    let obj = match saved { Some(Value::Object(m)) => m.clone(), _ => Map::new() };
+    // T 的 serde(default) 会把缺的字段补成默认值，相当于先铺默认再盖上 saved
+    serde_json::to_value(lenient::<T>(obj)).unwrap_or(Value::Null)
+}
+
+/// 按 ai.js loadConfig 的规则把文件内容（已解析的 JSON）和默认值合并
+pub fn merge(saved: &Value) -> Config {
+    let empty = Map::new();
+    let saved = saved.as_object().unwrap_or(&empty);
+    let mut obj = match serde_json::to_value(Config::default()) { Ok(Value::Object(m)) => m, _ => Map::new() };
+    for (k, v) in saved { obj.insert(k.clone(), v.clone()); }
+    obj.insert("reminders".into(), sub::<Reminders>(saved.get("reminders")));
+    obj.insert("tts".into(), sub::<TtsConfig>(saved.get("tts")));
+    obj.insert("moyu".into(), sub::<MoyuConfig>(saved.get("moyu")));
+    lenient(obj)
+}
+
+/// 把文件文本解析成配置（坏文件 = 全默认，和原版一致）
+pub fn parse(text: &str) -> Config {
+    let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or(Value::Null);
+    merge(&v)
 }
 
 static CONFIG: RwLock<Option<Config>> = RwLock::new(None);
 
 /// 当前配置（克隆一份）
 pub fn get() -> Config {
-    if let Some(c) = CONFIG.read().unwrap().as_ref() { return c.clone(); }
+    if let Some(c) = CONFIG.read().unwrap_or_else(|e| e.into_inner()).as_ref() { return c.clone(); }
     reload()
 }
 
 /// 从文件重新读取（缺字段用默认值），写回完整模板，返回新配置
 pub fn reload() -> Config {
     let path = super::paths::config_file();
-    let c: Config = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let c = match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            if !s.trim().is_empty() && serde_json::from_str::<Value>(s.trim_start_matches('\u{feff}')).is_err() {
+                // 原版这里会直接用默认模板覆盖；多留一份备份，免得手滑写坏 JSON 丢掉 Key
+                let _ = std::fs::write(path.with_extension("json.bak"), &s);
+                super::log::log("config.json 不是合法 JSON，已备份为 config.json.bak 并恢复默认");
+            }
+            parse(&s)
+        }
+        Err(_) => Config::default(),
+    };
     write(&c);
-    *CONFIG.write().unwrap() = Some(c.clone());
+    *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(c.clone());
     c
 }
 
 /// 改一个设置并写回文件（菜单开关用）
 pub fn update(f: impl FnOnce(&mut Config)) -> Config {
-    let mut c = get();
+    let mut guard = CONFIG.write().unwrap_or_else(|e| e.into_inner());
+    let mut c = match guard.as_ref() {
+        Some(c) => c.clone(),
+        None => {
+            drop(guard);
+            reload();
+            guard = CONFIG.write().unwrap_or_else(|e| e.into_inner());
+            guard.clone().unwrap_or_default()
+        }
+    };
     f(&mut c);
     write(&c);
-    *CONFIG.write().unwrap() = Some(c.clone());
+    *guard = Some(c.clone());
     c
 }
 
+/// 序列化成和原版一样的 2 空格缩进 JSON
+pub fn to_json(c: &Config) -> String {
+    serde_json::to_string_pretty(c).unwrap_or_default()
+}
+
 fn write(c: &Config) {
-    let _ = std::fs::create_dir_all(super::paths::data_dir());
-    if let Ok(s) = serde_json::to_string_pretty(c) { let _ = std::fs::write(super::paths::config_file(), s); }
+    let s = to_json(c);
+    if s.is_empty() { return; }
+    if let Err(e) = super::save::write_atomic(&super::paths::config_file(), s.as_bytes()) {
+        super::log::log(&format!("config write failed {e}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_original() {
+        let c = Config::default();
+        assert_eq!(c.provider, "gemini");
+        assert_eq!(c.model, "gemini-2.5-flash");
+        assert_eq!((c.reminders.water, c.reminders.stand_up, c.reminders.off_work.as_str()), (45, 60, "18:00"));
+        assert!(c.tts.enabled);
+        assert_eq!(c.tts.mode, "clone");
+        assert_eq!(c.tts.voice, "冰糖");
+        assert_eq!(c.tts.speak, "all");
+        assert!((c.tts.volume - 0.9).abs() < 1e-6);
+        assert!(c.moyu.enabled);
+        assert_eq!((c.moyu.minutes, c.moyu.pomodoro_minutes), (20, 2));
+        assert_eq!(c.moyu.keywords.len(), 29);
+        assert_eq!(c.moyu.processes.len(), 10);
+        assert_eq!(c.costume, "");
+        assert!(c.outfit.is_empty());
+        assert!(c.extra.contains_key("_说明"));
+    }
+
+    #[test]
+    fn camel_case_field_names() {
+        let v = serde_json::to_value(Config::default()).unwrap();
+        for k in ["provider", "apiKey", "model", "baseUrl", "proxy", "userName", "reminders", "tts", "costume", "outfit", "moyu", "_说明", "_tts说明"] {
+            assert!(v.get(k).is_some(), "missing {k}");
+        }
+        assert!(v["reminders"].get("standUp").is_some());
+        assert!(v["reminders"].get("offWork").is_some());
+        assert!(v["tts"].get("apiKey").is_some());
+        assert!(v["moyu"].get("pomodoroMinutes").is_some());
+    }
+
+    #[test]
+    fn merge_keeps_user_values_and_unknown_fields() {
+        let c = parse(r#"{"apiKey":"k1","provider":"openai","myField":1,"_说明":"自定义",
+            "reminders":{"water":0},"tts":{"apiKey":"t1","volume":1,"custom":true},"moyu":{"enabled":false},"outfit":["santa"]}"#);
+        assert_eq!(c.api_key, "k1");
+        assert_eq!(c.provider, "openai");
+        assert_eq!(c.model, "gemini-2.5-flash");
+        assert_eq!(c.reminders.water, 0);
+        assert_eq!(c.reminders.stand_up, 60);
+        assert_eq!(c.tts.api_key, "t1");
+        assert!((c.tts.volume - 1.0).abs() < 1e-6);
+        assert_eq!(c.tts.mode, "clone");
+        assert!(!c.moyu.enabled);
+        assert_eq!(c.moyu.minutes, 20);
+        assert_eq!(c.outfit, vec!["santa".to_string()]);
+        assert_eq!(c.extra.get("myField"), Some(&Value::from(1)));
+        assert_eq!(c.extra.get("_说明"), Some(&Value::from("自定义")));
+        assert_eq!(c.tts.extra.get("custom"), Some(&Value::Bool(true)));
+        assert!(c.extra.contains_key("_moyu说明"));
+        // 写回再读，值不变
+        let again = parse(&to_json(&c));
+        assert_eq!(to_json(&again), to_json(&c));
+    }
+
+    #[test]
+    fn bad_field_only_resets_that_field() {
+        let c = parse(r#"{"apiKey":"keep","model":123,"reminders":{"water":"x","standUp":30},"tts":null,"outfit":"santa"}"#);
+        assert_eq!(c.api_key, "keep");
+        assert_eq!(c.model, "gemini-2.5-flash");
+        assert_eq!(c.reminders.water, 45);
+        assert_eq!(c.reminders.stand_up, 30);
+        assert_eq!(c.tts.mode, "clone");
+        assert!(c.outfit.is_empty());
+    }
+
+    #[test]
+    fn garbage_gives_defaults() {
+        let c = parse("{not json");
+        assert_eq!(c.provider, "gemini");
+        let c = parse("\u{feff}{\"apiKey\":\"bom\"}");
+        assert_eq!(c.api_key, "bom");
+    }
 }
