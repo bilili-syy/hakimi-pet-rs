@@ -654,15 +654,17 @@ mod tests {
     fn live_snapshot() {
         let dir = std::env::var("HAKIMI_SNAP").unwrap_or_else(|_| ".".into());
         let mut r = Renderer::new();
-        let faces = [Face::Idle, Face::Happy, Face::Think, Face::Shy, Face::Love, Face::Surprised, Face::Hungry, Face::Stare, Face::Walk1];
+        let faces = [(Face::Idle, ""), (Face::Happy, ""), (Face::Think, ""), (Face::Shy, ""), (Face::Love, ""), (Face::Surprised, ""), (Face::Hungry, ""), (Face::Stare, ""), (Face::Walk1, ""),
+            (Face::Idle, "maid"), (Face::Love, "maid"), (Face::Think, "maid"), (Face::Hungry, "maid"), (Face::Idle, "xmas"), (Face::Think, "jk")];
         let scale = 3.0;
         let (cx, cy, cw, ch) = ((PET_X + 40.0) * scale, (PET_Y + 70.0) * scale, 110.0 * scale, 75.0 * scale);
         let mut sheet = Pixmap::new((cw * 3.0) as u32, (ch * faces.len() as f32) as u32).unwrap();
         sheet.fill(tiny_skia::Color::WHITE);
-        for (row, f) in faces.iter().enumerate() {
+        for (row, (f, costume)) in faces.iter().enumerate() {
             for (col, (b, m, d)) in [(0.0, 0.0, 0.0), (1.0, 0.0, 1.0), (0.0, 1.0, 1.0)].iter().enumerate() {
                 let mut sc = Scene::default();
                 sc.face = *f;
+                sc.costume = costume.to_string();
                 sc.live = live::LiveView { depth: *d, breath: 0.4, bob: 0.25, sway: 0.25, blink: *b, mouth: *m, sleep: false };
                 r.draw(&sc, scale);
                 let src = r.pixmap().unwrap();

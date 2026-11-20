@@ -204,35 +204,30 @@ pub struct Overlays {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind { Blink, Mouth }
 
-/// 内置贴片的资源路径。walk1/walk2 的头和 idle 一样，共用 idle 的
-pub fn builtin_path(face: Face, kind: Kind) -> Option<&'static str> {
-    use Face::*;
-    Some(match (kind, face) {
-        (Kind::Blink, Idle | Walk1 | Walk2) => "sprites/live/idle_blink.png",
-        (Kind::Blink, Hungry) => "sprites/live/hungry_blink.png",
-        (Kind::Blink, Love) => "sprites/live/love_blink.png",
-        (Kind::Blink, Stare) => "sprites/live/stare_blink.png",
-        (Kind::Blink, Surprised) => "sprites/live/surprised_blink.png",
-        (Kind::Blink, Think) => "sprites/live/think_blink.png",
-        (Kind::Mouth, Idle | Walk1 | Walk2) => "sprites/live/idle_mouthOpen.png",
-        (Kind::Mouth, Happy) => "sprites/live/happy_mouthOpen.png",
-        (Kind::Mouth, Think) => "sprites/live/think_mouthOpen.png",
-        (Kind::Mouth, Shy) => "sprites/live/shy_mouthOpen.png",
-        (Kind::Mouth, Love) => "sprites/live/love_mouthOpen.png",
-        (Kind::Mouth, Surprised) => "sprites/live/surprised_mouthOpen.png",
-        _ => return None,
-    })
+/// 实际画出来的那张立绘的名字（贴片按它找）：原装 walk1/walk2 的头和 idle 一样；换装按 sprites 的别名映射
+fn drawn_stem(face: Face, costume: &str) -> String {
+    if costume.is_empty() {
+        return match face { Face::Walk1 | Face::Walk2 => "idle", f => f.stem() }.to_string();
+    }
+    let src = crate::render::sprites::costume_src(costume, face);
+    src.rsplit('/').next().unwrap_or("").trim_end_matches(".png").to_string()
 }
 
-/// 这个表情（在这套衣服下）有没有某种贴片。换装立绘的五官位置没对过，先不贴
-pub fn available(face: Face, costume: &str, kind: Kind) -> bool { costume.is_empty() && builtin_path(face, kind).is_some() }
+/// 内置贴片的资源路径：原装 sprites/live/<立绘>_<blink|mouthOpen>.png，换装 sprites/live/<衣服>_<立绘>_….png。
+/// 没有这张贴片（闭眼的表情、五官差太多的表情）返回 None
+pub fn builtin_path(face: Face, costume: &str, kind: Kind) -> Option<String> {
+    let k = match kind { Kind::Blink => "blink", Kind::Mouth => "mouthOpen" };
+    let stem = drawn_stem(face, costume);
+    let p = if costume.is_empty() { format!("sprites/live/{stem}_{k}.png") } else { format!("sprites/live/{costume}_{stem}_{k}.png") };
+    crate::assets::get(&p).is_some().then_some(p)
+}
+
+/// 这个表情（在这套衣服下）有没有某种贴片
+pub fn available(face: Face, costume: &str, kind: Kind) -> bool { builtin_path(face, costume, kind).is_some() }
 
 /// 取一个表情的贴片（解码，未缩放）。唯一入口：皮肤包以后在这里按皮肤读文件
 pub fn overlays_for(face: Face, costume: &str) -> Overlays {
-    let load = |k: Kind| -> Option<Pixmap> {
-        if !available(face, costume, k) { return None; }
-        Pixmap::decode_png(crate::assets::get(builtin_path(face, k)?)?).ok()
-    };
+    let load = |k: Kind| -> Option<Pixmap> { Pixmap::decode_png(crate::assets::get(&builtin_path(face, costume, k)?)?).ok() };
     Overlays { blink: load(Kind::Blink), mouth_open: load(Kind::Mouth) }
 }
 
@@ -607,18 +602,22 @@ mod tests {
 
     #[test]
     fn builtin_overlays_exist_and_crop_small() {
-        for f in Face::ALL {
-            for k in [Kind::Blink, Kind::Mouth] {
-                if let Some(p) = builtin_path(f, k) { assert!(crate::assets::get(p).is_some(), "{p}"); }
-            }
-        }
-        for f in [Face::Idle, Face::Happy, Face::Think, Face::Shy, Face::Love, Face::Surprised] {
+        for f in [Face::Idle, Face::Walk1, Face::Happy, Face::Think, Face::Shy, Face::Love, Face::Surprised] {
             assert!(available(f, "", Kind::Mouth), "{f:?}");
         }
-        for f in [Face::Sleep, Face::Happy, Face::Shy, Face::Yawn, Face::Dance] {
+        for f in [Face::Idle, Face::Walk2, Face::Think, Face::Love, Face::Stare, Face::Surprised, Face::Hungry] {
+            assert!(available(f, "", Kind::Blink), "{f:?}");
+        }
+        for f in [Face::Sleep, Face::Happy, Face::Shy, Face::Yawn, Face::Dance, Face::Eat] {
             assert!(!available(f, "", Kind::Blink), "{f:?} has closed eyes");
         }
-        assert!(!available(Face::Idle, "maid", Kind::Blink));
+        // 换装：按实际画的那张（shy/love → happy，stare → think，yawn → idle）
+        for c in ["maid", "xmas", "jk"] {
+            for f in [Face::Idle, Face::Yawn, Face::Think, Face::Stare, Face::Hungry] { assert!(available(f, c, Kind::Blink), "{c} {f:?}"); }
+            for f in [Face::Idle, Face::Love, Face::Shy, Face::Think] { assert!(available(f, c, Kind::Mouth), "{c} {f:?}"); }
+            for f in [Face::Love, Face::Sleep, Face::Drag] { assert!(!available(f, c, Kind::Blink), "{c} {f:?}"); }
+        }
+        assert_eq!(builtin_path(Face::Shy, "maid", Kind::Mouth).as_deref(), Some("sprites/live/maid_happy_mouthOpen.png"));
         let p = Patches::from_overlays(overlays_for(Face::Idle, ""), 300, 440);
         let b = p.blink.as_ref().unwrap();
         let m = p.mouth.as_ref().unwrap();
