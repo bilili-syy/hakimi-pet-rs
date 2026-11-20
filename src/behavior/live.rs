@@ -226,6 +226,8 @@ mod tests {
     #[test]
     fn mouth_follows_voice_level() {
         let mut b = mk();
+        // 默认水手服还没有张嘴贴片，用原装卫衣测
+        b.costume = "hoodie".into();
         tick(&mut b, 3000);
         b.state_timer = None;
         assert_eq!(b.scene.live.mouth, 0.0);
