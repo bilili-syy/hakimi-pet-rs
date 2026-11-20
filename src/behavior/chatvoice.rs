@@ -224,6 +224,8 @@ impl Behavior {
         self.play(Shot::Bounce);
         self.set_state(St::Happy, None);
         self.hold_timer(2500, StateAct::ChatIdle);
+        // 情绪表情（behavior/emotion.rs）：出字这一刻换表情，念完 2 秒后回平时
+        self.emotion_cv_reveal();
     }
 
     /// 显示下一段的字（累加到气泡里），同时开始念它；然后预合成下一段

@@ -4,6 +4,7 @@ pub mod fx;
 pub mod lines;
 pub mod play;
 mod memo;
+mod emotion;
 mod skin;
 pub mod beat;
 pub mod dance;
@@ -245,6 +246,8 @@ pub struct Behavior {
     /// 新互动（behavior/play.rs）
     play: play::Play,
     memo: memo::MemoUi,
+    /// 情绪表情 + 长期记忆（behavior/emotion.rs）
+    mind: emotion::MindUi,
     /// 语音回答进行中（behavior/chatvoice.rs）
     cv: Option<chatvoice::ChatVoice>,
     /// 测试用：io=false 时假装「语音回答」开着且 TTS 可用 / 用户关了语音回答
@@ -336,6 +339,7 @@ impl Behavior {
             fake_chat_voice_off: false,
             key_hint_shown: false,
             memo: memo::MemoUi::default(),
+            mind: emotion::MindUi::default(),
         };
         b.mood_cls = b.stats.mood();
         b.next_blink = b.live.blink.next;
@@ -378,6 +382,7 @@ impl Behavior {
             AppEvent::ChatReply(r) => self.on_chat_reply(r),
             AppEvent::Speech { token, audio } if self.cv_wants(token) => self.cv_on_speech(token, audio),
             AppEvent::Speech { token, audio } => {
+                self.emotion_speech(token, audio.is_some());
                 if token != self.voice_req || token == 0 { return self.flush(out); }
                 let Some(a) = audio else { return self.flush(out) };
                 let same = self.bubble.as_ref().is_some_and(|b| b.token == token) && self.bubble_fade.on;
@@ -392,6 +397,7 @@ impl Behavior {
                 if let Some(b) = &mut self.bubble { b.hide_at = Some(now + 60_000); }
             }
             AppEvent::AudioDone { token } => {
+                self.emotion_audio_done(token);
                 let tail = self.memo.bubble_tail(token, now);
                 if self.voice_playing == Some(token) {
                     self.voice_playing = None;
@@ -412,6 +418,7 @@ impl Behavior {
                     if self.state == St::Dance { self.end_dance(); }
                 }
                 self.cv_on_audio_done(token);
+                self.emotion_cv_done();
             }
             AppEvent::Remind(k) => self.on_remind(k),
             AppEvent::Pomodoro(p) => self.on_pomodoro(p),
@@ -435,6 +442,7 @@ impl Behavior {
             AppEvent::ClimbFailed => self.on_climb_failed(),
             AppEvent::PerchLost => self.on_perch_lost(),
             AppEvent::Memo(m) => self.on_memo(m),
+            AppEvent::Mind(m) => self.on_mind(m),
         }
         self.sync_play();
         self.build_scene();
@@ -635,6 +643,7 @@ impl Behavior {
         } else {
             self.tick_play();
         }
+        self.tick_mind();
     }
 
     // ============================================================ 基本动作
@@ -1176,6 +1185,7 @@ impl Behavior {
                 self.say(&pick(if on { lines::MOYU_ON } else { lines::MOYU_OFF }), 2600);
             }
             MenuAction::Memo(m) => self.on_memo_menu(m),
+            MenuAction::Mind(m) => self.on_mind_menu(m),
             MenuAction::ForgetChat => {
                 if self.io { crate::services::ai::clear_history(); }
                 self.play(Shot::Shake);
@@ -1259,6 +1269,8 @@ impl Behavior {
             return self.drink_honey();
         }
         // 「提醒我…」「记一下…」「我有什么待办」
+        // 「记住…」「忘掉…」「你记得我什么」
+        if self.mind_chat(&text) { return; }
         if self.memo_chat(&text) { return; }
         self.waiting = true;
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(false)));
@@ -1277,10 +1289,17 @@ impl Behavior {
     }
 
     fn on_chat_reply(&mut self, r: ChatReply) {
+        // 去掉情绪标签（气泡和 TTS 只拿干净文字）
+        let (r, emo) = self.emotion_split(r);
         // 语音回答：先合成，字和声音一起出来（chatvoice.rs）；这期间保持思考中
         if r.ok && self.chat_voice_on() {
             self.cv_start(&r.text);
-            if self.cv.is_some() { return; }
+            if self.cv.is_some() {
+                // 第一段出字时再换表情（emotion_cv_reveal），整段念完 2 秒后回平时
+                self.emotion_cv_pending(emo, r.text.chars().count());
+                self.mind_after_reply(true);
+                return;
+            }
         }
         self.waiting = false;
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(true)));
@@ -1288,6 +1307,7 @@ impl Behavior {
             self.act(Act::Chat);
             self.play(Shot::Bounce);
             self.set_state(St::Happy, None);
+            self.emotion_face(emo);
         } else {
             self.play(Shot::Shake);
             self.set_state(if r.need_key { St::Sit } else { St::Drag }, None);
@@ -1298,6 +1318,8 @@ impl Behavior {
         let voice = !(r.ok && self.chat_voice_disabled_by_user());
         self.say_opts(&r.text, ms, voice, if r.ok { SpeakKind::Chat } else { SpeakKind::Line });
         self.hold_timer(2500, StateAct::ChatIdle);
+        self.emotion_hold(emo);
+        self.mind_after_reply(r.ok);
     }
 
     // ============================================================ 提醒 / 番茄钟 / 摸鱼

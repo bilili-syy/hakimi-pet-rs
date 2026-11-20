@@ -65,8 +65,15 @@ const POMO: &[Node] = &[
     Sep,
     Item("pomo:stop", "结束番茄钟"),
 ];
+/// 「她的记忆」（platform/mind_menu.rs 把 id 映射成 MenuAction::Mind）
+pub const MIND_TITLE: &str = "🧠 她的记忆";
+const MIND: &[Node] = &[
+    Item("mind:open", "📂 打开 memory.json"),
+    Item("mind:clear", "🗑️ 清空记忆…"),
+];
 const TOOLS: &[Node] = &[
     Gen("memo"),
+    Sub(MIND_TITLE, MIND),
     Sub(POMO_TITLE, POMO),
     Item("checkin", "📅 今日签到"),
     Item("weather", "🌦️ 天气播报"),
@@ -466,6 +473,8 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
         "quit" => A::Quit,
         _ => {
             if let Some(a) = super::memo_menu::parse(id) {
+                a
+            } else if let Some(a) = super::mind_menu::parse(id) {
                 a
             } else if let Some(a) = super::skin_menu::parse(id) {
                 a

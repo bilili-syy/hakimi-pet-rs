@@ -47,6 +47,7 @@ src/
 | Moyu(on) | 在 Handler（它会写 config）之后启停监督 |
 | Quit | 调 `Handler::quit` 然后退出 |
 | Memo(OpenFile) | 打开 memo.json（不存在先建）；其余 Memo(..) 由行为层调 core::memo 处理 |
+| Mind(OpenFile) / Mind(ClearAsk) | 打开 memory.json / 弹框二次确认，确认了再投递 `Mind(Clear)`（行为层清空） |
 
 ## 备忘录
 - 数据：core/memo.rs（memo.json 读写、到点计算，全局 Mutex，任何线程可调）
@@ -74,6 +75,15 @@ src/
 - `tts.chatVoiceReply` 开且 TTS 可用：AI 回复到了先保持「思考中」，按句切开（最多 4 段），第一段合成好才出字并同时开念；
   后面每段在前一段念的时候预合成，念完才出下一段字。某段合成失败或 15 秒没好：剩下的字直接全显示，不出声。
 - 关掉：聊天回复只出字、不念（其它台词照旧）。
+
+## 情绪表情 + 长期记忆（feat/memory-emotion）
+- 情绪标签：`services/emotion.rs`。系统提示词要求回复以 `[happy]` 等标签开头（只用现有立绘名）；`analyze(text)` 去标签（含【】［］、大小写、正文里混进来的）→ 没有/不认识就按关键词猜 → idle。流式回复用 `TagStream`（标签被拆开也能认，半截标签先扣着）。
+  行为层在 `on_chat_reply` 一开始调 `emotion_split`，气泡和 TTS 只拿到干净文字；说话期间换表情 + 小动作，念完（AudioDone）或估算说完后 2 秒回平时。
+- 记忆数据：`core/memory.rs`（%APPDATA%\hakimi-pet\memory.json，每条带 created/updated，合并去重、新的覆盖旧的、上限 60、称呼/生日最后才丢；忘掉过的内容记个墓碑，后台提取不再捡回来；未知字段保留）。
+- 提示词：`ai::persona` 末尾追加 emotion::PROMPT 和 `core::memory::prompt()`（≤600 字）。
+- 提取/关心：`services/mind.rs`。每 4 轮成功聊天后台线程用同一个模型（ai::ask_once）总结 chat.json 里新消息的事实（JSON），合并进去；主动关心每天最多 2 次、间隔 ≥3 小时、9–22 点，只在没开聊天框、没在响提醒、气泡空着时问，结果用 `AppEvent::Mind(MindEv::Care)` 送回。
+- 聊天指令：「记住…」立即写入、「忘掉…/把…忘了」删除、「你记得我什么」列几条；行为在 `behavior/emotion.rs`。菜单 `platform/mind_menu.rs`。
+- 记忆内容和 Key 不写日志。
 
 ## 跳个舞
 - 舞谱在 `behavior/dance.rs` 的 `SCORES`（BPM、时长、按拍计长的动作段），加一条菜单就自动多一支舞。

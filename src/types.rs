@@ -113,6 +113,8 @@ pub enum MenuAction {
     Memo(MemoAct),
     /// 跳个舞：舞谱 id（behavior::dance::SCORES），"" = 随机挑一支
     Dance(String),
+    /// 右键「她的记忆」子菜单
+    Mind(MindAct),
 }
 
 // ---------------------------------------------------------------- 事件
@@ -208,6 +210,24 @@ pub enum MemoAct {
     ClearDone,
 }
 
+/// 「她的记忆」子菜单的动作
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MindAct {
+    /// 打开 memory.json（平台层打开）
+    OpenFile,
+    /// 点了「清空记忆…」：平台层弹框二次确认，确认了再发 Clear
+    ClearAsk,
+    /// 已确认：清空
+    Clear,
+}
+
+/// 长期记忆的后台结果
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MindEv {
+    /// 主动关心：模型给的一句话（开头可能带情绪标签）；None = 这次没什么好说的
+    Care(Option<String>),
+}
+
 /// 发给 Handler 的所有事件（平台层在 UI 线程上逐个投递）
 #[derive(Debug)]
 pub enum AppEvent {
@@ -245,6 +265,8 @@ pub enum AppEvent {
     PerchLost,
     /// 备忘录：到点提醒 / AI 解析结果
     Memo(MemoEv),
+    /// 长期记忆：后台结果
+    Mind(MindEv),
 }
 
 /// 线程安全的事件投递器：服务层工作线程用它把结果送回 UI 线程。

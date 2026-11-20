@@ -118,7 +118,16 @@ fn local_time() -> (u16, u16, u16, u16) {
 }
 
 pub fn persona(c: &crate::core::config::Config, ctx: &ChatCtx) -> String {
-    persona_at(c, ctx, local_time())
+    let mut p = persona_at(c, ctx, local_time());
+    // 情绪标签 + 长期记忆（services::emotion / core::memory）
+    p.push('\n');
+    p.push_str(super::emotion::PROMPT);
+    let mem = crate::core::memory::prompt();
+    if !mem.is_empty() {
+        p.push('\n');
+        p.push_str(&mem);
+    }
+    p
 }
 
 fn persona_at(c: &crate::core::config::Config, ctx: &ChatCtx, (mo, d, h, mi): (u16, u16, u16, u16)) -> String {

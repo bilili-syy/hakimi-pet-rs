@@ -2,7 +2,9 @@
 //! 公开函数签名是约定，别改名改参数；内部实现随意。耗时操作一律放后台线程，结果用 EventSender 送回。
 pub mod ai;
 pub mod audio;
+pub mod emotion;
 pub mod memo_parse;
+pub mod mind;
 pub mod net;
 pub mod songs;
 pub mod tts;
