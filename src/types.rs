@@ -105,6 +105,8 @@ pub enum MenuAction {
     WeatherReport,
     /// 爬到当前窗口顶上坐着
     Climb,
+    /// 右键「备忘录」子菜单
+    Memo(MemoAct),
 }
 
 // ---------------------------------------------------------------- 事件
@@ -172,6 +174,34 @@ pub enum MoyuEv {
     Back { minutes: u32 },
 }
 
+/// 备忘录里到点的一条
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoHit {
+    pub id: u64,
+    pub text: String,
+    /// 错过了（睡眠/关机醒来后补的）
+    pub late: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoEv {
+    /// 到点了（醒来后错过的好几条会合并成一次）。平台层发
+    Due(Vec<MemoHit>),
+    /// 本地规则没看懂、交给 AI 后的结果：ok = 已经加进备忘录，text 是她要说的确认/提示
+    Reply { ok: bool, text: String },
+}
+
+/// 「备忘录」子菜单的动作
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoAct {
+    Done(u64),
+    Delete(u64),
+    /// 稍后 10 分钟再提醒（正在响的那些）
+    Snooze,
+    OpenFile,
+    ClearDone,
+}
+
 /// 发给 Handler 的所有事件（平台层在 UI 线程上逐个投递）
 #[derive(Debug)]
 pub enum AppEvent {
@@ -207,6 +237,8 @@ pub enum AppEvent {
     ClimbFailed,
     /// 坐着的窗口挪走/关了/最小化：平台层已经让她开始下落（之后照常发 Landed）
     PerchLost,
+    /// 备忘录：到点提醒 / AI 解析结果
+    Memo(MemoEv),
 }
 
 /// 线程安全的事件投递器：服务层工作线程用它把结果送回 UI 线程。
