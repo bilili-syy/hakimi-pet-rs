@@ -5,6 +5,7 @@ pub mod anim;
 pub mod shapes;
 pub mod sprites;
 pub mod text;
+pub mod toy;
 
 pub use anim::Xf;
 use crate::types::{Face, Frame, WIN_H, WIN_W};
@@ -62,6 +63,10 @@ pub struct StatusView {
     pub level: String,
     pub affection: f64,
     pub moyu: Option<u32>,
+    /// (连续签到天数, 累计签到天数)
+    pub checkin: Option<(u32, u32)>,
+    /// 天气一行（如「小雨 12°C」）
+    pub weather: Option<String>,
     pub opacity: f32,
 }
 
@@ -81,6 +86,8 @@ pub struct Scene {
     pub star: Xf,
     /// 喝了蜂蜜水的金色光晕（drop-shadow）
     pub glow: bool,
+    /// 身子朝光标那边歪：头顶水平错切的像素（逻辑像素，向右为正；脚底不动）
+    pub lean: f32,
     pub bubble: Option<BubbleView>,
     pub status: Option<StatusView>,
     pub zzz: Vec<ZGlyph>,
@@ -98,6 +105,7 @@ impl Default for Scene {
             tail: Xf::ID,
             star: Xf::ID,
             glow: false,
+            lean: 0.0,
             bubble: None,
             status: None,
             zzz: Vec::new(),
@@ -254,6 +262,13 @@ impl Renderer {
 
     fn draw_pet(&mut self, pm: &mut Pixmap, scene: &Scene, scale: f32, root: Transform) {
         let pet = root.pre_concat(xf_matrix(&scene.pet, PET_X + PET_W / 2.0, WIN_H as f32));
+        // 歪头看光标：以脚底为轴水平错切，头顶偏 lean 像素
+        let pet = if scene.lean.abs() > 0.01 {
+            let k = -scene.lean / PET_H;
+            pet.pre_concat(Transform::from_row(1.0, 0.0, k, 1.0, -k * WIN_H as f32, 0.0))
+        } else {
+            pet
+        };
         let cx = PET_X + PET_W / 2.0;
         let cy = PET_Y + PET_H / 2.0;
         let body = pet
@@ -421,7 +436,7 @@ impl Renderer {
         let lh = self.text.cell_height(px, false).max(px * 1.2);
         let lhb = self.text.cell_height(px, true).max(px * 1.2);
         let box_w = 212.0 * s;
-        let rows = 4 + st.moyu.is_some() as usize;
+        let rows = 4 + st.moyu.is_some() as usize + st.checkin.is_some() as usize + st.weather.is_some() as usize;
         let content_h = lhb + 4.0 * s + rows as f32 * lh + (rows as f32 - 1.0) * 3.0 * s + 3.0 * s;
         let box_h = content_h + 20.0 * s;
         let mut pm = Pixmap::new(box_w.ceil() as u32 + 1, (box_h + 6.0 * s).ceil() as u32 + 1)?;
@@ -455,10 +470,24 @@ impl Renderer {
         let nw = self.text.text_width(&n, px, false);
         self.text_at(&mut pm, &n, x0 + cw - nw, y, lh, px, false, C_TEXT);
         y += lh + 3.0 * s;
+        if let Some((streak, total)) = st.checkin {
+            self.text_at(&mut pm, "签到", x0, y, lh, px, false, C_TEXT);
+            self.text_at(&mut pm, &format!("连续 {streak} 天"), x0 + 34.0 * s, y, lh, px, true, C_GREEN);
+            let n = format!("累计 {total}");
+            let nw = self.text.text_width(&n, px, false);
+            self.text_at(&mut pm, &n, x0 + cw - nw, y, lh, px, false, C_TEXT);
+            y += lh + 3.0 * s;
+        }
+        if let Some(w) = &st.weather {
+            self.text_at(&mut pm, "天气", x0, y, lh, px, false, C_TEXT);
+            self.text_at(&mut pm, w, x0 + 34.0 * s, y, lh, px, true, C_BLUE);
+            y += lh + 3.0 * s;
+        }
         if let Some(m) = st.moyu {
             self.text_at(&mut pm, "摸鱼", x0, y, lh, px, false, C_TEXT);
             self.text_at(&mut pm, &format!("今天 {m} 分钟"), x0 + 34.0 * s, y, lh, px, true, C_RED);
         }
+        let _ = y;
         Some((pm, Rect { x: 14.0, y: 46.0, w: 212.0, h: box_h / s }))
     }
 
@@ -535,7 +564,7 @@ mod tests {
         sc.zzz = vec![ZGlyph { ch: 'z', size: 14.0, color: C_BLUE, x: 5.0, y: -10.0, opacity: 1.0 }, ZGlyph { ch: 'Z', size: 24.0, color: C_RED, x: 20.0, y: -40.0, opacity: 0.7 }];
         let shapes = [FxShape::Heart, FxShape::Note(0), FxShape::Note(1), FxShape::Note(2), FxShape::Spark, FxShape::Drop, FxShape::Anger, FxShape::Exclaim];
         sc.fx = shapes.iter().enumerate().map(|(i, &sh)| FxSprite { shape: sh, x: 10.0 + i as f32 * 22.0, y: 150.0, size: 20.0, xf: Xf::ID, color: [C_RED, C_BLUE, C_GREEN, C_YELLOW][i % 4] }).collect();
-        sc.status = Some(StatusView { days: 12, hunger: 66.0, mood: 80.0, energy: 33.0, level: "好朋友".into(), affection: 88.0, moyu: Some(23), opacity: 1.0 });
+        sc.status = Some(StatusView { days: 12, hunger: 66.0, mood: 80.0, energy: 33.0, level: "好朋友".into(), affection: 88.0, moyu: Some(23), checkin: Some((3, 10)), weather: Some("小雨 12°C".into()), opacity: 1.0 });
         r.draw(&sc, 1.5);
         r.pixmap().unwrap().save_png(&out).unwrap();
         let mut sc2 = Scene::default();
