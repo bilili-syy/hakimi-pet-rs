@@ -19,6 +19,7 @@ mod power;
 mod settings;
 mod sys;
 mod timers;
+mod hrtimer;
 mod toy;
 mod watch;
 #[cfg(test)]
@@ -179,17 +180,38 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
         })
     });
     menu::init();
+    hrtimer::init();
     rearm();
 
     unsafe {
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-            // 设置窗口：Tab 切换、回车保存、Esc 取消
-            if settings::dialog_message(&msg) {
-                continue;
+        if let Some(t) = hrtimer::handle() {
+            // 高精度定时器到点 = 一次 tick；其余照常分发消息
+            'pump: loop {
+                let r = MsgWaitForMultipleObjectsEx(Some(&[t]), windows::Win32::System::Threading::INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                if r == windows::Win32::Foundation::WAIT_OBJECT_0 {
+                    tick();
+                }
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_QUIT {
+                        break 'pump;
+                    }
+                    // 设置窗口：Tab 切换、回车保存、Esc 取消
+                    if settings::dialog_message(&msg) {
+                        continue;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
             }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        } else {
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                if settings::dialog_message(&msg) {
+                    continue;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
 
@@ -410,6 +432,7 @@ fn rearm() {
         unsafe {
             SetTimer(Some(s.hwnd), TIMER_ID, ms, None);
         }
+        hrtimer::arm(ms);
     });
 }
 

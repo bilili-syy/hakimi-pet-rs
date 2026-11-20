@@ -12,6 +12,8 @@ use std::rc::Rc;
 use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
 
 /// 活动时的帧间隔（≈60fps；原来 60ms≈16fps，呼吸/发梢摆动看着一顿一顿的。实测 12 核机器上整机 CPU 约 0.13%）。待机呼吸、口型都按这个节奏，眨眼那一下用 BLINK_FRAME_MS
+/// 运行时按 config::frame_ms()（设置里 30/60/120，默认 60）；这里是默认值，测试用
+#[allow(dead_code)]
 pub const LIVE_FRAME_MS: u32 = 16;
 /// 眨眼进行中的帧间隔（一下眨眼 ≈ 190ms，要多几帧才顺）
 pub const BLINK_FRAME_MS: u32 = 33;

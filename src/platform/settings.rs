@@ -129,6 +129,7 @@ const ID_PLAY: i32 = 141;
 const ID_PLAY_RESULT: i32 = 142;
 const ID_AUTOSTART: i32 = 150;
 const ID_SCALE: i32 = 151;
+const ID_FPS: i32 = 164;
 const ID_CITY: i32 = 152;
 const ID_MOYU: i32 = 153;
 const ID_MOYU_MIN: i32 = 154;
@@ -155,6 +156,7 @@ const MODES: [(&str, &str); 3] =
 const VOICES: [&str; 2] = ["冰糖", "茉莉"];
 const SCALES: [(f32, &str); 5] =
     [(0.7, "小（70%）"), (0.85, "偏小（85%）"), (1.0, "标准（100%）"), (1.2, "偏大（120%）"), (1.5, "大（150%）")];
+const FPS: [(u32, &str); 3] = [(30, "30"), (60, "60"), (120, "120")];
 /// MiMo 开放平台 API Keys 页（curl 200）
 pub const MIMO_KEY_URL: &str = "https://platform.xiaomimimo.com/#/console/api-keys";
 
@@ -685,6 +687,9 @@ impl Dlg {
         self.label(p, "哈基米大小", [X0, 82.0, LW, 26.0]);
         let sc = self.combo(p, ID_SCALE, false, [FX, 82.0, 170.0, 0.0]);
         combo_fill(sc, &SCALES.map(|x| x.1));
+        self.label(p, "帧率", [FX + 184.0, 82.0, 36.0, 26.0]);
+        let fps = self.combo(p, ID_FPS, false, [FX + 222.0, 82.0, FW - 222.0, 0.0]);
+        combo_fill(fps, &FPS.map(|x| x.1));
         self.label(p, "天气城市", [X0, 118.0, LW, 26.0]);
         let city = self.edit(p, ID_CITY, 0, [FX, 118.0, 170.0, 26.0]);
         cue(city, "留空 = 自动定位");
@@ -746,6 +751,7 @@ impl Dlg {
 
         set_checked(self.c(ID_AUTOSTART), autostart);
         combo_set(self.c(ID_SCALE), nearest_scale(c.scale));
+        combo_set(self.c(ID_FPS), FPS.iter().position(|x| x.0 == crate::core::config::clamp_fps(c.fps)).unwrap_or(1));
         set_text(self.c(ID_CITY), &c.weather_city);
         set_checked(self.c(ID_MOYU), c.moyu.enabled);
         set_text(self.c(ID_MOYU_MIN), &c.moyu.minutes.to_string());
@@ -844,6 +850,7 @@ impl Dlg {
 
         let autostart = checked(self.c(ID_AUTOSTART));
         c.scale = SCALES[combo_sel(self.c(ID_SCALE)).min(SCALES.len() - 1)].0;
+        c.fps = FPS[combo_sel(self.c(ID_FPS)).min(FPS.len() - 1)].0;
         c.weather_city = get_text(self.c(ID_CITY)).trim().to_string();
         c.moyu.enabled = checked(self.c(ID_MOYU));
         let num = |id: i32, name: &str, max: u32| -> Result<u32, (u8, String)> {

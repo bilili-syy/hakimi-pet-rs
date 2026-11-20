@@ -213,7 +213,7 @@ impl Behavior {
         if self.live_mode().is_some() || self.live.depth > 0.001 || self.live.mouth.value > 0.0
             || (self.speaking() && live::available(self.face, &self.costume, Kind::Mouth))
         {
-            ms = ms.min(live::LIVE_FRAME_MS);
+            ms = ms.min(crate::core::config::frame_ms());
         }
         // 交叉淡化 / 整体动画过渡进行中
         if self.live.fade.is_some_and(|(_, t)| now < t + XFADE_MS) || self.live.pet_from.is_some_and(|(_, t)| now < t + PET_BLEND_MS) {
