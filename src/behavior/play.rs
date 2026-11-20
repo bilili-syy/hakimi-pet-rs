@@ -373,7 +373,8 @@ impl Behavior {
 
     /// 能不能被小事打扰（打招呼/天气）
     fn free_for_chatter(&self) -> bool {
-        !self.chatting && !self.waiting && self.play.game.is_none() && matches!(self.state, St::Idle | St::Sit | St::Walk)
+        !self.chatting && !self.waiting && self.play.game.is_none() && !self.memo_ringing()
+            && matches!(self.state, St::Idle | St::Sit | St::Walk)
     }
 
     /// 能不能看光标
