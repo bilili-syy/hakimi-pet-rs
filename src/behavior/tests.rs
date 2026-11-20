@@ -202,6 +202,7 @@ fn frame_interval_idle_vs_animating() {
 fn idle_wakes_rarely() {
     // 静止状态下大部分帧都是 200ms（只被眨眼之类的计时器提前）
     let mut b = mk();
+    b.live.force_low_power = true; // 灵动效果开着时待机是 ~18fps（见 behavior/live.rs 的测试）
     let mut t = 10_000;
     tick(&mut b, t);
     b.state_timer = None;

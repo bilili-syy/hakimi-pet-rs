@@ -6,7 +6,7 @@
 use crate::types::{AppEvent, Audio, EventSender};
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -29,6 +29,13 @@ enum Cmd {
 static TX: OnceLock<Mutex<Sender<Cmd>>> = OnceLock::new();
 static EVENTS: OnceLock<EventSender> = OnceLock::new();
 static PLAYING: AtomicBool = AtomicBool::new(false);
+/// 口型同步用：正在播放的声音最近 ~20ms 的 RMS（0..1 满幅，f32 的位），声卡线程写、UI 线程无锁读
+static LEVEL: AtomicU32 = AtomicU32::new(0);
+
+/// 当前出声的音量（滚动 RMS，0 = 静音/没在放）。和音量设置无关（量的是解码出来的样本）
+pub fn level() -> f32 { f32::from_bits(LEVEL.load(Ordering::Relaxed)) }
+
+fn set_level(v: f32) { LEVEL.store(v.to_bits(), Ordering::Relaxed); }
 
 /// 启动时调用一次，保存 tx 用来发 AudioDone
 pub fn init(tx: EventSender) {
@@ -132,6 +139,7 @@ fn worker(rx: Receiver<Cmd>) {
         } else {
             // 只有队列里确实没有新的 play 时才认为静音了
             PLAYING.store(false, Ordering::SeqCst);
+            set_level(0.0);
             if sink.is_some() && idle_since.elapsed() >= IDLE_CLOSE {
                 sink = None; // 关掉设备
             }
@@ -186,15 +194,80 @@ where
     S: rodio::Source + Send + 'static,
 {
     if max_secs > 0 {
-        player.append(src.take_duration(Duration::from_secs(u64::from(max_secs))));
+        player.append(Tap::new(src.take_duration(Duration::from_secs(u64::from(max_secs)))));
     } else {
-        player.append(src);
+        player.append(Tap::new(src));
     }
+}
+
+/// 透传样本的同时算滚动 RMS（每 ~20ms 一个窗口）写进 LEVEL。样本由声卡线程按播放进度拉取，
+/// 所以 LEVEL 跟着「正在出声」的位置走（只差设备缓冲那十几毫秒）
+struct Tap<S> {
+    inner: S,
+    acc: f32,
+    n: u32,
+    win: u32,
+}
+
+impl<S: rodio::Source> Tap<S> {
+    fn new(inner: S) -> Self {
+        let rate = u32::from(inner.sample_rate()) * u32::from(inner.channels().get());
+        Self { inner, acc: 0.0, n: 0, win: (rate / 50).max(64) }
+    }
+}
+
+impl<S: rodio::Source> Iterator for Tap<S> {
+    type Item = rodio::Sample;
+
+    #[inline]
+    fn next(&mut self) -> Option<rodio::Sample> {
+        let s = self.inner.next();
+        match s {
+            Some(v) => {
+                self.acc += v * v;
+                self.n += 1;
+                if self.n >= self.win {
+                    set_level((self.acc / self.n as f32).sqrt());
+                    self.acc = 0.0;
+                    self.n = 0;
+                }
+            }
+            None => set_level(0.0),
+        }
+        s
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) { self.inner.size_hint() }
+}
+
+impl<S: rodio::Source> rodio::Source for Tap<S> {
+    fn current_span_len(&self) -> Option<usize> { self.inner.current_span_len() }
+    fn channels(&self) -> rodio::ChannelCount { self.inner.channels() }
+    fn sample_rate(&self) -> rodio::SampleRate { self.inner.sample_rate() }
+    fn total_duration(&self) -> Option<Duration> { self.inner.total_duration() }
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> { self.inner.try_seek(pos) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::can_decode;
+
+    #[test]
+    fn tap_measures_rms_and_passes_samples_through() {
+        use rodio::Source;
+        // 1 秒 440Hz 正弦，幅度 0.5 → RMS ≈ 0.354
+        let wave = rodio::source::SineWave::new(440.0).amplify(0.5).take_duration(std::time::Duration::from_millis(200));
+        let rate = u32::from(wave.sample_rate());
+        let mut tap = super::Tap::new(wave);
+        assert_eq!(u32::from(tap.sample_rate()), rate);
+        let first: Vec<f32> = tap.by_ref().take(rate as usize / 10).collect();
+        assert_eq!(first.len(), rate as usize / 10);
+        let l = super::level();
+        assert!((l - 0.354).abs() < 0.03, "rms {l}");
+        // 放完归零
+        for _ in tap.by_ref() {}
+        assert_eq!(super::level(), 0.0);
+    }
 
     #[test]
     fn decode_wav_and_probe_ogg() {

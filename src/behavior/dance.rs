@@ -625,7 +625,8 @@ mod tests {
             assert_eq!(find(s.id).id, s.id);
         }
         assert!(SCORES.len() >= 3);
-        assert!(SCORES.iter().any(|s| s.id == find("").id));
+        let any = find("");
+        assert!(SCORES.iter().any(|s| s.id == any.id));
     }
 
     #[test]

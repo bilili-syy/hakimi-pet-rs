@@ -13,6 +13,7 @@ mod chat;
 mod memo_menu;
 mod menu;
 mod perch;
+mod power;
 mod sys;
 mod timers;
 mod toy;
@@ -424,6 +425,10 @@ fn tick() {
     }
     pump();
 
+    // 省电探测（藏起来/全屏程序/锁屏/电池 → 灵动效果降帧），每 2 秒一次
+    if let Some(h) = with(|s| s.hwnd) {
+        power::maybe_probe(now, h);
+    }
     // 帧
     let due = with(|s| !s.quitting && now >= s.next_frame).unwrap_or(false);
     if due {

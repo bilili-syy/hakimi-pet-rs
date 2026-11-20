@@ -3,6 +3,7 @@
 //! 布局全部按原版 index.html/style.css 的逻辑像素（240×360）算，再整体乘 DPI 缩放。
 pub mod anim;
 pub mod dance;
+pub mod live;
 pub mod shapes;
 pub mod sprites;
 pub mod text;
@@ -93,6 +94,8 @@ pub struct Scene {
     pub status: Option<StatusView>,
     pub zzz: Vec<ZGlyph>,
     pub fx: Vec<FxSprite>,
+    /// 伪 Live2D：呼吸扭曲 + 眨眼/张嘴贴片（全 0 = 静态立绘）
+    pub live: live::LiveView,
 }
 
 impl Default for Scene {
@@ -111,6 +114,7 @@ impl Default for Scene {
             status: None,
             zzz: Vec::new(),
             fx: Vec::new(),
+            live: live::LiveView::default(),
         }
     }
 }
@@ -154,6 +158,9 @@ struct BubbleText {
     cell: f32,
 }
 
+/// (资源路径, 尺寸, 裁好的图, 在缩放图里的 x, y)
+type Crop = (&'static str, (u32, u32), Rc<Pixmap>, f32, f32);
+
 struct Layer {
     key: String,
     pm: Pixmap,
@@ -168,6 +175,10 @@ pub struct Renderer {
     frame: Frame,
     last: Option<(Scene, f32)>,
     sprites: sprites::SpriteCache,
+    warper: live::Warper,
+    patches: live::PatchCache,
+    /// 尾巴/星星图层裁到不透明部分（整张画布大多是透明的，画小图省一大半像素）
+    crops: Vec<Crop>,
     text: text::TextEngine,
     bubble: Option<Layer>,
     bubble_text: Option<BubbleText>,
@@ -190,6 +201,9 @@ impl Renderer {
             frame: Frame { w: 0, h: 0, bgra: Vec::new() },
             last: None,
             sprites: sprites::SpriteCache::new(12),
+            warper: live::Warper::default(),
+            patches: live::PatchCache::default(),
+            crops: Vec::new(),
             text: text::TextEngine::new(),
             bubble: None,
             bubble_text: None,
@@ -241,6 +255,8 @@ impl Renderer {
         if self.pm.as_ref().is_none_or(|p| p.width() != w || p.height() != h) {
             self.pm = Pixmap::new(w, h);
             self.sprites.clear();
+            self.patches.clear();
+            self.crops.clear();
             self.bubble = None;
             self.bubble_text = None;
             self.status = None;
@@ -298,21 +314,43 @@ impl Renderer {
                     pm.draw_pixmap(0, 0, g.as_ref().as_ref(), &paint, t, None);
                 }
             }
-            pm.draw_pixmap(0, 0, base.as_ref().as_ref(), &paint, body.pre_concat(to_box(base)), None);
+            let m = body.pre_concat(to_box(base));
+            if scene.live.warping()
+                && let Some(w) = self.warper.warp(base, &scene.live, PET_H)
+            {
+                pm.draw_pixmap(0, 0, w.as_ref(), &paint, m, None);
+            } else {
+                pm.draw_pixmap(0, 0, base.as_ref().as_ref(), &paint, m, None);
+            }
+            // 眨眼 / 张嘴贴片：脸那一块随扭曲整体平移
+            let lv = &scene.live;
+            if lv.blink > 0.003 || lv.mouth > 0.003 {
+                let pt = self.patches.get(scene.face, &scene.costume, (sw, sh));
+                let head = body.pre_translate(0.0, -live::row_lift(lv, live::FACE_V)).pre_concat(to_box(base));
+                for (p, a) in [(&pt.blink, lv.blink), (&pt.mouth, lv.mouth)] {
+                    if let Some(p) = p && a > 0.003 {
+                        let pp = PixmapPaint { opacity: a.min(1.0), ..paint };
+                        pm.draw_pixmap(0, 0, p.pm.as_ref(), &pp, head.pre_translate(p.x as f32, p.y as f32), None);
+                    }
+                }
+            }
         }
+        let full_box = Transform::from_scale(PET_W / sw as f32, PET_H / sh as f32);
         if layers.tail
-            && let Some(t) = self.sprites.asset(sprites::TAIL, sw, sh)
+            && let Some((t, ox, oy)) = self.cropped(sprites::TAIL, sw, sh)
         {
             {
-                let m = body.pre_concat(xf_matrix(&scene.tail, 0.6 * PET_W, 0.797 * PET_H)).pre_concat(to_box(&t));
+                let (dx, dy) = live::offset_at(&scene.live, 0.6, 0.797);
+                let m = body.pre_translate(dx, dy).pre_concat(xf_matrix(&scene.tail, 0.6 * PET_W, 0.797 * PET_H)).pre_concat(full_box).pre_translate(ox, oy);
                 pm.draw_pixmap(0, 0, t.as_ref().as_ref(), &paint, m, None);
             }
         }
         if layers.star
-            && let Some(s) = self.sprites.asset(sprites::STAR, sw, sh)
+            && let Some((s, ox, oy)) = self.cropped(sprites::STAR, sw, sh)
         {
             {
-                let m = body.pre_concat(xf_matrix(&scene.star, 0.395 * PET_W, 0.123 * PET_H)).pre_concat(to_box(&s));
+                let lift = live::row_lift(&scene.live, 0.123);
+                let m = body.pre_translate(0.0, -lift).pre_concat(xf_matrix(&scene.star, 0.395 * PET_W, 0.123 * PET_H)).pre_concat(full_box).pre_translate(ox, oy);
                 pm.draw_pixmap(0, 0, s.as_ref().as_ref(), &paint, m, None);
                 if scene.star.bright > 1.001 {
                     // brightness(b) ≈ 再叠一层 (b-1) 的加色
@@ -326,10 +364,40 @@ impl Renderer {
                 let path = format!("outfits/{id}.png");
                 if let Some(o) = self.sprites.asset(&path, sw, sh) {
                     let m = body.pre_translate(ox / 400.0 * PET_W, oy / 587.0 * PET_H).pre_concat(to_box(&o));
-                    pm.draw_pixmap(0, 0, o.as_ref().as_ref(), &paint, m, None);
+                    if scene.live.warping()
+                        && let Some(w) = self.warper.warp(&o, &scene.live, PET_H)
+                    {
+                        pm.draw_pixmap(0, 0, w.as_ref(), &paint, m, None);
+                    } else {
+                        pm.draw_pixmap(0, 0, o.as_ref().as_ref(), &paint, m, None);
+                    }
                 }
             }
         }
+    }
+
+    /// 图层裁到不透明部分：(小图, 在缩放图里的 x, y)
+    fn cropped(&mut self, path: &'static str, w: u32, h: u32) -> Option<(Rc<Pixmap>, f32, f32)> {
+        if let Some(c) = self.crops.iter().find(|c| c.0 == path && c.1 == (w, h)) { return Some((c.2.clone(), c.3, c.4)); }
+        let full = self.sprites.asset(path, w, h)?;
+        let (fw, fh) = (full.width() as usize, full.height() as usize);
+        let d = full.data();
+        let (mut x0, mut y0, mut x1, mut y1) = (fw, fh, 0, 0);
+        for y in 0..fh {
+            for x in 0..fw {
+                if d[(y * fw + x) * 4 + 3] > 0 { x0 = x0.min(x); y0 = y0.min(y); x1 = x1.max(x); y1 = y1.max(y); }
+            }
+        }
+        let (c, off) = if x1 < x0 {
+            (full.clone(), (0.0, 0.0))
+        } else {
+            // 四周留 1px 透明，双线性采样边缘不被截断
+            let (x0, y0, x1, y1) = (x0.saturating_sub(1), y0.saturating_sub(1), (x1 + 1).min(fw - 1), (y1 + 1).min(fh - 1));
+            let r = tiny_skia::IntRect::from_ltrb(x0 as i32, y0 as i32, x1 as i32 + 1, y1 as i32 + 1)?;
+            (Rc::new(full.clone_rect(r)?), (x0 as f32, y0 as f32))
+        };
+        self.crops.push((path, (w, h), c.clone(), off.0, off.1));
+        Some((c, off.0, off.1))
     }
 
     fn draw_fx(&mut self, pm: &mut Pixmap, scene: &Scene, root: Transform) {
@@ -579,6 +647,72 @@ mod tests {
         r.pixmap().unwrap().save_png(out.replace(".png", "2.png")).unwrap();
     }
 
+    /// 手动看贴片对位：HAKIMI_SNAP=dir cargo test live_snapshot -- --ignored
+    /// 每个有贴片的表情出一张：左 原图 / 中 闭眼 / 右 张嘴（脸部裁剪放大）
+    #[test]
+    #[ignore]
+    fn live_snapshot() {
+        let dir = std::env::var("HAKIMI_SNAP").unwrap_or_else(|_| ".".into());
+        let mut r = Renderer::new();
+        let faces = [Face::Idle, Face::Happy, Face::Think, Face::Shy, Face::Love, Face::Surprised, Face::Hungry, Face::Stare, Face::Walk1];
+        let scale = 3.0;
+        let (cx, cy, cw, ch) = ((PET_X + 40.0) * scale, (PET_Y + 70.0) * scale, 110.0 * scale, 75.0 * scale);
+        let mut sheet = Pixmap::new((cw * 3.0) as u32, (ch * faces.len() as f32) as u32).unwrap();
+        sheet.fill(tiny_skia::Color::WHITE);
+        for (row, f) in faces.iter().enumerate() {
+            for (col, (b, m, d)) in [(0.0, 0.0, 0.0), (1.0, 0.0, 1.0), (0.0, 1.0, 1.0)].iter().enumerate() {
+                let mut sc = Scene::default();
+                sc.face = *f;
+                sc.live = live::LiveView { depth: *d, breath: 0.4, bob: 0.25, sway: 0.25, blink: *b, mouth: *m, sleep: false };
+                r.draw(&sc, scale);
+                let src = r.pixmap().unwrap();
+                let crop = src.clone_rect(tiny_skia::IntRect::from_xywh(cx as i32, cy as i32, cw as u32, ch as u32).unwrap()).unwrap();
+                sheet.draw_pixmap((col as f32 * cw) as i32, (row as f32 * ch) as i32, crop.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            }
+        }
+        sheet.save_png(format!("{dir}/live_sheet.png")).unwrap();
+        // 扭曲幅度：吸气顶点 vs 呼气、发梢左右
+        let mut sc = Scene::default();
+        let mut strip = Pixmap::new((WIN_W as f32 * 2.0 * 3.0) as u32, (WIN_H as f32 * 2.0) as u32).unwrap();
+        strip.fill(tiny_skia::Color::WHITE);
+        for (i, (br, sw)) in [(0.0, 0.25), (0.4, 0.75), (0.4, 0.25)].iter().enumerate() {
+            sc.live = live::LiveView { depth: 1.0, breath: *br, bob: 0.0, sway: *sw, blink: 0.0, mouth: 0.0, sleep: false };
+            r.draw(&sc, 2.0);
+            strip.draw_pixmap((i as f32 * WIN_W as f32 * 2.0) as i32, 0, r.pixmap().unwrap().as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        }
+        strip.save_png(format!("{dir}/live_warp.png")).unwrap();
+    }
+
+    #[test]
+    fn live_overlays_draw_and_change_frame() {
+        let mut r = Renderer::new();
+        let mut sc = Scene::default();
+        r.draw(&sc, 1.0);
+        let a = r.pixmap().unwrap().clone();
+        sc.live.blink = 1.0;
+        r.draw(&sc, 1.0);
+        let b = r.pixmap().unwrap().clone();
+        assert_ne!(a.data(), b.data(), "blink patch drew nothing");
+        // 只改了脸那一块：脚底一行不变
+        let w = a.width() as usize;
+        let foot = (a.height() as usize - 20) * w * 4;
+        assert_eq!(&a.data()[foot..foot + w * 4], &b.data()[foot..foot + w * 4]);
+        // 扭曲开着但在呼气末、头不点：头顶和脚底逐像素不变（只有发梢/衣摆在动）
+        sc.live = live::LiveView { depth: 1.0, ..Default::default() };
+        r.draw(&sc, 1.0);
+        let c = r.pixmap().unwrap().clone();
+        let row = |p: &Pixmap, y: f32| { let y = y as usize * w * 4; p.data()[y..y + w * 4].to_vec() };
+        for y in [PET_Y + 30.0, PET_Y + 60.0, WIN_H as f32 - 20.0, WIN_H as f32 - 5.0] {
+            assert_eq!(row(&a, y), row(&c, y), "row {y}");
+        }
+        // 吸气顶点：头整体上移
+        sc.live.breath = 0.4;
+        r.draw(&sc, 1.0);
+        let d = r.pixmap().unwrap().clone();
+        assert_ne!(row(&a, PET_Y + 60.0), row(&d, PET_Y + 60.0));
+        assert_eq!(row(&a, WIN_H as f32 - 5.0), row(&d, WIN_H as f32 - 5.0));
+    }
+
     /// 手动测性能：cargo test --release bench -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -598,6 +732,39 @@ mod tests {
             r.update(&sc, 1.5);
         }
         eprintln!("avg frame {:?}", t.elapsed() / n);
+        // 伪 Live2D：扭曲 + 贴片
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            let p = i as f32 / 60.0;
+            sc.face = Face::Idle;
+            sc.pet = Xf::ID;
+            sc.live = live::LiveView { depth: 1.0, breath: p.fract(), bob: (p * 0.8).fract(), sway: (p * 0.7).fract(), blink: if i % 50 < 3 { 1.0 } else { 0.0 }, mouth: (i % 4) as f32 / 3.0, sleep: false };
+            r.update(&sc, 1.5);
+        }
+        eprintln!("avg live frame {:?}", t.elapsed() / n);
+        // 桌面上的常见情况：100% 缩放、没有气泡/配件
+        for scale in [1.0f32, 1.25] {
+            let mut r = Renderer::new();
+            let mut sc = Scene::default();
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                sc.pet = anim::breathe((i as f32 / 13.0).fract());
+                sc.tail = anim::tail_sway((i as f32 / 40.0).fract());
+                sc.star = anim::star_bob((i as f32 / 50.0).fract());
+                r.update(&sc, scale);
+            }
+            let old = t.elapsed() / n;
+            let t = std::time::Instant::now();
+            sc.pet = Xf::ID;
+            for i in 0..n {
+                let p = i as f32 / 60.0;
+                sc.tail = anim::tail_sway((i as f32 / 40.0).fract());
+                sc.star = anim::star_bob((i as f32 / 50.0).fract());
+                sc.live = live::LiveView { depth: 1.0, breath: p.fract(), bob: (p * 0.8).fract(), sway: (p * 0.7).fract(), blink: 0.0, mouth: 0.0, sleep: false };
+                r.update(&sc, scale);
+            }
+            eprintln!("scale {scale}: old idle frame {old:?}, live idle frame {:?}", t.elapsed() / n);
+        }
         std::thread::sleep(std::time::Duration::from_secs(4));
     }
 }
