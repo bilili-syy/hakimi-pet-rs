@@ -10,11 +10,12 @@ use crate::types::Audio;
 /// 每句最多等多久合成（毫秒）
 pub(super) const CV_WAIT_MS: u64 = 15_000;
 /// 最多切几段（再多就并到最后一段）
-const MAX_CHUNKS: usize = 4;
+const MAX_CHUNKS: usize = 3;
 /// 短于这个字数的句子和下一句合并（别一个「嗯！」也单独念）
-const MIN_CHUNK: usize = 6;
-/// 整句不超过这么多字就不切
-const NO_SPLIT_UNDER: usize = 24;
+const MIN_CHUNK: usize = 12;
+/// 整段不超过这么多字就不切。MiMo 每次合成要等好几秒（主要花在请求本身，跟字数关系不大），
+/// 切太碎反而句与句之间要干等；人设要求回复 ≤60 字，所以平常一整段一起出，只有长回复才分句
+const NO_SPLIT_UNDER: usize = 60;
 
 /// 进行中的语音回答
 #[derive(Debug, Default)]
@@ -283,18 +284,24 @@ mod tests {
     fn split() {
         assert_eq!(split_sentences("  "), Vec::<String>::new());
         assert_eq!(split_sentences("晴天喵～"), vec!["晴天喵～"]);
-        let s = split_sentences("今天天气很好喵！我们出去玩吧～记得带伞，下午可能会下雨哦。");
-        assert_eq!(s, vec!["今天天气很好喵！", "我们出去玩吧～", "记得带伞，下午可能会下雨哦。"]);
-        // 短句并到下一句；连着的标点算一起
-        let s = split_sentences("嗯！！这个问题哈基米知道……答案是四十二喵。你还想知道什么呀？");
-        assert_eq!(s[0], "嗯！！这个问题哈基米知道……");
-        assert_eq!(s.concat(), "嗯！！这个问题哈基米知道……答案是四十二喵。你还想知道什么呀？");
-        // 最多 4 段，拼起来不丢字
-        let long = "一二三四五六。".repeat(8);
-        let s = split_sentences(&long);
-        assert_eq!(s.len(), 4);
+        // 一般长度（≤60 字）整段不切
+        let short = "今天天气很好喵！我们出去玩吧～记得带伞，下午可能会下雨哦。";
+        assert_eq!(split_sentences(short), vec![short]);
+        // 长回复按句切，短句并到下一句，连着的标点算一起
+        let long = "嗯！！这个问题哈基米知道……答案是四十二喵。宇宙、生命以及一切的终极答案就是它！不过哈基米觉得，比起答案，和你一起找答案更开心喵～你还想知道什么呀？";
+        assert!(long.chars().count() > 60);
+        let s = split_sentences(long);
+        assert!(s.len() >= 2 && s.len() <= 3, "{s:?}");
+        assert!(s[0].starts_with("嗯！！这个问题哈基米知道……"));
+        assert!(s.iter().all(|c| c.chars().count() >= MIN_CHUNK));
         assert_eq!(s.concat(), long);
-        // 没有句末标点
-        assert_eq!(split_sentences("没有标点的一句很长很长很长很长很长很长的话呀"), vec!["没有标点的一句很长很长很长很长很长很长的话呀"]);
+        // 最多 3 段，拼起来不丢字
+        let many = "一二三四五六七八九十一二。".repeat(8);
+        let s = split_sentences(&many);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.concat(), many);
+        // 没有句末标点的长段
+        let flat = "没有标点".repeat(20);
+        assert_eq!(split_sentences(&flat), vec![flat.clone()]);
     }
 }
