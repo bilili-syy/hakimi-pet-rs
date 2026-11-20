@@ -504,13 +504,8 @@ impl Behavior {
                 }
                 2 => self.on_blink(),
                 3 => self.on_tick(),
-                4 => {
-                    // setInterval 节奏：按到期时间累加，落后太多就重新对齐
-                    self.next_walk_frame = if self.next_walk_frame + 500 < now { now + 160 } else { self.next_walk_frame + 160 };
-                    const WALK_SEQ: [Face; 4] = [Face::Walk1, Face::Idle, Face::Walk2, Face::Idle];
-                    self.walk_frame = (self.walk_frame + 1) % 4;
-                    self.show(WALK_SEQ[self.walk_frame]);
-                }
+                // 走路换帧跟着整体动画的颠步走（live.rs）
+                4 => self.walk_tick(now),
                 5 => self.on_dance_beat(),
                 6 => {
                     if let Some(b) = &mut self.bubble { b.hide_at = None; }
@@ -1469,6 +1464,7 @@ impl Behavior {
         let live = self.live_view();
         let mut pet = self.pet_xf();
         if self.live_replaces_breathe() && matches!(self.pet_anim.0, PetAnim::Breathe | PetAnim::BreatheSlow) { pet = Xf::ID; }
+        let mut pet = self.blend_pet(pet);
         let (lean, tilt) = self.play.lean_at(now);
         pet.rot += tilt;
         let (tail, star) = self.tail_star();

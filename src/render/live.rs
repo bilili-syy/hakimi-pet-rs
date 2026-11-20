@@ -34,6 +34,9 @@ pub struct LiveView {
     pub blink: f32,
     /// 张嘴程度 0..1（张嘴贴片的不透明度）
     pub mouth: f32,
+    /// 表情交叉淡化：上一个表情（同一套衣服）盖在上面，不透明度 prev_alpha 从 1 淡到 0
+    pub prev_face: Option<Face>,
+    pub prev_alpha: f32,
 }
 
 impl LiveView {
@@ -109,74 +112,153 @@ pub fn offset_at(l: &LiveView, u: f32, v: f32) -> (f32, f32) {
 }
 
 // ---------------------------------------------------------------- 扭曲（逐行重采样）
-/// 复用的扭曲缓冲（一张立绘大小）+ 列权重表
+/// 复用的扭曲缓冲（一张立绘大小）+ 列权重表 + 直接画进窗口时用的一行暂存
 #[derive(Default)]
 pub struct Warper {
     buf: Option<Pixmap>,
+    /// 列权重表对应的 (宽, 外扩)
+    cols_key: (u32, u32),
     cols: Vec<(f32, f32)>,
+    row: Vec<u8>,
+}
+
+/// 第 y 行（源图坐标）的四个位移，单位源图像素。pad = 源图四周外扩（光晕图比立绘大一圈）
+fn row_params(l: &LiveView, y: usize, h: usize, pad: u32, k: f32) -> (f32, f32, f32, f32) {
+    let inner = h as f32 - 2.0 * pad as f32;
+    let v = (y as f32 + 0.5 - pad as f32) / inner.max(1.0);
+    let (hl, hr) = hair_dx(l, v);
+    (row_lift(l, v) * k, row_dx(l, v) * k, hl * k, hr * k)
 }
 
 impl Warper {
+    fn ensure_cols(&mut self, w: u32, pad: u32) {
+        if self.cols_key != (w, pad) || self.cols.len() != w as usize {
+            let inner = (w as f32 - 2.0 * pad as f32).max(1.0);
+            self.cols = (0..w).map(|x| hair_cols((x as f32 + 0.5 - pad as f32) / inner)).collect();
+            self.cols_key = (w, pad);
+        }
+    }
+
     /// 把 src 按 l 扭曲进内部缓冲。box_h = src 对应的逻辑高度（#pet 盒子 293）
-    pub fn warp(&mut self, src: &Pixmap, l: &LiveView, box_h: f32) -> Option<&Pixmap> {
+    pub fn warp(&mut self, src: &Pixmap, l: &LiveView, box_h: f32) -> Option<&Pixmap> { self.warp_padded(src, l, box_h, 0) }
+
+    /// 同 warp，但 src 四周比立绘多 pad 像素（光晕图）：扭曲场按里面那张立绘的位置算，光晕跟着身子一起动
+    pub fn warp_padded(&mut self, src: &Pixmap, l: &LiveView, box_h: f32, pad: u32) -> Option<&Pixmap> {
         let (w, h) = (src.width(), src.height());
         if self.buf.as_ref().is_none_or(|b| b.width() != w || b.height() != h) {
             self.buf = Pixmap::new(w, h);
-            self.cols = (0..w).map(|x| hair_cols((x as f32 + 0.5) / w as f32)).collect();
         }
-        let k = h as f32 / box_h;
+        self.ensure_cols(w, pad);
+        let k = (h as f32 - 2.0 * pad as f32) / box_h;
         let dst = self.buf.as_mut()?;
-        warp_rows(src.data(), dst.data_mut(), w as usize, h as usize, &self.cols, |v| {
-            let (hl, hr) = hair_dx(l, v);
-            (row_lift(l, v) * k, row_dx(l, v) * k, hl * k, hr * k)
-        });
+        let stride = w as usize * 4;
+        let (wu, hu) = (w as usize, h as usize);
+        for (y, out) in dst.data_mut().chunks_exact_mut(stride).enumerate() {
+            warp_row(src.data(), out, wu, hu, &self.cols, y, row_params(l, y, hu, pad, k));
+        }
         self.buf.as_ref()
+    }
+
+    /// 快速路径：扭曲后直接 src-over 画进 dst 的整数像素位置 (x, y)，mirror = 水平镜像，opacity = 整体不透明度。
+    /// 省掉中间缓冲和一次 tiny-skia 的双线性重采样；不动的行（腿、脚）直接拿源行，不做插值
+    #[allow(clippy::too_many_arguments)]
+    pub fn warp_blit(&mut self, src: &Pixmap, l: &LiveView, box_h: f32, pad: u32, dst: &mut Pixmap, x: i32, y: i32, mirror: bool, opacity: f32) {
+        let a = (opacity.clamp(0.0, 1.0) * 256.0).round() as u32;
+        if a == 0 { return; }
+        let (w, h) = (src.width() as usize, src.height() as usize);
+        self.ensure_cols(w as u32, pad);
+        self.row.resize(w * 4, 0);
+        let k = (h as f32 - 2.0 * pad as f32) / box_h;
+        let (dw, dh) = (dst.width() as i32, dst.height() as i32);
+        let stride = w * 4;
+        let dstride = dw as usize * 4;
+        let dd = dst.data_mut();
+        for sy in 0..h {
+            let dy = y + sy as i32;
+            if dy < 0 || dy >= dh { continue; }
+            let p = if l.warping() { row_params(l, sy, h, pad, k) } else { (0.0, 0.0, 0.0, 0.0) };
+            let row: &[u8] = if p == (0.0, 0.0, 0.0, 0.0) {
+                &src.data()[sy * stride..(sy + 1) * stride]
+            } else {
+                warp_row(src.data(), &mut self.row, w, h, &self.cols, sy, p);
+                &self.row
+            };
+            let drow = &mut dd[dy as usize * dstride..(dy as usize + 1) * dstride];
+            blend_row(drow, dw, row, x, mirror, a);
+        }
     }
 }
 
-/// 逐行：目标行 y 取源行 y + lift（内容上移），水平位移 dx = 衣摆 + 列权重 × 发梢；双线性采样（预乘 RGBA 直接插值）。
+/// 一行 src-over（预乘 RGBA）：src 行画到 dst 行的 x 处，mirror = 水平镜像，a = 整体不透明度（256 = 不透明）。
+/// 不透明/全透明像素走捷径
+pub fn blend_row(drow: &mut [u8], dw: i32, row: &[u8], x: i32, mirror: bool, a: u32) {
+    let w = (row.len() / 4) as i32;
+    for i in 0..w {
+        let dx = if mirror { x + w - 1 - i } else { x + i };
+        if dx < 0 || dx >= dw { continue; }
+        let s = &row[i as usize * 4..i as usize * 4 + 4];
+        if s[3] == 0 { continue; }
+        let s = if a >= 256 { [s[0], s[1], s[2], s[3]] } else { [0, 1, 2, 3].map(|c| ((s[c] as u32 * a + 128) >> 8) as u8) };
+        let sa = s[3] as u32;
+        let d = &mut drow[dx as usize * 4..dx as usize * 4 + 4];
+        if sa == 255 || d[3] == 0 {
+            d.copy_from_slice(&s);
+            continue;
+        }
+        let inv = 255 - sa;
+        for c in 0..4 {
+            let v = d[c] as u32 * inv + 128;
+            d[c] = (s[c] as u32 + ((v + (v >> 8)) >> 8)).min(255) as u8;
+        }
+    }
+}
+
+/// 目标行 y 取源行 y + lift（内容上移），水平位移 dx = 衣摆 + 列权重 × 发梢；双线性采样（预乘 RGBA 直接插值）。
 /// 只有竖直位移的行/像素走整数权重的两行插值（大部分像素），有水平位移的才做完整双线性
-fn warp_rows(src: &[u8], dst: &mut [u8], w: usize, h: usize, cols: &[(f32, f32)], row: impl Fn(f32) -> (f32, f32, f32, f32)) {
+fn warp_row(src: &[u8], out: &mut [u8], w: usize, h: usize, cols: &[(f32, f32)], y: usize, (lift, hem, hl, hr): (f32, f32, f32, f32)) {
     const ZERO: [u8; 0] = [];
     let stride = w * 4;
     let src_row = |y: isize| -> &[u8] { if y < 0 || y >= h as isize { &ZERO } else { &src[y as usize * stride..(y as usize + 1) * stride] } };
-    for y in 0..h {
-        let v = (y as f32 + 0.5) / h as f32;
-        let (lift, hem, hl, hr) = row(v);
-        let sy = y as f32 + lift;
-        let y0f = sy.floor();
-        let fy = sy - y0f;
-        let y0 = y0f as isize;
-        let (ra, rb) = (src_row(y0), src_row(y0 + 1));
-        let out = &mut dst[y * stride..(y + 1) * stride];
-        let wy = (fy * 256.0 + 0.5) as u32;
-        let horiz = hem != 0.0 || hl != 0.0 || hr != 0.0;
-        if !horiz {
-            vlerp(ra, rb, out, wy);
+    let sy = y as f32 + lift;
+    let y0f = sy.floor();
+    let fy = sy - y0f;
+    let y0 = y0f as isize;
+    let (ra, rb) = (src_row(y0), src_row(y0 + 1));
+    let wy = (fy * 256.0 + 0.5) as u32;
+    let horiz = hem != 0.0 || hl != 0.0 || hr != 0.0;
+    if !horiz {
+        vlerp(ra, rb, out, wy);
+        return;
+    }
+    let px = |r: &[u8], x: isize, c: usize| -> f32 { if r.is_empty() || x < 0 || x >= w as isize { 0.0 } else { r[x as usize * 4 + c] as f32 } };
+    for x in 0..w {
+        let (cl, cr) = cols[x];
+        let dx = hem + hl * cl + hr * cr;
+        let o = &mut out[x * 4..x * 4 + 4];
+        if dx == 0.0 {
+            vlerp(ra.get(x * 4..x * 4 + 4).unwrap_or(&ZERO), rb.get(x * 4..x * 4 + 4).unwrap_or(&ZERO), o, wy);
             continue;
         }
-        let px = |r: &[u8], x: isize, c: usize| -> f32 { if r.is_empty() || x < 0 || x >= w as isize { 0.0 } else { r[x as usize * 4 + c] as f32 } };
-        for x in 0..w {
-            let (cl, cr) = cols[x];
-            let dx = hem + hl * cl + hr * cr;
-            let o = &mut out[x * 4..x * 4 + 4];
-            if dx == 0.0 {
-                vlerp(ra.get(x * 4..x * 4 + 4).unwrap_or(&ZERO), rb.get(x * 4..x * 4 + 4).unwrap_or(&ZERO), o, wy);
-                continue;
-            }
-            let sx = x as f32 - dx;
-            let x0f = sx.floor();
-            let fx = sx - x0f;
-            let x0 = x0f as isize;
-            for (c, oc) in o.iter_mut().enumerate() {
-                let top = px(ra, x0, c) + (px(ra, x0 + 1, c) - px(ra, x0, c)) * fx;
-                let bot = px(rb, x0, c) + (px(rb, x0 + 1, c) - px(rb, x0, c)) * fx;
-                *oc = (top + (bot - top) * fy + 0.5) as u8;
-            }
-            // 预乘不变量：颜色不超过 alpha
-            let al = o[3];
-            for oc in &mut o[..3] { if *oc > al { *oc = al; } }
+        let sx = x as f32 - dx;
+        let x0f = sx.floor();
+        let fx = sx - x0f;
+        let x0 = x0f as isize;
+        for (c, oc) in o.iter_mut().enumerate() {
+            let top = px(ra, x0, c) + (px(ra, x0 + 1, c) - px(ra, x0, c)) * fx;
+            let bot = px(rb, x0, c) + (px(rb, x0 + 1, c) - px(rb, x0, c)) * fx;
+            *oc = (top + (bot - top) * fy + 0.5) as u8;
         }
+        // 预乘不变量：颜色不超过 alpha
+        let al = o[3];
+        for oc in &mut o[..3] { if *oc > al { *oc = al; } }
+    }
+}
+
+/// 测试用：整张图逐行扭曲（和 Warper 同一套逐行代码）
+#[cfg(test)]
+fn warp_rows(src: &[u8], dst: &mut [u8], w: usize, h: usize, cols: &[(f32, f32)], row: impl Fn(f32) -> (f32, f32, f32, f32)) {
+    for (y, out) in dst.chunks_exact_mut(w * 4).enumerate() {
+        warp_row(src, out, w, h, cols, y, row((y as f32 + 0.5) / h as f32));
     }
 }
 
@@ -647,5 +729,179 @@ mod tests {
         let a = c.get(Face::Surprised, "", (200, 293));
         let b = c.get(Face::Surprised, "", (200, 293));
         assert!(Rc::ptr_eq(&a, &b));
+    }
+    #[test]
+    fn blend_row_opacity_and_mirror() {
+        // dst: 3 像素，第 0 个已有半透明红
+        let mut d = vec![0u8; 12];
+        d[0..4].copy_from_slice(&[100, 0, 0, 100]);
+        let row = [10u8, 20, 30, 255, 0, 0, 0, 0, 50, 50, 50, 128];
+        blend_row(&mut d, 3, &row, 0, false, 256);
+        assert_eq!(&d[0..4], &[10, 20, 30, 255]); // 不透明直接盖
+        assert_eq!(&d[4..8], &[0, 0, 0, 0]); // 透明跳过
+        assert_eq!(&d[8..12], &[50, 50, 50, 128]); // 目标空直接拷
+        // 镜像：第 0 个源像素落到最右
+        let mut m = vec![0u8; 12];
+        blend_row(&mut m, 3, &row, 0, true, 256);
+        assert_eq!(&m[8..12], &[10, 20, 30, 255]);
+        // 半透明叠半透明：预乘 src-over
+        let mut e = vec![100u8, 0, 0, 100];
+        blend_row(&mut e, 1, &[0, 0, 100, 100], 0, false, 256);
+        assert_eq!(e[3] as u32, 100 + (100 * 155 + 127) / 255);
+        assert!(e[0] > 55 && e[0] < 65 && e[2] == 100);
+        // 整体不透明度一半
+        let mut h = vec![0u8; 4];
+        blend_row(&mut h, 1, &[200, 100, 0, 255], 0, false, 128);
+        assert_eq!(&h[..], &[100, 50, 0, 128]);
+        // 出界不写
+        let mut c = vec![0u8; 4];
+        blend_row(&mut c, 1, &row, -2, false, 256);
+        assert_eq!(&c[..], &[50, 50, 50, 128]);
+    }
+
+    fn test_img(w: u32, h: u32) -> Pixmap {
+        let mut p = Pixmap::new(w, h).unwrap();
+        for (i, px) in p.data_mut().chunks_exact_mut(4).enumerate() {
+            let (x, y) = (i as u32 % w, i as u32 / w);
+            if (x / 3 + y / 5) % 2 == 0 { px.copy_from_slice(&[(x * 7 % 256) as u8 / 2, (y * 3 % 256) as u8 / 2, 60, 200]); }
+        }
+        p
+    }
+
+    #[test]
+    fn warp_blit_matches_buffered_warp() {
+        let src = test_img(60, 88);
+        let l = LiveView { depth: 1.0, breath: 0.33, bob: 0.2, sway: 0.27, ..Default::default() };
+        let mut w = Warper::default();
+        let buf = w.warp(&src, &l, 88.0).unwrap().clone();
+        let mut dst = Pixmap::new(80, 100).unwrap();
+        w.warp_blit(&src, &l, 88.0, 0, &mut dst, 7, 9, false, 1.0);
+        // 直接画进窗口的结果 = 扭曲进缓冲再整像素拷贝
+        for y in 0..88usize {
+            for x in 0..60usize {
+                let a = &buf.data()[(y * 60 + x) * 4..][..4];
+                let b = &dst.data()[((y + 9) * 80 + x + 7) * 4..][..4];
+                assert_eq!(a, b, "x={x} y={y}");
+            }
+        }
+        // 不扭曲 = 原样拷贝（像素级不变 → 不发虚）
+        let mut d2 = Pixmap::new(60, 88).unwrap();
+        w.warp_blit(&src, &LiveView::default(), 88.0, 0, &mut d2, 0, 0, false, 1.0);
+        assert_eq!(d2.data(), src.data());
+    }
+
+    #[test]
+    fn padded_warp_follows_inner_sprite() {
+        // 光晕图 = 立绘四周外扩 pad：扭曲场按里面立绘的位置算，和立绘本身的位移一致
+        let pad = 6u32;
+        let src = test_img(60, 88);
+        let mut big = Pixmap::new(60 + 2 * pad, 88 + 2 * pad).unwrap();
+        big.draw_pixmap(pad as i32, pad as i32, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        let l = LiveView { depth: 1.0, breath: 0.4, bob: 0.1, sway: 0.3, ..Default::default() };
+        let mut w = Warper::default();
+        let inner = w.warp(&src, &l, 88.0).unwrap().clone();
+        let outer = w.warp_padded(&big, &l, 88.0, pad).unwrap().clone();
+        let ow = (60 + 2 * pad) as usize;
+        let mut diff = 0u32;
+        for y in 0..88usize {
+            for x in 0..60usize {
+                let a = &inner.data()[(y * 60 + x) * 4..][..4];
+                let b = &outer.data()[((y + pad as usize) * ow + x + pad as usize) * 4..][..4];
+                diff = diff.max(a.iter().zip(b).map(|(p, q)| (*p as i32 - *q as i32).unsigned_abs()).max().unwrap());
+            }
+        }
+        // 边缘行可能从外扩区取到透明像素，内部一致
+        assert!(diff <= 200, "{diff}");
+        let mut same = 0;
+        for y in 10..80usize { for x in 10..50usize {
+            if inner.data()[(y * 60 + x) * 4..][..4] == outer.data()[((y + pad as usize) * ow + x + pad as usize) * 4..][..4] { same += 1; }
+        } }
+        assert!(same as f32 > 0.99 * 70.0 * 40.0, "{same}");
+    }
+
+    // ------------------------------------------------------------ 贴片覆盖率矩阵
+    /// 每套衣服应该有的贴片（按画出来的那张立绘算）：睁眼的要眨眼，能说话的要张嘴。
+    /// 闭眼/表情太夸张的（sleep、drag、eat、sit）不要求
+    const WANT: [(&str, &[Kind]); 4] = [
+        ("idle", &[Kind::Blink, Kind::Mouth]),
+        ("happy", &[Kind::Mouth]),
+        ("hungry", &[Kind::Blink]),
+        ("think", &[Kind::Blink, Kind::Mouth]),
+    ];
+
+    /// 还没补上的缺口（衣服, 立绘, 种类）。补一张就从这里删一行；测试会拦住「补了没删」和「新缺口」
+    const KNOWN_GAPS: &[(&str, &str, Kind)] = &[
+        ("sailor", "hungry", Kind::Blink),
+        ("sailor", "think", Kind::Blink),
+        ("pajama", "idle", Kind::Blink),
+        ("pajama", "hungry", Kind::Blink),
+        ("pajama", "think", Kind::Blink),
+        ("idol", "idle", Kind::Blink),
+        ("idol", "hungry", Kind::Blink),
+        ("idol", "think", Kind::Blink),
+        ("swim", "idle", Kind::Blink),
+        ("swim", "hungry", Kind::Blink),
+        ("swim", "think", Kind::Blink),
+    ];
+
+    /// 衣服 → (表情, 立绘)：同一张立绘只算一次
+    fn stems_of(costume: &str) -> Vec<(Face, String)> {
+        let mut v: Vec<(Face, String)> = Vec::new();
+        for f in Face::ALL {
+            let s = drawn_stem(f, costume);
+            if !v.iter().any(|(_, x)| *x == s) { v.push((f, s)); }
+        }
+        v
+    }
+
+    /// 打印矩阵：cargo test --release patch_coverage -- --nocapture
+    #[test]
+    fn patch_coverage_matrix() {
+        let mark = |f: Face, c: &str, k: Kind, ch: char| if available(f, c, k) { ch } else { '·' };
+        let mut gaps = Vec::new();
+        println!("贴片覆盖率（B=眨眼 M=张嘴 ·=没有）");
+        for (c, _) in crate::core::costume::COSTUMES {
+            let row: Vec<String> = stems_of(c).iter()
+                .map(|(f, s)| format!("{s}:{}{}", mark(*f, c, Kind::Blink, 'B'), mark(*f, c, Kind::Mouth, 'M')))
+                .collect();
+            println!("{c:7} {}", row.join(" "));
+            for (stem, kinds) in WANT {
+                let Some((f, _)) = stems_of(c).into_iter().find(|(_, s)| s == stem) else { continue };
+                for &k in kinds {
+                    if !available(f, c, k) { gaps.push((c, stem, k)); }
+                }
+            }
+        }
+        for g in &gaps {
+            assert!(KNOWN_GAPS.contains(g), "新缺口（贴片丢了？）：{g:?}");
+        }
+        for g in KNOWN_GAPS {
+            assert!(gaps.contains(g), "已经补上了，从 KNOWN_GAPS 删掉：{g:?}");
+        }
+        let total = crate::core::costume::COSTUMES.len() * WANT.iter().map(|(_, k)| k.len()).sum::<usize>();
+        println!("覆盖 {}/{total}", total - gaps.len());
+    }
+
+    /// assets/sprites/live 里每张贴片都有表情用得到，且和它贴的那张立绘一样大
+    #[test]
+    fn patches_used_and_sized() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/sprites/live");
+        let mut used = std::collections::HashMap::new();
+        for c in ["hoodie"].into_iter().chain(crate::core::costume::COSTUMES.iter().map(|(c, _)| *c)) {
+            for f in Face::ALL {
+                let base = crate::render::sprites::layers_for(f, c, &[]).base;
+                for k in [Kind::Blink, Kind::Mouth] {
+                    if let Some(p) = builtin_path(f, c, k) { used.insert(p, base.clone()); }
+                }
+            }
+        }
+        for e in std::fs::read_dir(dir).unwrap() {
+            let name = e.unwrap().file_name().into_string().unwrap();
+            let p = format!("sprites/live/{name}");
+            let base = used.get(&p).unwrap_or_else(|| panic!("没有表情用到这张贴片：{p}"));
+            let a = Pixmap::decode_png(crate::assets::get(&p).unwrap()).unwrap();
+            let b = Pixmap::decode_png(crate::assets::get(base).unwrap()).unwrap();
+            assert_eq!((a.width(), a.height()), (b.width(), b.height()), "{p} vs {base}");
+        }
     }
 }

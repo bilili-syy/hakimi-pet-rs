@@ -99,11 +99,14 @@ fn walk_and_walk_done() {
     assert!(dir == 1 || dir == -1);
     assert!((120.0 * 1.5..=420.0 * 1.5).contains(&dist));
     assert!((speed - 1.6 * 1.5).abs() < 1e-3);
-    // 走路帧轮换：walk1 → idle → walk2 → idle（原版从下标 1 开始换）
+    // 走路帧轮换：walk1 → idle → walk2 → idle，跟整体动画的颠步同步（500ms 两步，脚落地时迈腿）
     tick(&mut b, 3170);
-    tick(&mut b, 3330);
+    assert_eq!(b.scene.face, Face::Idle);
+    tick(&mut b, 3250);
     assert_eq!(b.scene.face, Face::Walk2);
-    tick(&mut b, 3650);
+    tick(&mut b, 3400);
+    assert_eq!(b.scene.face, Face::Idle);
+    tick(&mut b, 3500);
     assert_eq!(b.scene.face, Face::Walk1);
     let out = ev(&mut b, AppEvent::WalkDone { hit_edge: true }, 4000);
     assert_eq!(b.state, St::Idle);
@@ -195,7 +198,8 @@ fn frame_interval_idle_vs_animating() {
     assert!(ms <= IDLE_FRAME_MS);
     ev(&mut b, AppEvent::Menu(MenuAction::Feed), 4000);
     let (ms, _) = tick(&mut b, 4016);
-    assert_eq!(ms, ANIM_FRAME_MS);
+    // 待机扭曲还在渐出（DEPTH_RAMP_MS）那几帧沿用灵动帧间隔，渐出完就是普通动画帧
+    if b.scene.live.warping() { assert_eq!(ms, crate::render::live::LIVE_FRAME_MS.min(ANIM_FRAME_MS)); } else { assert_eq!(ms, ANIM_FRAME_MS); }
 }
 
 #[test]

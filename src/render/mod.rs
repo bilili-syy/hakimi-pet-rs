@@ -4,6 +4,7 @@
 pub mod anim;
 pub mod dance;
 pub mod live;
+pub mod perf;
 pub mod shapes;
 pub mod skin_loader;
 pub mod sprites;
@@ -181,6 +182,8 @@ pub struct Renderer {
     sprites: sprites::SpriteCache,
     warper: live::Warper,
     patches: live::PatchCache,
+    /// HAKIMI_TRACE=1 时的帧耗时/帧率/CPU 统计
+    perf: perf::Perf,
     /// 尾巴/星星图层裁到不透明部分（整张画布大多是透明的，画小图省一大半像素）
     crops: Vec<Crop>,
     text: text::TextEngine,
@@ -207,6 +210,7 @@ impl Renderer {
             sprites: sprites::SpriteCache::new(12),
             warper: live::Warper::default(),
             patches: live::PatchCache::default(),
+            perf: perf::Perf::new(),
             crops: Vec::new(),
             text: text::TextEngine::new(),
             bubble: None,
@@ -227,6 +231,13 @@ impl Renderer {
 
     /// 画一帧到内部缓冲；没变化返回 false
     pub fn update(&mut self, scene: &Scene, scale: f32) -> bool {
+        let t0 = self.perf.begin();
+        let drawn = self.update_inner(scene, scale);
+        self.perf.end(t0, drawn, scene.live.warping(), scale);
+        drawn
+    }
+
+    fn update_inner(&mut self, scene: &Scene, scale: f32) -> bool {
         let scale = if scale.is_finite() && scale > 0.1 { scale } else { 1.0 };
         // 换了角色包：旧皮肤的图已释放，这一帧必须重画
         if skin_loader::sync(&mut self.sprites) { self.last = None; }
@@ -284,22 +295,32 @@ impl Renderer {
     pub fn pixmap(&self) -> Option<&Pixmap> { self.pm.as_ref() }
 
     fn draw_pet(&mut self, pm: &mut Pixmap, scene: &Scene, scale: f32, root: Transform) {
-        let pet = root.pre_concat(xf_matrix(&scene.pet, PET_X + PET_W / 2.0, WIN_H as f32));
-        // 歪头看光标：以脚底为轴水平错切，头顶偏 lean 像素
-        let pet = if scene.lean.abs() > 0.01 {
-            let k = -scene.lean / PET_H;
-            pet.pre_concat(Transform::from_row(1.0, 0.0, k, 1.0, -k * WIN_H as f32, 0.0))
-        } else {
-            pet
-        };
-        let cx = PET_X + PET_W / 2.0;
-        let cy = PET_Y + PET_H / 2.0;
-        let body = pet
-            .pre_translate(cx, cy)
-            .pre_scale(scene.flip, 1.0)
-            .pre_translate(-cx, -cy)
-            .pre_translate(PET_X, PET_Y);
         let (sw, sh) = ((PET_W * scale).round() as u32, (PET_H * scale).round() as u32);
+        // 快速路径：没有旋转/缩放/歪头时，立绘贴底对齐到整像素直接拷进窗口（不再二次双线性 → 高倍缩放不发虚，也更省）
+        let snap = snapped_origin(scene, scale, sw, sh);
+        let mirror = scene.flip < 0.0;
+        let body = match snap {
+            Some((x, y)) => {
+                // 盒子坐标 → 设备像素（缩放 = 立绘缩放图 / 盒子），镜像绕盒子中线
+                Transform::from_row(sw as f32 / PET_W, 0.0, 0.0, sh as f32 / PET_H, x as f32, y as f32)
+                    .pre_translate(PET_W / 2.0, 0.0)
+                    .pre_scale(scene.flip.signum(), 1.0)
+                    .pre_translate(-PET_W / 2.0, 0.0)
+            }
+            None => {
+                let pet = root.pre_concat(xf_matrix(&scene.pet, PET_X + PET_W / 2.0, WIN_H as f32));
+                // 歪头看光标：以脚底为轴水平错切，头顶偏 lean 像素
+                let pet = if scene.lean.abs() > 0.01 {
+                    let k = -scene.lean / PET_H;
+                    pet.pre_concat(Transform::from_row(1.0, 0.0, k, 1.0, -k * WIN_H as f32, 0.0))
+                } else {
+                    pet
+                };
+                let cx = PET_X + PET_W / 2.0;
+                let cy = PET_Y + PET_H / 2.0;
+                pet.pre_translate(cx, cy).pre_scale(scene.flip, 1.0).pre_translate(-cx, -cy).pre_translate(PET_X, PET_Y)
+            }
+        };
         let to_box = |p: &Pixmap| Transform::from_scale(PET_W / p.width() as f32, PET_H / p.height() as f32);
         let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..Default::default() };
 
@@ -319,18 +340,46 @@ impl Renderer {
                     Some(g)
                 });
                 if let Some(g) = glow {
-                    let pad = (g.width() as f32 - base.width() as f32) / 2.0;
-                    let t = body.pre_concat(to_box(base)).pre_translate(-pad, -pad);
-                    pm.draw_pixmap(0, 0, g.as_ref().as_ref(), &paint, t, None);
+                    let pad = ((g.width() - base.width()) / 2) as i32;
+                    // 光晕跟着呼吸扭曲一起动（以前是静止的一圈，身子起伏时会露馅）
+                    match snap {
+                        Some((x, y)) => self.warper.warp_blit(&g, &scene.live, PET_H, pad as u32, pm, x - pad, y - pad, mirror, 1.0),
+                        None => {
+                            let t = body.pre_concat(to_box(base)).pre_translate(-pad as f32, -pad as f32);
+                            if scene.live.warping()
+                                && let Some(w) = self.warper.warp_padded(&g, &scene.live, PET_H, pad as u32)
+                            {
+                                pm.draw_pixmap(0, 0, w.as_ref(), &paint, t, None);
+                            } else {
+                                pm.draw_pixmap(0, 0, g.as_ref().as_ref(), &paint, t, None);
+                            }
+                        }
+                    }
                 }
             }
             let m = body.pre_concat(to_box(base));
-            if scene.live.warping()
-                && let Some(w) = self.warper.warp(base, &scene.live, PET_H)
-            {
-                pm.draw_pixmap(0, 0, w.as_ref(), &paint, m, None);
-            } else {
-                pm.draw_pixmap(0, 0, base.as_ref().as_ref(), &paint, m, None);
+            // 表情交叉淡化：新表情画满，旧表情按 prev_alpha 盖在上面（重叠处 = 线性混合，旧的独有部分淡出）
+            let prev = match scene.live.prev_face {
+                Some(pf) if scene.live.prev_alpha > 0.003 && !skinned => {
+                    let pl = sprites::layers_for(pf, &scene.costume, &scene.outfits);
+                    if pl.base == layers.base { None } else { self.sprites.asset(&pl.base, sw, sh) }
+                }
+                _ => None,
+            };
+            for (img, op) in [(Some(base.clone()), 1.0), (prev, scene.live.prev_alpha)] {
+                let Some(img) = img else { continue };
+                if let Some((x, y)) = snap {
+                    self.warper.warp_blit(&img, &scene.live, PET_H, 0, pm, x, y, mirror, op);
+                    continue;
+                }
+                let p = PixmapPaint { opacity: op, ..paint };
+                if scene.live.warping()
+                    && let Some(w) = self.warper.warp(&img, &scene.live, PET_H)
+                {
+                    pm.draw_pixmap(0, 0, w.as_ref(), &p, m, None);
+                } else {
+                    pm.draw_pixmap(0, 0, img.as_ref().as_ref(), &p, m, None);
+                }
             }
             // 眨眼 / 张嘴贴片：脸那一块随扭曲整体平移
             let lv = &scene.live;
@@ -358,30 +407,31 @@ impl Renderer {
         if layers.tail
             && let Some((t, ox, oy)) = self.cropped(sprites::TAIL, sw, sh)
         {
-            {
-                let (dx, dy) = live::offset_at(&scene.live, 0.6, 0.797);
-                let m = body.pre_translate(dx, dy).pre_concat(xf_matrix(&scene.tail, 0.6 * PET_W, 0.797 * PET_H)).pre_concat(full_box).pre_translate(ox, oy);
-                pm.draw_pixmap(0, 0, t.as_ref().as_ref(), &paint, m, None);
-            }
+            let (dx, dy) = live::offset_at(&scene.live, 0.6, 0.797);
+            let m = body.pre_translate(dx, dy).pre_concat(xf_matrix(&scene.tail, 0.6 * PET_W, 0.797 * PET_H)).pre_concat(full_box).pre_translate(ox, oy);
+            pm.draw_pixmap(0, 0, t.as_ref().as_ref(), &paint, m, None);
         }
         if layers.star
             && let Some((s, ox, oy)) = self.cropped(sprites::STAR, sw, sh)
         {
-            {
-                let lift = live::row_lift(&scene.live, 0.123);
-                let m = body.pre_translate(0.0, -lift).pre_concat(xf_matrix(&scene.star, 0.395 * PET_W, 0.123 * PET_H)).pre_concat(full_box).pre_translate(ox, oy);
-                pm.draw_pixmap(0, 0, s.as_ref().as_ref(), &paint, m, None);
-                if scene.star.bright > 1.001 {
-                    // brightness(b) ≈ 再叠一层 (b-1) 的加色
-                    let p = PixmapPaint { opacity: (scene.star.bright - 1.0).min(1.0), blend_mode: BlendMode::Plus, quality: FilterQuality::Bilinear };
-                    pm.draw_pixmap(0, 0, s.as_ref().as_ref(), &p, m, None);
-                }
+            let lift = live::row_lift(&scene.live, 0.123);
+            let m = body.pre_translate(0.0, -lift).pre_concat(xf_matrix(&scene.star, 0.395 * PET_W, 0.123 * PET_H)).pre_concat(full_box).pre_translate(ox, oy);
+            pm.draw_pixmap(0, 0, s.as_ref().as_ref(), &paint, m, None);
+            if scene.star.bright > 1.001 {
+                // brightness(b) ≈ 再叠一层 (b-1) 的加色
+                let p = PixmapPaint { opacity: (scene.star.bright - 1.0).min(1.0), blend_mode: BlendMode::Plus, quality: FilterQuality::Bilinear };
+                pm.draw_pixmap(0, 0, s.as_ref().as_ref(), &p, m, None);
             }
         }
         if let Some((ox, oy)) = layers.outfit_offset {
             for id in &scene.outfits {
                 let path = format!("outfits/{id}.png");
                 if let Some(o) = self.sprites.asset(&path, sw, sh) {
+                    if let Some((x, y)) = snap {
+                        let (dx, dy) = ((ox / 400.0 * sw as f32).round() as i32, (oy / 587.0 * sh as f32).round() as i32);
+                        self.warper.warp_blit(&o, &scene.live, PET_H, 0, pm, x + if mirror { -dx } else { dx }, y + dy, mirror, 1.0);
+                        continue;
+                    }
                     let m = body.pre_translate(ox / 400.0 * PET_W, oy / 587.0 * PET_H).pre_concat(to_box(&o));
                     if scene.live.warping()
                         && let Some(w) = self.warper.warp(&o, &scene.live, PET_H)
@@ -588,6 +638,17 @@ impl Renderer {
     }
 }
 
+/// 立绘的变换是不是「纯平移（可水平镜像）」：是就返回立绘缩放图在窗口里贴底、居中、对齐整像素的左上角（设备像素）。
+/// 翻转过渡中、旋转、缩放、歪头时返回 None，走通用的 tiny-skia 变换
+fn snapped_origin(scene: &Scene, scale: f32, sw: u32, sh: u32) -> Option<(i32, i32)> {
+    let p = &scene.pet;
+    let plain = p.rot.abs() < 1e-3 && (p.sx - 1.0).abs() < 1e-4 && (p.sy - 1.0).abs() < 1e-4;
+    if !plain || scene.lean.abs() > 0.01 || (scene.flip.abs() - 1.0).abs() > 1e-4 { return None; }
+    let x = ((PET_X + p.tx) * scale + (PET_W * scale - sw as f32) / 2.0).round() as i32;
+    let y = ((WIN_H as f32 + p.ty) * scale).round() as i32 - sh as i32;
+    Some((x, y))
+}
+
 /// 卡片：圆角 12、2px 暖橙边、#fffaf0 底、下方一层柔和的浅棕阴影（和设置窗口同一套奶油/橙色调）。
 /// 原版是红/绿/蓝三层错开的彩色 box-shadow，缩小后像花边，2026-11-20 按用户要求换掉。
 fn draw_card(pm: &mut Pixmap, w: f32, h: f32, s: f32, bg_alpha: f32) {
@@ -686,7 +747,7 @@ mod tests {
                 let mut sc = Scene::default();
                 sc.face = *f;
                 sc.costume = costume.to_string();
-                sc.live = live::LiveView { depth: *d, breath: 0.4, bob: 0.25, sway: 0.25, blink: *b, mouth: *m, sleep: false };
+                sc.live = live::LiveView { depth: *d, breath: 0.4, bob: 0.25, sway: 0.25, blink: *b, mouth: *m, sleep: false, ..Default::default() };
                 r.draw(&sc, scale);
                 let src = r.pixmap().unwrap();
                 let crop = src.clone_rect(tiny_skia::IntRect::from_xywh(cx as i32, cy as i32, cw as u32, ch as u32).unwrap()).unwrap();
@@ -699,7 +760,7 @@ mod tests {
         let mut strip = Pixmap::new((WIN_W as f32 * 2.0 * 3.0) as u32, (WIN_H as f32 * 2.0) as u32).unwrap();
         strip.fill(tiny_skia::Color::WHITE);
         for (i, (br, sw)) in [(0.0, 0.25), (0.4, 0.75), (0.4, 0.25)].iter().enumerate() {
-            sc.live = live::LiveView { depth: 1.0, breath: *br, bob: 0.0, sway: *sw, blink: 0.0, mouth: 0.0, sleep: false };
+            sc.live = live::LiveView { depth: 1.0, breath: *br, bob: 0.0, sway: *sw, blink: 0.0, mouth: 0.0, sleep: false, ..Default::default() };
             r.draw(&sc, 2.0);
             strip.draw_pixmap((i as f32 * WIN_W as f32 * 2.0) as i32, 0, r.pixmap().unwrap().as_ref(), &PixmapPaint::default(), Transform::identity(), None);
         }
@@ -761,7 +822,7 @@ mod tests {
             let p = i as f32 / 60.0;
             sc.face = Face::Idle;
             sc.pet = Xf::ID;
-            sc.live = live::LiveView { depth: 1.0, breath: p.fract(), bob: (p * 0.8).fract(), sway: (p * 0.7).fract(), blink: if i % 50 < 3 { 1.0 } else { 0.0 }, mouth: (i % 4) as f32 / 3.0, sleep: false };
+            sc.live = live::LiveView { depth: 1.0, breath: p.fract(), bob: (p * 0.8).fract(), sway: (p * 0.7).fract(), blink: if i % 50 < 3 { 1.0 } else { 0.0 }, mouth: (i % 4) as f32 / 3.0, sleep: false, ..Default::default() };
             r.update(&sc, 1.5);
         }
         eprintln!("avg live frame {:?}", t.elapsed() / n);
@@ -783,11 +844,132 @@ mod tests {
                 let p = i as f32 / 60.0;
                 sc.tail = anim::tail_sway((i as f32 / 40.0).fract());
                 sc.star = anim::star_bob((i as f32 / 50.0).fract());
-                sc.live = live::LiveView { depth: 1.0, breath: p.fract(), bob: (p * 0.8).fract(), sway: (p * 0.7).fract(), blink: 0.0, mouth: 0.0, sleep: false };
+                sc.live = live::LiveView { depth: 1.0, breath: p.fract(), bob: (p * 0.8).fract(), sway: (p * 0.7).fract(), blink: 0.0, mouth: 0.0, sleep: false, ..Default::default() };
                 r.update(&sc, scale);
             }
             eprintln!("scale {scale}: old idle frame {old:?}, live idle frame {:?}", t.elapsed() / n);
         }
         std::thread::sleep(std::time::Duration::from_secs(4));
+    }
+    #[test]
+    fn snapped_pet_is_pixel_exact_at_fractional_dpi() {
+        // 125%/150%/175%：立绘缩放图原样落到整像素上，不再二次双线性（以前高倍缩放发虚）
+        for scale in [1.25f32, 1.5, 1.75, 2.5] {
+            let mut r = Renderer::new();
+            let sc = Scene::default();
+            r.draw(&sc, scale);
+            let (sw, sh) = ((PET_W * scale).round() as u32, (PET_H * scale).round() as u32);
+            let base = r.sprites.asset(&sprites::layers_for(sc.face, &sc.costume, &[]).base, sw, sh).unwrap();
+            let (x, y) = snapped_origin(&sc, scale, sw, sh).unwrap();
+            let pm = r.pixmap().unwrap();
+            let pw = pm.width() as usize;
+            // 取立绘中间一块（避开尾巴/星星图层）逐像素比对
+            let mut same = 0;
+            let mut total = 0;
+            for yy in (sh as usize / 3)..(sh as usize / 2) {
+                for xx in (sw as usize * 2 / 5)..(sw as usize * 3 / 5) {
+                    let s = &base.data()[(yy * sw as usize + xx) * 4..][..4];
+                    if s[3] != 255 { continue; }
+                    total += 1;
+                    let d = &pm.data()[((y as usize + yy) * pw + x as usize + xx) * 4..][..4];
+                    if s == d { same += 1; }
+                }
+            }
+            assert!(total > 100 && same == total, "scale {scale}: {same}/{total}");
+            // 脚底贴窗口底边
+            assert_eq!(y + sh as i32, (WIN_H as f32 * scale).round() as i32);
+        }
+        // 转着/歪头时走通用变换
+        let mut sc = Scene::default();
+        sc.pet.rot = 3.0;
+        assert!(snapped_origin(&sc, 1.25, 250, 366).is_none());
+        sc.pet.rot = 0.0;
+        sc.flip = 0.4;
+        assert!(snapped_origin(&sc, 1.25, 250, 366).is_none());
+        sc.flip = -1.0;
+        assert!(snapped_origin(&sc, 1.25, 250, 366).is_some());
+    }
+
+    #[test]
+    fn mirrored_snap_matches_general_path() {
+        // 镜像快速路径和 tiny-skia 通用路径画出来的位置一致（只差采样）
+        let mut r = Renderer::new();
+        let mut sc = Scene::default();
+        sc.flip = -1.0;
+        r.draw(&sc, 1.0);
+        let a = r.pixmap().unwrap().clone();
+        sc.pet.rot = 0.0005; // 极小旋转也走快速路径（阈值内）
+        r.draw(&sc, 1.0);
+        let b = r.pixmap().unwrap().clone();
+        assert_eq!(a.data(), b.data());
+        // 镜像后左右对调：不透明像素的水平重心落在另一侧
+        let sc2 = Scene::default();
+        r.draw(&sc2, 1.0);
+        let c = r.pixmap().unwrap().clone();
+        let cx = |p: &Pixmap| {
+            let w = p.width() as usize;
+            let (mut s, mut n) = (0f64, 0f64);
+            for (i, px) in p.data().chunks_exact(4).enumerate() { if px[3] > 128 { s += (i % w) as f64; n += 1.0; } }
+            s / n
+        };
+        let mid = (PET_X + PET_W / 2.0) as f64;
+        assert!((cx(&a) - mid) * (cx(&c) - mid) < 0.0 || (cx(&a) - cx(&c)).abs() > 0.5);
+    }
+
+    #[test]
+    fn crossfade_mixes_previous_face() {
+        let mut r = Renderer::new();
+        let mut sc = Scene::default();
+        sc.face = Face::Think;
+        r.draw(&sc, 1.0);
+        let think = r.pixmap().unwrap().clone();
+        sc.face = Face::Idle;
+        r.draw(&sc, 1.0);
+        let idle = r.pixmap().unwrap().clone();
+        sc.live.prev_face = Some(Face::Think);
+        sc.live.prev_alpha = 0.5;
+        r.draw(&sc, 1.0);
+        let mix = r.pixmap().unwrap().clone();
+        // 两张不一样的像素上，混合结果落在两者之间
+        // （尾巴/星星图层画在上面，那几处不参与混合，所以按比例判断）
+        let (mut checked, mut between) = (0, 0);
+        for ((a, b), m) in idle.data().chunks_exact(4).zip(think.data().chunks_exact(4)).zip(mix.data().chunks_exact(4)) {
+            if a[3] == 255 && b[3] == 255 && (a[0] as i32 - b[0] as i32).abs() > 60 {
+                checked += 1;
+                let (lo, hi) = (a[0].min(b[0]) as i32 + 10, a[0].max(b[0]) as i32 - 10);
+                if (lo..=hi).contains(&(m[0] as i32)) { between += 1; }
+            }
+        }
+        assert!(checked > 20 && between * 10 > checked * 8, "{between}/{checked}");
+        // 同一张底图（换装别名）不叠
+        sc.costume = "maid".into();
+        sc.face = Face::Happy;
+        sc.live.prev_face = Some(Face::Love);
+        r.draw(&sc, 1.0);
+        let a = r.pixmap().unwrap().clone();
+        sc.live.prev_face = None;
+        r.draw(&sc, 1.0);
+        assert_eq!(a.data(), r.pixmap().unwrap().data());
+    }
+
+    #[test]
+    fn glow_follows_breathing_warp() {
+        let mut r = Renderer::new();
+        let mut sc = Scene::default();
+        sc.glow = true;
+        sc.live = live::LiveView { depth: 1.0, breath: 0.0, ..Default::default() };
+        r.draw(&sc, 1.0);
+        let a = r.pixmap().unwrap().clone();
+        sc.live.breath = 0.4;
+        r.draw(&sc, 1.0);
+        let b = r.pixmap().unwrap().clone();
+        // 头顶上方一行（只有光晕，没有立绘）：吸气时光晕跟着上移 → 这一行变了
+        let w = a.width() as usize;
+        let top = (0..a.height() as usize).find(|&y| a.data()[y * w * 4..(y + 1) * w * 4].chunks_exact(4).any(|p| p[3] > 0 && p[3] < 200)).unwrap();
+        let row = |p: &Pixmap, y: usize| p.data()[y * w * 4..(y + 1) * w * 4].to_vec();
+        assert_ne!(row(&a, top + 2), row(&b, top + 2));
+        // 脚底的光晕不动
+        let foot = a.height() as usize - 3;
+        assert_eq!(row(&a, foot), row(&b, foot));
     }
 }
