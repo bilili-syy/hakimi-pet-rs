@@ -75,6 +75,9 @@ impl Behavior {
         token
     }
 
+    /// 提醒还响着（没点、没过 ALERT_MS）：发呆换动作/打招呼/天气这些闲事先别来盖掉提醒气泡
+    pub(super) fn memo_ringing(&self) -> bool { self.memo.active(self.now) }
+
     pub(super) fn on_memo(&mut self, ev: MemoEv) {
         match ev {
             MemoEv::Due(hits) => self.memo_due(hits),
@@ -303,6 +306,21 @@ mod tests {
         // 之后点她就是普通戳戳
         click(&mut b, 6000);
         assert_eq!(b.calls.iter().filter(|c| c.starts_with("memo:ack")).count(), 1);
+    }
+
+    #[test]
+    fn alert_bubble_survives_idle_thinking() {
+        let mut b = mk();
+        tick(&mut b, 3000);
+        ev(&mut b, AppEvent::Memo(MemoEv::Due(vec![hit(9, "喝水", false)])), 3100);
+        let mut t = 3100;
+        while t < 3100 + ALERT_MS - 2000 {
+            t += 250;
+            tick(&mut b, t);
+            assert!(b.scene.bubble.as_ref().is_some_and(|x| x.text.contains("该喝水了")), "alert bubble replaced at {t}");
+        }
+        assert_eq!(b.state, St::Idle);
+        assert!(!b.calls.iter().any(|c| c.starts_with("memo:ack")));
     }
 
     #[test]
