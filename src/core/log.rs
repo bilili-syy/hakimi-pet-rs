@@ -23,6 +23,14 @@ pub fn log(msg: &str) {
     eprintln!("{msg}");
 }
 
+/// 调试追踪：设了环境变量 HAKIMI_TRACE=1 才写（念什么、声音从哪来、播放/停止/播完），平时不写
+pub fn trace(msg: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("HAKIMI_TRACE").is_some_and(|v| !v.is_empty() && v != "0")) {
+        log(&format!("trace {msg}"));
+    }
+}
+
 /// 当前 UTC 时间，`Date.prototype.toISOString()` 格式
 pub fn iso_now() -> String {
     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);

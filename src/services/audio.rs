@@ -55,6 +55,7 @@ fn sender() -> Option<Sender<Cmd>> {
 }
 
 fn done(token: u64) {
+    crate::core::log::trace(&format!("audio done:{token}"));
     if let Some(tx) = EVENTS.get() { tx.send(AppEvent::AudioDone { token }); }
 }
 
@@ -116,7 +117,10 @@ fn worker(rx: Receiver<Cmd>) {
             Ok(Cmd::Play { token, src, volume, max_secs }) => {
                 finish(&mut cur);
                 match start(&mut sink, src, volume, max_secs) {
-                    Ok(player) => cur = Some(Current { token, player }),
+                    Ok(player) => {
+                        crate::core::log::trace(&format!("audio start:{token}"));
+                        cur = Some(Current { token, player })
+                    }
                     Err(e) => {
                         crate::core::log::log(&format!("audio error {e}"));
                         done(token);

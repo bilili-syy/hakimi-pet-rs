@@ -120,14 +120,21 @@ fn cache_dir() -> PathBuf { crate::core::paths::tts_cache_dir() }
 /// 内置 → 缓存（命中缓存会更新修改时间，LRU）
 pub fn read_cache(t: &TtsConfig, text: &str, mood: Option<VoiceMood>) -> Option<Vec<u8>> {
     // 角色包的 voiceDir（文件名规则同内置台词）优先；放不出来的格式跳过
-    if let Some(b) = crate::core::skin::voice_line(text).filter(|b| super::audio::can_decode(b)) { return Some(b); }
-    if let Some(b) = bundled(t, text).filter(|_| bundled_playable()) { return Some(b.to_vec()); }
+    if let Some(b) = crate::core::skin::voice_line(text).filter(|b| super::audio::can_decode(b)) {
+        crate::core::log::trace(&format!("voice skin {text}"));
+        return Some(b);
+    }
+    if let Some(b) = bundled(t, text).filter(|_| bundled_playable()) {
+        crate::core::log::trace(&format!("voice bundled {text}"));
+        return Some(b.to_vec());
+    }
     for k in [cache_key(t, text, mood), text_key(t, text)] {
         let Some(file) = CACHE_EXTS.iter().map(|e| cache_dir().join(format!("{k}.{e}"))).find(|f| f.is_file()) else { continue };
         if let Ok(buf) = std::fs::read(&file) {
             if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&file) {
                 let _ = f.set_modified(std::time::SystemTime::now());
             }
+            crate::core::log::trace(&format!("voice cache {text}"));
             return Some(buf);
         }
     }
@@ -409,7 +416,10 @@ fn run_fg(job: Job) {
         st.last_fg = Some(Instant::now());
     }
     match result {
-        Ok(wav) => answer(job.seq, Some(wav)),
+        Ok(wav) => {
+            crate::core::log::trace(&format!("voice online {} ({} B)", job.text, wav.len()));
+            answer(job.seq, Some(wav))
+        }
         Err(f) => {
             if is_pending(job.seq) && f.msg != "superseded" {
                 crate::core::log::log(&format!("tts error {}", f.msg));
