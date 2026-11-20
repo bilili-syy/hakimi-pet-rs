@@ -8,7 +8,24 @@ use std::sync::Mutex;
 /// 记住最近 20 条（10 轮）
 pub const MAX_HISTORY: usize = 20;
 /// 原版 AbortController 30 秒
-const TIMEOUT_SECS: u64 = 30;
+/// 普通聊天的超时。带思考的新模型（如 gemini-3.x）经中转常要 30 多秒，30 秒会误报超时
+const TIMEOUT_SECS: u64 = 60;
+/// 联网搜索要先搜再答，实测 70 秒上下
+const SEARCH_TIMEOUT_SECS: u64 = 100;
+
+/// 这句话要不要让模型联网搜索（只对 Gemini 系模型开：OpenAI 兼容中转和官方接口都认 `google_search` 工具）。
+/// 只在像是问实时信息时才开，平时聊天不多等。
+pub fn wants_search(model: &str, text: &str) -> bool {
+    if !model.to_ascii_lowercase().contains("gemini") { return false; }
+    const KEYS: [&str; 34] = [
+        "今天", "今日", "现在", "此刻", "最新", "实时", "刚刚", "最近", "这周", "本周", "新闻", "热搜", "金价", "油价",
+        "汇率", "股价", "股票", "基金", "比分", "赛果", "谁赢", "价格", "多少钱", "行情", "天气预报", "上映", "发布了",
+        "几号", "星期几", "查一下", "查查", "搜一下", "搜搜", "联网",
+    ];
+    KEYS.iter().any(|k| text.contains(k))
+}
+
+const SEARCH_NOTE: &str = "\n\n【这次已联网搜索】回答里直接给出搜到的具体数字、日期和来源名，别说自己不能联网；仍然用哈基米的口吻，简短口语化，不用 Markdown。";
 
 const NEED_KEY: &str = "哈基米的大脑还没接上喵……右键我点「⚙️ 设置…」，在「AI 聊天」里填好 API Key 就能聊天啦！";
 /// 第一次打开聊天、还没填 Key 时她先说的一句（behavior 用）
@@ -57,11 +74,16 @@ pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
     let start = history.len().saturating_sub(MAX_HISTORY);
     let system = persona(&c, ctx);
     // 角色包的 persona 追加在末尾（内置哈基米原样）
-    let system = crate::core::skin::with_persona(system);
+    let mut system = crate::core::skin::with_persona(system);
+    let search = wants_search(&c.model, user_text);
+    if search {
+        system.push_str(SEARCH_NOTE);
+        crate::core::log::log("ai web search on");
+    }
     let r = if c.provider == "openai" {
-        call_openai(&c, &system, &history[start..])
+        call_openai(&c, &system, &history[start..], search)
     } else {
-        call_gemini(&c, &system, &history[start..])
+        call_gemini(&c, &system, &history[start..], search)
     };
     match r {
         Ok(reply) => {
@@ -173,7 +195,11 @@ impl AiError {
 }
 
 fn post(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value, AiError> {
-    let (status, text) = super::net::post_json(url, headers, body, TIMEOUT_SECS).map_err(|e| {
+    post_t(url, headers, body, TIMEOUT_SECS)
+}
+
+fn post_t(url: &str, headers: &[(&str, &str)], body: &Value, timeout: u64) -> Result<Value, AiError> {
+    let (status, text) = super::net::post_json(url, headers, body, timeout).map_err(|e| {
         let kind = if matches!(e, ureq::Error::Timeout(_)) {
             ErrKind::Timeout
         } else if super::net::is_network_error(&e) {
@@ -232,11 +258,18 @@ pub fn gemini_body(model: &str, system: &str, history: &[Value]) -> Value {
     body
 }
 
-fn call_gemini(c: &crate::core::config::Config, system: &str, history: &[Value]) -> Result<String, AiError> {
+/// 给请求体加上 Gemini 的联网搜索工具（原生接口和 OpenAI 兼容中转同一个写法）
+pub fn add_search(body: &mut Value) {
+    body["tools"] = json!([{ "google_search": {} }]);
+}
+
+fn call_gemini(c: &crate::core::config::Config, system: &str, history: &[Value], search: bool) -> Result<String, AiError> {
     let base = if c.base_url.is_empty() { "https://generativelanguage.googleapis.com/v1beta" } else { c.base_url.as_str() };
     let base = base.strip_suffix('/').unwrap_or(base);
     let url = format!("{base}/models/{}:generateContent", encode_component(&c.model));
-    let json = post(&url, &[("x-goog-api-key", &c.api_key)], &gemini_body(&c.model, system, history))?;
+    let mut body = gemini_body(&c.model, system, history);
+    if search { add_search(&mut body); }
+    let json = post_t(&url, &[("x-goog-api-key", &c.api_key)], &body, if search { SEARCH_TIMEOUT_SECS } else { TIMEOUT_SECS })?;
     parse_gemini(&json)
 }
 
@@ -266,11 +299,13 @@ pub fn openai_body(model: &str, system: &str, history: &[Value]) -> Value {
     json!({ "model": model, "temperature": 0.9, "max_tokens": 300, "messages": messages })
 }
 
-fn call_openai(c: &crate::core::config::Config, system: &str, history: &[Value]) -> Result<String, AiError> {
+fn call_openai(c: &crate::core::config::Config, system: &str, history: &[Value], search: bool) -> Result<String, AiError> {
     let base = if c.base_url.is_empty() { "https://api.openai.com/v1" } else { c.base_url.as_str() };
     let base = base.strip_suffix('/').unwrap_or(base);
     let auth = format!("Bearer {}", c.api_key);
-    let json = post(&format!("{base}/chat/completions"), &[("Authorization", &auth)], &openai_body(&c.model, system, history))?;
+    let mut body = openai_body(&c.model, system, history);
+    if search { add_search(&mut body); }
+    let json = post_t(&format!("{base}/chat/completions"), &[("Authorization", &auth)], &body, if search { SEARCH_TIMEOUT_SECS } else { TIMEOUT_SECS })?;
     parse_openai(&json)
 }
 
@@ -410,6 +445,17 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn search_only_for_gemini_and_live_questions() {
+        assert!(super::wants_search("gemini-3.8-flash-tiered", "帮我查一下今日金价"));
+        assert!(super::wants_search("Gemini-2.5-Flash", "现在美元汇率多少"));
+        assert!(!super::wants_search("gemini-3.8-flash", "哈基米你好可爱"));
+        assert!(!super::wants_search("gpt-4o-mini", "今天金价多少"));
+        let mut b = super::openai_body("gemini-x", "s", &[]);
+        super::add_search(&mut b);
+        assert_eq!(b["tools"][0]["google_search"], serde_json::json!({}));
+    }
+
     use super::*;
 
     fn ctx() -> ChatCtx { ChatCtx { hunger: 50, mood: 60, energy: 70, level: "朋友".into(), days: 3 } }
