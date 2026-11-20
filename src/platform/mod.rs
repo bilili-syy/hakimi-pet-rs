@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 mod chat;
+mod memo_menu;
 mod menu;
 mod perch;
 mod sys;
@@ -51,6 +52,10 @@ const WM_APP_DEBUG_MENU: u32 = WM_APP + 9;
 const DEBUG_MENU: [&str; 9] = ["feed", "feednow", "game", "climb", "weather", "checkin", "status", "walk", "pat"];
 const TIMER_ID: usize = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_POWERBROADCAST: u32 = 0x0218;
+const WM_TIMECHANGE: u32 = 0x001E;
+/// 备忘提醒最多隔多久重新核对一次本地时间（改了系统时间、睡眠醒来、手改 memo.json 都能跟上）
+const MEMO_RECHECK: u64 = 5 * 60_000;
 /// 溜达/下落的物理步长（原版 setInterval 16）
 const PHYS_STEP: u64 = 16;
 /// 有输入事件后最快多久补一帧
@@ -380,6 +385,10 @@ fn rearm() {
         if let Some(p) = &s.pomodoro {
             due = due.min(p.end);
         }
+        // 备忘录：排到下一条提醒的时间
+        if let Some(ms) = crate::core::memo::ms_until_next(crate::core::memo::Now::get()) {
+            due = due.min(now + ms.min(MEMO_RECHECK));
+        }
         let ms = due.saturating_sub(now).clamp(1, 0x7fff_ffff) as u32;
         unsafe {
             SetTimer(Some(s.hwnd), TIMER_ID, ms, None);
@@ -402,6 +411,12 @@ fn tick() {
     })
     .unwrap_or(false);
     if pomo_done {
+        menu::refresh();
+    }
+    // 备忘录到点（睡眠醒来后错过的几条一次性合并发出）
+    let hits = crate::core::memo::poll(crate::core::memo::Now::get());
+    if !hits.is_empty() {
+        evs.push(AppEvent::Memo(crate::types::MemoEv::Due(hits)));
         menu::refresh();
     }
     for e in evs {
@@ -587,6 +602,7 @@ fn after(a: MenuAction) {
             with(|s| s.set_watch(on, now));
         }
         MenuAction::Quit => do_quit(),
+        MenuAction::Memo(crate::types::MemoAct::OpenFile) => open_path(&crate::core::memo::ensure_file()),
         _ => {}
     }
     menu::refresh();
@@ -1294,6 +1310,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_CLOSE => {
                 do_quit();
                 LRESULT(0)
+            }
+            // 睡眠醒来 / 改了系统时间：马上重排定时器，错过的备忘会在下一次 tick 合并补发
+            WM_POWERBROADCAST | WM_TIMECHANGE => {
+                rearm();
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_ENDSESSION if wp.0 != 0 => {
                 // 关机/注销：存档

@@ -45,6 +45,13 @@ src/
 | ReloadSettings | 在 Handler 之后重排提醒定时器、按 moyu.enabled 启停监督 |
 | Moyu(on) | 在 Handler（它会写 config）之后启停监督 |
 | Quit | 调 `Handler::quit` 然后退出 |
+| Memo(OpenFile) | 打开 memo.json（不存在先建）；其余 Memo(..) 由行为层调 core::memo 处理 |
+
+## 备忘录
+- 数据：core/memo.rs（memo.json 读写、到点计算，全局 Mutex，任何线程可调）
+- 解析：services/memo_parse.rs（本地中文时间规则 → 不懂再问 AI）
+- 定时：平台层 rearm 按 `core::memo::ms_until_next` 排一次性定时器（最多 5 分钟核对一次），tick 里 `core::memo::poll` 到点发 `AppEvent::Memo(MemoEv::Due)`；睡眠醒来/改系统时间（WM_POWERBROADCAST/WM_TIMECHANGE）立刻重排，错过的合并成一次
+- 菜单：platform/memo_menu.rs；行为：behavior/memo.rs
 
 其余（Chat、Feed、Pat、Honey、Song、Status、Sleep、Walk、Costume、Outfit、ClearOutfit、Tts、TtsChatOnly、ForgetChat）只由行为层处理；
 其中会改配置的（Costume/Outfit/Tts/TtsChatOnly/Moyu）由行为层调 `core::config::update` 写入，平台层每次弹菜单时读 `core::config::get()` 决定勾选状态。
