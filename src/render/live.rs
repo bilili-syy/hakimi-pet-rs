@@ -206,19 +206,22 @@ pub enum Kind { Blink, Mouth }
 
 /// 实际画出来的那张立绘的名字（贴片按它找）：原装 walk1/walk2 的头和 idle 一样；换装按 sprites 的别名映射
 fn drawn_stem(face: Face, costume: &str) -> String {
-    if costume.is_empty() {
+    if is_original(costume) {
         return match face { Face::Walk1 | Face::Walk2 => "idle", f => f.stem() }.to_string();
     }
     let src = crate::render::sprites::costume_src(costume, face);
     src.rsplit('/').next().unwrap_or("").trim_end_matches(".png").to_string()
 }
 
+/// 原装卫衣立绘（"" 或 "hoodie"）：贴片在 sprites/live/<立绘>_…，不带衣服前缀
+fn is_original(costume: &str) -> bool { matches!(costume, "" | "hoodie") }
+
 /// 内置贴片的资源路径：原装 sprites/live/<立绘>_<blink|mouthOpen>.png，换装 sprites/live/<衣服>_<立绘>_….png。
 /// 没有这张贴片（闭眼的表情、五官差太多的表情）返回 None
 pub fn builtin_path(face: Face, costume: &str, kind: Kind) -> Option<String> {
     let k = match kind { Kind::Blink => "blink", Kind::Mouth => "mouthOpen" };
     let stem = drawn_stem(face, costume);
-    let p = if costume.is_empty() { format!("sprites/live/{stem}_{k}.png") } else { format!("sprites/live/{costume}_{stem}_{k}.png") };
+    let p = if is_original(costume) { format!("sprites/live/{stem}_{k}.png") } else { format!("sprites/live/{costume}_{stem}_{k}.png") };
     crate::assets::get(&p).is_some().then_some(p)
 }
 
@@ -611,6 +614,9 @@ mod tests {
         for f in [Face::Sleep, Face::Happy, Face::Shy, Face::Yawn, Face::Dance, Face::Eat] {
             assert!(!available(f, "", Kind::Blink), "{f:?} has closed eyes");
         }
+        // 原装卫衣现在的 id 是 "hoodie"，和 "" 用同一套贴片；默认水手服只有待机眨眼
+        assert_eq!(builtin_path(Face::Idle, "hoodie", Kind::Mouth), builtin_path(Face::Idle, "", Kind::Mouth));
+        assert!(available(Face::Idle, "sailor", Kind::Blink));
         // 换装：按实际画的那张（shy/love → happy，stare → think，yawn → idle）
         for c in ["maid", "xmas", "jk"] {
             for f in [Face::Idle, Face::Yawn, Face::Think, Face::Stare, Face::Hungry] { assert!(available(f, c, Kind::Blink), "{c} {f:?}"); }
