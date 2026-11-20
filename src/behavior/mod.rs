@@ -759,6 +759,8 @@ impl Behavior {
     /// 空闲时自己决定下一步做什么，受数值影响
     fn think(&mut self) {
         if matches!(self.state, St::Drag | St::Fall) || self.chat_busy() { return; }
+        // 备忘提醒还响着：原地等你点她，不换动作不说闲话（不然 60 秒的提醒气泡十几秒就被盖掉）
+        if self.memo_ringing() { return self.set_state(St::Idle, Some((5000.0, 9000.0))); }
         self.yield_chat();
         if self.think_play() { return; }
         let m = self.stats.mood();
