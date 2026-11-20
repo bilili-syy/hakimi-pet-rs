@@ -461,7 +461,9 @@ impl Behavior {
 
     fn flush(&mut self, out: &mut Vec<WinCmd>) { out.append(&mut self.cmds); }
 
-    fn call(&mut self, s: String) { if !self.io && self.calls.len() < 500 { self.calls.push(s); } }
+    fn call(&mut self, s: String) {
+        if self.io { crate::core::log::trace(&s) } else if self.calls.len() < 500 { self.calls.push(s) }
+    }
 
     fn save(&mut self) { if self.io { crate::core::save::store(&self.stats.data); } }
 
@@ -650,6 +652,7 @@ impl Behavior {
     fn show(&mut self, f: Face) { self.face = f; }
 
     fn set_state(&mut self, next: St, hold: Option<(f64, f64)>) {
+        if self.io && next != self.state { crate::core::log::trace(&format!("state {:?} -> {next:?}", self.state)); }
         if next != St::Dance { self.cancel_routine(); }
         if self.state == St::Walk && next != St::Walk { self.cmds.push(WinCmd::WalkStop); }
         let prev = self.state;
@@ -715,6 +718,12 @@ impl Behavior {
         self.bubble = Some(Bubble { text: text.to_string(), shown: self.now, hide_at: Some(self.now + ms), dur: ms, token });
         self.bubble_fade.set(true, self.now);
         if voice { self.voice(text, kind, token) } else { self.stop_voice() }
+    }
+
+    /// 只换气泡、不出声，也不掐正在念的台词（小游戏里抓到/扑空的短句，别把开场白打断）
+    fn say_bubble(&mut self, text: &str, ms: u64) {
+        self.bubble = Some(Bubble { text: text.to_string(), shown: self.now, hide_at: Some(self.now + ms), dur: ms, token: 0 });
+        self.bubble_fade.set(true, self.now);
     }
 
     /// 气泡先出，声音随后到；新台词会打断旧的
@@ -1097,6 +1106,7 @@ impl Behavior {
 
     // ============================================================ 菜单
     fn on_menu(&mut self, a: MenuAction) {
+        if self.io { crate::core::log::trace(&format!("menu {a:?}")); }
         // 让她做事的菜单项：输入框开着但没打字就顺手关掉；打了字就留着（框跟着她走）
         if matches!(
             a,

@@ -920,10 +920,10 @@ impl Behavior {
                 if caught {
                     self.set_state(St::Happy, None);
                     self.fx(FxKind::Heart, 2);
-                    self.say_opts(&pick(GAME_CATCH), 900, false, crate::types::SpeakKind::Line);
+                    self.say_bubble(&pick(GAME_CATCH), 900);
                 } else {
                     self.set_state(St::Surprised, None);
-                    if fastrand::f64() < 0.5 { self.say_opts(&pick(GAME_MISS), 900, false, crate::types::SpeakKind::Line); }
+                    if fastrand::f64() < 0.5 { self.say_bubble(&pick(GAME_MISS), 900); }
                 }
             }
             GameAct::Walk { dir, dist } => {
@@ -1165,5 +1165,22 @@ mod tests {
         let out = frame(&mut b, 3000 + Game::DURATION + 10);
         assert!(out.contains(&WinCmd::Toy(ToyCmd::Remove)));
         assert!(b.play.game.is_none());
+    }
+
+    #[test]
+    fn teaser_catch_does_not_cut_opening_line() {
+        let mut b = mkb();
+        frame(&mut b, 3000);
+        ev(&mut b, AppEvent::Menu(MenuAction::Game), 3000);
+        let tok = b.voice_req;
+        assert!(tok != 0);
+        ev(&mut b, AppEvent::Speech { token: tok, audio: Some(crate::types::Audio(vec![1, 2, 3])) }, 3100);
+        assert_eq!(b.voice_playing, Some(tok));
+        b.calls.clear();
+        // 开场白还在念，毛球就进了扑击范围：扑一下、换气泡，但不能把开场白掐掉
+        ev(&mut b, AppEvent::Cursor { x: 120.0, y: 60.0 }, 3500);
+        assert!(b.shot.is_some_and(|(s, _)| s == Shot::Jump));
+        assert!(!b.calls.iter().any(|c| c == "stop"), "{:?}", b.calls);
+        assert_eq!(b.voice_playing, Some(tok));
     }
 }

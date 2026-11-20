@@ -55,6 +55,7 @@ fn sender() -> Option<Sender<Cmd>> {
 }
 
 fn done(token: u64) {
+    crate::core::log::trace(&format!("audio done:{token}"));
     if let Some(tx) = EVENTS.get() { tx.send(AppEvent::AudioDone { token }); }
 }
 
@@ -116,7 +117,10 @@ fn worker(rx: Receiver<Cmd>) {
             Ok(Cmd::Play { token, src, volume, max_secs }) => {
                 finish(&mut cur);
                 match start(&mut sink, src, volume, max_secs) {
-                    Ok(player) => cur = Some(Current { token, player }),
+                    Ok(player) => {
+                        crate::core::log::trace(&format!("audio start:{token}"));
+                        cur = Some(Current { token, player })
+                    }
                     Err(e) => {
                         crate::core::log::log(&format!("audio error {e}"));
                         done(token);
@@ -271,14 +275,16 @@ mod tests {
 
     #[test]
     fn decode_wav_and_probe_ogg() {
-        // 不开声卡，只验证 rodio 能解 wav（MiMo 返回的格式）
-        assert!(can_decode(crate::assets::get("voice/hakimi-voice.wav").unwrap()));
+        // 不开声卡，只验证 rodio 能解 mp3（参考音频）和 wav（MiMo 返回的格式）
+        assert!(can_decode(crate::assets::get("voice/hakimi-voice.mp3").unwrap()));
+        assert!(can_decode(&crate::services::tts::tests_support::tiny_wav()));
         assert!(!can_decode(b"not audio"));
-        // 内置台词是 Ogg Opus，symphonia 0.5 不支持 Opus；tts 会探测后自动退回缓存/在线合成
+        // 内置台词是 Ogg Vorbis（48k 单声道），必须能解，否则每句都要在线合成
         let lines: serde_json::Value = serde_json::from_slice(crate::assets::get("voice/lines.json").unwrap()).unwrap();
         let t = crate::core::config::TtsConfig::default();
         let ogg = lines.as_object().unwrap().keys().find_map(|k| crate::services::tts::bundled(&t, k)).unwrap();
-        assert_eq!(can_decode(ogg), crate::services::tts::bundled_playable());
+        assert!(can_decode(ogg));
+        assert!(crate::services::tts::bundled_playable());
     }
 
     /// 诊断：按 start() 里 Src::Mem 完全一样的方式解码一句内置台词，把样本写成 16 位 wav，
@@ -346,7 +352,7 @@ mod tests {
         super::init(EventSender::new(move |ev| {
             if let AppEvent::AudioDone { token } = ev { let _ = tx.lock().unwrap().send(token); }
         }));
-        let wav = crate::assets::get("voice/hakimi-voice.wav").unwrap().to_vec();
+        let wav = crate::assets::get("voice/hakimi-voice.mp3").unwrap().to_vec();
         super::play(1, Audio(wav.clone()), 0.0);
         assert!(super::is_playing());
         std::thread::sleep(Duration::from_millis(300));
