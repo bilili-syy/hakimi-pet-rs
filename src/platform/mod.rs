@@ -1,28 +1,983 @@
 //! 平台层（负责人：A 路「窗口与系统」）：Win32 分层窗口、消息循环、鼠标、拖拽/下落/溜达物理、
 //! 托盘与右键菜单、聊天输入框、单实例、开机自启、摸鱼监督、提醒与番茄钟。
 //! 公开函数签名是约定，别改名改参数；内部实现随意。
+//!
+//! 线程：全部在 UI 线程。别的线程只通过 EventSender（队列 + PostMessage）进来。
+//! 定时：只有一个 one-shot SetTimer，每次按「下一帧 / 物理 / 提醒 / 番茄钟 / 摸鱼采样」里最早的到期时间重排，
+//! 空闲时完全睡在 GetMessage 里，不忙等。
+//! 重入：Handler 和平台状态各放一个 RefCell；调用 Handler 期间不持有平台状态，反之亦然。
+//! 事件统一进 PENDING 队列按顺序投递，菜单动作的「平台额外动作」作为一条 After 排在 Handler 之后。
 #![allow(dead_code)]
+
+mod chat;
+mod menu;
 mod sys;
 mod timers;
 mod watch;
-use crate::types::{EventSender, Handler};
+#[cfg(test)]
+mod selftest;
+
+use crate::types::{
+    AppEvent, Button, ChatInputCmd, EventSender, Frame, Handler, MenuAction, MouseEv, PomodoroEv, WIN_H, WIN_W,
+    WinCmd,
+};
+use chat::Chat;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use timers::{LocalTime, Pomodoro, Reminders};
+use watch::Supervisor;
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, SelectObject,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::w;
+
+pub(crate) const WM_APP_EVENT: u32 = WM_APP + 1;
+pub(crate) const WM_APP_MENU: u32 = WM_APP + 2;
+pub(crate) const WM_APP_SECOND: u32 = WM_APP + 3;
+const WM_APP_DPI: u32 = WM_APP + 4;
+const TIMER_ID: usize = 1;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+/// 溜达/下落的物理步长（原版 setInterval 16）
+const PHYS_STEP: u64 = 16;
+/// 有输入事件后最快多久补一帧
+const EVENT_FRAME_GAP: u64 = 16;
+
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+static SCALE_BITS: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0f32
+static EVENT_QUEUE: Mutex<VecDeque<AppEvent>> = Mutex::new(VecDeque::new());
+pub(crate) static MENU_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+/// 番茄钟结束时间（epoch 毫秒），0 = 没开
+pub(crate) static POMO_END: AtomicU64 = AtomicU64::new(0);
+static MOYU_TODAY_SEC: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn main_hwnd() -> Option<HWND> {
+    let h = MAIN_HWND.load(Ordering::Relaxed);
+    (h != 0).then_some(HWND(h as *mut _))
+}
+
+pub(crate) fn current_scale() -> f32 {
+    f32::from_bits(SCALE_BITS.load(Ordering::Relaxed))
+}
+
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// 任意线程：把事件送回 UI 线程
+pub(crate) fn post_event(ev: AppEvent) {
+    EVENT_QUEUE.lock().unwrap().push_back(ev);
+    if let Some(h) = main_hwnd() {
+        unsafe {
+            let _ = PostMessageW(Some(h), WM_APP_EVENT, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 公开接口
 
 /// 创建窗口、托盘，跑消息循环直到退出。
 /// make 拿到 EventSender（内部 PostMessage 到 UI 线程）后构造 Handler。
 pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
-    // TODO(A)：真正的实现。现在只是让程序能编译运行。
-    let tx = EventSender::new(|_ev| {});
-    let mut h = make(tx);
-    h.quit();
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    // 只允许开一只哈基米；第二个实例通知第一个后直接退出（不构造 Handler）
+    let Some(_mutex) = sys::single_instance(WM_APP_SECOND) else {
+        crate::core::log::log("second instance, exit");
+        return;
+    };
+    let Some(hwnd) = create_main_window() else {
+        crate::core::log::log("create window failed");
+        return;
+    };
+    MAIN_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+
+    let scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
+    let w = (WIN_W as f32 * scale).round() as i32;
+    let h = (WIN_H as f32 * scale).round() as i32;
+    // 屏幕偏右的位置，不挤在托盘时钟旁边
+    let wa = work_area_at(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+    let x = (wa.left as f32 + (wa.right - wa.left) as f32 * 0.62 - w as f32 / 2.0).round() as i32;
+    let y = wa.bottom - h;
+    unsafe {
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
+    }
+
+    let tx = EventSender::new(post_event);
+    let handler = make(tx);
+    HANDLER.with(|c| *c.borrow_mut() = Some(handler));
+
+    let hinst: HINSTANCE = unsafe { GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default() };
+    let chat = Chat::new(hwnd, hinst, scale);
+    let now = now_ms();
+    let cfg = crate::core::config::get();
+    STATE.with(|c| {
+        *c.borrow_mut() = Some(Plat {
+            hwnd,
+            scale,
+            x,
+            y,
+            w,
+            h,
+            dib: None,
+            walk: None,
+            fall: None,
+            phys_last: now,
+            phys_acc: 0,
+            drag_off: (0, 0),
+            next_frame: now,
+            last_frame: 0,
+            reminders: Reminders::schedule(&cfg.reminders, now),
+            pomodoro: None,
+            sup: Supervisor::new(LocalTime::now().day_key()),
+            watch_next: cfg.moyu.enabled.then_some(now + watch::STEP as u64 * 1000),
+            dbl_pending: false,
+            tracking: false,
+            chat,
+            quitting: false,
+            shown_once: false,
+        })
+    });
+    menu::init();
+    rearm();
+
+    unsafe {
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    menu::shutdown();
+    STATE.with(|c| c.borrow_mut().take());
+    HANDLER.with(|c| c.borrow_mut().take());
+    MAIN_HWND.store(0, Ordering::Relaxed);
 }
 
 /// 番茄钟剩余分钟，没开返回 None
-pub fn pomodoro_left() -> Option<u32> { None }
+pub fn pomodoro_left() -> Option<u32> {
+    let end = POMO_END.load(Ordering::Relaxed);
+    (end != 0).then(|| timers::minutes_left(end, now_ms()))
+}
 
 /// 今天摸鱼了几分钟；摸鱼监督关闭时返回 None
-pub fn moyu_today() -> Option<u32> { None }
+pub fn moyu_today() -> Option<u32> {
+    if !crate::core::config::get().moyu.enabled {
+        return None;
+    }
+    Some((MOYU_TODAY_SEC.load(Ordering::Relaxed) as f64 / 60.0).round() as u32)
+}
 
 /// 用资源管理器 / 默认程序打开文件或文件夹（ShellExecuteW）
 pub fn open_path(path: &std::path::Path) {
     sys::open_path(path)
+}
+
+// ---------------------------------------------------------------- 状态
+
+struct Walk {
+    dir: i32,
+    speed: f32,
+    distance: f32,
+    moved: f32,
+    xf: f32,
+    min_x: f32,
+    max_x: f32,
+}
+
+struct Fall {
+    vy: f32,
+    xf: f32,
+    yf: f32,
+    floor: f32,
+}
+
+struct Dib {
+    dc: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    bits: *mut u8,
+    w: i32,
+    h: i32,
+}
+
+impl Drop for Dib {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old);
+            let _ = DeleteObject(HGDIOBJ(self.bmp.0));
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
+struct Plat {
+    hwnd: HWND,
+    scale: f32,
+    /// 窗口位置/大小（物理像素）
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    dib: Option<Dib>,
+    walk: Option<Walk>,
+    fall: Option<Fall>,
+    phys_last: u64,
+    phys_acc: u64,
+    /// 左键按下时光标相对窗口左上角的偏移
+    drag_off: (i32, i32),
+    next_frame: u64,
+    last_frame: u64,
+    reminders: Reminders,
+    pomodoro: Option<Pomodoro>,
+    sup: Supervisor,
+    watch_next: Option<u64>,
+    dbl_pending: bool,
+    tracking: bool,
+    chat: Option<Chat>,
+    quitting: bool,
+    shown_once: bool,
+}
+
+enum Pending {
+    Ev(AppEvent),
+    /// Handler 处理完这个菜单动作之后，平台层自己要做的事
+    After(MenuAction),
+}
+
+thread_local! {
+    static STATE: RefCell<Option<Plat>> = const { RefCell::new(None) };
+    static HANDLER: RefCell<Option<Box<dyn Handler>>> = RefCell::new(None);
+    static PENDING: RefCell<VecDeque<Pending>> = const { RefCell::new(VecDeque::new()) };
+    static PUMPING: Cell<bool> = const { Cell::new(false) };
+    static QUITTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 借平台状态（重入时借不到就返回 None）
+fn with<R>(f: impl FnOnce(&mut Plat) -> R) -> Option<R> {
+    STATE.with(|c| {
+        let mut g = c.try_borrow_mut().ok()?;
+        g.as_mut().map(f)
+    })
+}
+
+fn with_handler<R>(f: impl FnOnce(&mut dyn Handler) -> R) -> Option<R> {
+    HANDLER.with(|c| {
+        let mut g = c.try_borrow_mut().ok()?;
+        g.as_mut().map(|h| f(h.as_mut()))
+    })
+}
+
+fn emit(ev: AppEvent) {
+    PENDING.with(|q| q.borrow_mut().push_back(Pending::Ev(ev)));
+}
+
+/// 依次把待投递事件交给 Handler，执行它返回的 WinCmd
+fn pump() {
+    if PUMPING.with(|p| p.replace(true)) {
+        return;
+    }
+    let mut any = false;
+    while let Some(p) = PENDING.with(|q| q.borrow_mut().pop_front()) {
+        if QUITTING.with(|q| q.get()) {
+            continue;
+        }
+        any = true;
+        match p {
+            Pending::Ev(ev) => {
+                let mut out = Vec::new();
+                with_handler(|h| h.event(ev, &mut out));
+                apply(out);
+            }
+            Pending::After(a) => after(a),
+        }
+    }
+    if any {
+        // 有事发生：尽快补一帧，让画面跟上
+        with(|s| s.next_frame = s.next_frame.min((s.last_frame + EVENT_FRAME_GAP).max(now_ms())));
+    }
+    PUMPING.with(|p| p.set(false));
+    rearm();
+}
+
+/// 重排唯一的定时器到最早的到期时间
+fn rearm() {
+    with(|s| {
+        if s.quitting {
+            return;
+        }
+        let now = now_ms();
+        let mut due = s.next_frame;
+        if s.walk.is_some() || s.fall.is_some() {
+            due = due.min(s.phys_last + PHYS_STEP);
+        }
+        if let Some(t) = s.watch_next {
+            due = due.min(t);
+        }
+        if let Some(t) = s.reminders.next_deadline() {
+            due = due.min(t);
+        }
+        if let Some(p) = &s.pomodoro {
+            due = due.min(p.end);
+        }
+        let ms = due.saturating_sub(now).clamp(1, 0x7fff_ffff) as u32;
+        unsafe {
+            SetTimer(Some(s.hwnd), TIMER_ID, ms, None);
+        }
+    });
+}
+
+fn tick() {
+    if PUMPING.with(|p| p.get()) {
+        rearm();
+        return;
+    }
+    let now = now_ms();
+    let mut evs = Vec::new();
+    let pomo_done = with(|s| {
+        s.physics(now, &mut evs);
+        s.timers(now, &mut evs)
+    })
+    .unwrap_or(false);
+    if pomo_done {
+        menu::refresh();
+    }
+    for e in evs {
+        emit(e);
+    }
+    pump();
+
+    // 帧
+    let due = with(|s| !s.quitting && now >= s.next_frame).unwrap_or(false);
+    if due {
+        let mut out = Vec::new();
+        let delay = with_handler(|h| h.frame(now, &mut out)).unwrap_or(200);
+        apply(out);
+        let scale = current_scale();
+        with_handler(|h| {
+            if let Some(f) = h.render(scale) {
+                with(|s| s.blit(f));
+            }
+        });
+        with(|s| {
+            s.last_frame = now;
+            s.next_frame = now + delay.max(1) as u64;
+        });
+        pump(); // apply 可能产生了事件
+    }
+    rearm();
+}
+
+/// 执行 Handler 返回的窗口命令
+fn apply(out: Vec<WinCmd>) {
+    for cmd in out {
+        match cmd {
+            WinCmd::Quit => {
+                do_quit();
+                return;
+            }
+            WinCmd::Walk { dir, distance, speed } => {
+                with(|s| s.start_walk(dir, distance, speed));
+            }
+            WinCmd::WalkStop => {
+                with(|s| s.walk = None);
+            }
+            WinCmd::DragMove { sx, sy } => {
+                with(|s| {
+                    s.fall = None;
+                    s.walk = None;
+                    s.move_to(sx - s.drag_off.0, sy - s.drag_off.1);
+                });
+            }
+            WinCmd::DragEnd => {
+                with(|s| s.start_fall());
+            }
+            WinCmd::Show => {
+                with(|s| s.set_visible(true));
+                menu::refresh();
+            }
+            WinCmd::Hide => {
+                with(|s| s.set_visible(false));
+                menu::refresh();
+            }
+            WinCmd::ChatInput(c) => {
+                with(|s| {
+                    let (x, y, h) = (s.x, s.y, s.h);
+                    if let Some(chat) = s.chat.as_mut() {
+                        match c {
+                            ChatInputCmd::Open => {
+                                chat.layout(x, y, h);
+                                chat.open();
+                            }
+                            ChatInputCmd::Close => chat.close(),
+                            ChatInputCmd::Enable(on) => chat.enable(on),
+                        }
+                    }
+                });
+            }
+        }
+    }
+    rearm();
+}
+
+/// 菜单 / 托盘点击
+fn on_menu(a: MenuAction) {
+    match &a {
+        // 先读一遍文件，Handler 拿到的就是新配置
+        MenuAction::ReloadSettings => {
+            crate::core::config::reload();
+        }
+        // 原版：win.show(); win.focus(); 再通知渲染进程开聊天
+        MenuAction::Chat => {
+            with(|s| s.set_visible(true));
+        }
+        _ => {}
+    }
+    PENDING.with(|q| {
+        let mut q = q.borrow_mut();
+        q.push_back(Pending::Ev(AppEvent::Menu(a.clone())));
+        q.push_back(Pending::After(a));
+    });
+}
+
+/// 平台类菜单动作（docs/ARCHITECTURE.md「菜单动作谁来执行」）
+fn after(a: MenuAction) {
+    let now = now_ms();
+    match a {
+        MenuAction::ToggleVisible => {
+            let visible = with(|s| s.is_visible()).unwrap_or(true);
+            with(|s| s.set_visible(!visible));
+            if !visible {
+                emit(AppEvent::Peek);
+            }
+        }
+        MenuAction::CallToCenter => {
+            with(|s| s.call_to_center());
+            emit(AppEvent::Peek);
+        }
+        MenuAction::PomodoroStart(m) => {
+            with(|s| {
+                let p = Pomodoro::start(m, now);
+                POMO_END.store(p.end, Ordering::Relaxed);
+                s.pomodoro = Some(p);
+            });
+            emit(AppEvent::Pomodoro(PomodoroEv::Start { minutes: m }));
+        }
+        MenuAction::PomodoroStop => {
+            let had = with(|s| s.pomodoro.take().is_some()).unwrap_or(false);
+            POMO_END.store(0, Ordering::Relaxed);
+            if had {
+                emit(AppEvent::Pomodoro(PomodoroEv::Cancel));
+            }
+        }
+        MenuAction::AutoStart(on) => sys::set_autostart(on),
+        MenuAction::OpenSettings => {
+            let f = crate::core::paths::config_file();
+            if !f.exists() {
+                crate::core::config::reload(); // 确保文件存在且字段齐全
+            }
+            open_path(&f);
+        }
+        MenuAction::OpenDataDir => {
+            let d = crate::core::paths::data_dir();
+            let _ = std::fs::create_dir_all(&d);
+            open_path(&d);
+        }
+        MenuAction::OpenSongDir => {
+            let d = crate::core::paths::songs_dir();
+            let _ = std::fs::create_dir_all(&d);
+            open_path(&d);
+        }
+        MenuAction::ReloadSettings => {
+            let cfg = crate::core::config::get();
+            with(|s| {
+                s.reminders = Reminders::schedule(&cfg.reminders, now);
+                s.set_watch(cfg.moyu.enabled, now);
+            });
+        }
+        MenuAction::Moyu(on) => {
+            with(|s| s.set_watch(on, now));
+        }
+        MenuAction::Quit => do_quit(),
+        _ => {}
+    }
+    menu::refresh();
+}
+
+fn do_quit() {
+    if QUITTING.with(|q| q.replace(true)) {
+        return;
+    }
+    with(|s| s.quitting = true);
+    with_handler(|h| h.quit());
+    menu::shutdown();
+    let hwnd = with(|s| {
+        s.chat = None;
+        s.hwnd
+    });
+    if let Some(h) = hwnd {
+        unsafe {
+            let _ = KillTimer(Some(h), TIMER_ID);
+            let _ = DestroyWindow(h);
+        }
+    }
+}
+
+/// 聊天框里按了 Esc
+pub(crate) fn chat_escape() {
+    with(|s| {
+        if let Some(c) = s.chat.as_mut() {
+            c.close();
+        }
+    });
+    post_event(AppEvent::ChatCancel);
+}
+
+// ---------------------------------------------------------------- 窗口
+
+fn work_area_at(pt: POINT, flag: windows::Win32::Graphics::Gdi::MONITOR_FROM_FLAGS) -> RECT {
+    unsafe {
+        let mon = MonitorFromPoint(pt, flag);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+        }
+    }
+}
+
+impl Plat {
+    fn work_area(&self) -> RECT {
+        work_area_at(POINT { x: self.x + self.w / 2, y: self.y + self.h / 2 }, MONITOR_DEFAULTTONEAREST)
+    }
+
+    fn is_visible(&self) -> bool {
+        unsafe { IsWindowVisible(self.hwnd).as_bool() }
+    }
+
+    fn set_visible(&mut self, on: bool) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, if on { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        }
+        if on {
+            self.shown_once = true;
+            self.layout_chat();
+        }
+        if let Some(c) = &self.chat {
+            c.show_with_pet(on);
+        }
+    }
+
+    fn layout_chat(&self) {
+        if let Some(c) = &self.chat
+            && c.visible
+        {
+            c.layout(self.x, self.y, self.h);
+        }
+    }
+
+    fn move_to(&mut self, x: i32, y: i32) {
+        if (x, y) == (self.x, self.y) {
+            return;
+        }
+        self.x = x;
+        self.y = y;
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        self.layout_chat();
+    }
+
+    fn call_to_center(&mut self) {
+        self.walk = None;
+        self.fall = None;
+        let wa = self.work_area();
+        let x = (wa.left as f32 + (wa.right - wa.left) as f32 * 0.62 - self.w as f32 / 2.0).round() as i32;
+        self.move_to(x, wa.bottom - self.h);
+        self.set_visible(true);
+    }
+
+    fn start_walk(&mut self, dir: i32, distance: f32, speed: f32) {
+        let wa = self.work_area();
+        let m = 20.0 * self.scale;
+        let min_x = wa.left as f32 - m;
+        let max_x = ((wa.right - self.w) as f32 + m).max(min_x);
+        self.walk = Some(Walk { dir: dir.signum(), speed, distance, moved: 0.0, xf: self.x as f32, min_x, max_x });
+        self.phys_last = now_ms();
+        self.phys_acc = 0;
+    }
+
+    /// 松手：带重力掉到任务栏上方
+    fn start_fall(&mut self) {
+        let wa = self.work_area();
+        let floor = (wa.bottom - self.h) as f32;
+        let lo = wa.left as f32 - self.w as f32 / 3.0;
+        let hi = (wa.right as f32 - self.w as f32 * 2.0 / 3.0).max(lo);
+        let xf = (self.x as f32).clamp(lo, hi);
+        self.fall = Some(Fall { vy: 0.0, xf, yf: self.y as f32, floor });
+        self.phys_last = now_ms();
+        self.phys_acc = 0;
+    }
+
+    fn physics(&mut self, now: u64, evs: &mut Vec<AppEvent>) {
+        if self.walk.is_none() && self.fall.is_none() {
+            self.phys_last = now;
+            self.phys_acc = 0;
+            return;
+        }
+        self.phys_acc += now.saturating_sub(self.phys_last);
+        self.phys_last = now;
+        let steps = self.phys_acc / PHYS_STEP;
+        self.phys_acc %= PHYS_STEP;
+        // 卡太久（比如拖着菜单）不追帧，最多补 8 步
+        for _ in 0..steps.min(8) {
+            self.phys_step(evs);
+        }
+    }
+
+    fn phys_step(&mut self, evs: &mut Vec<AppEvent>) {
+        let s = self.scale;
+        if let Some(f) = &mut self.fall {
+            f.vy += 2.2 * s;
+            f.yf += f.vy;
+            let mut landed = None;
+            if f.yf >= f.floor {
+                f.yf = f.floor;
+                landed = Some(f.vy > 25.0 * s);
+            }
+            let (x, y) = (f.xf.round() as i32, f.yf.round() as i32);
+            if let Some(big) = landed {
+                self.fall = None;
+                evs.push(AppEvent::Landed { big });
+            }
+            self.move_to(x, y);
+        }
+        if let Some(w) = &mut self.walk {
+            w.xf += w.dir as f32 * w.speed;
+            w.moved += w.speed;
+            let hit_edge = w.xf <= w.min_x || w.xf >= w.max_x;
+            w.xf = w.xf.clamp(w.min_x, w.max_x);
+            let x = w.xf.round() as i32;
+            let done = hit_edge || w.moved >= w.distance;
+            if done {
+                self.walk = None;
+                evs.push(AppEvent::WalkDone { hit_edge });
+            }
+            let y = self.y;
+            self.move_to(x, y);
+        }
+    }
+
+    /// 提醒 / 番茄钟 / 摸鱼采样。返回番茄钟是否刚结束（要刷新菜单）
+    fn timers(&mut self, now: u64, evs: &mut Vec<AppEvent>) -> bool {
+        let mut pomo_done = false;
+        if let Some(p) = self.pomodoro
+            && now >= p.end
+        {
+            self.pomodoro = None;
+            POMO_END.store(0, Ordering::Relaxed);
+            evs.push(AppEvent::Pomodoro(PomodoroEv::Done { minutes: p.minutes }));
+            pomo_done = true;
+        }
+        let lt = LocalTime::now();
+        for k in self.reminders.poll(now, lt) {
+            evs.push(AppEvent::Remind(k));
+        }
+        if let Some(t) = self.watch_next
+            && now >= t
+        {
+            self.watch_next = Some(now + watch::STEP as u64 * 1000);
+            let cfg = crate::core::config::get().moyu;
+            if cfg.enabled {
+                let sample = watch::sample();
+                if let Some(ev) = self.sup.on_sample(&sample, &cfg, self.pomodoro.is_some(), lt.day_key()) {
+                    let (kind, level, minutes) = match &ev {
+                        crate::types::MoyuEv::Nag { level, minutes, .. } => ("nag", *level, *minutes),
+                        crate::types::MoyuEv::Back { minutes } => ("back", 0, *minutes),
+                    };
+                    crate::core::log::log(&format!(
+                        "moyu {{\"type\":\"{kind}\",\"level\":{level},\"minutes\":{minutes}}}"
+                    ));
+                    evs.push(AppEvent::Moyu(ev));
+                }
+                MOYU_TODAY_SEC.store(self.sup.today_sec(), Ordering::Relaxed);
+            }
+        }
+        pomo_done
+    }
+
+    fn set_watch(&mut self, on: bool, now: u64) {
+        self.watch_next = on.then_some(self.watch_next.unwrap_or(now + watch::STEP as u64 * 1000));
+    }
+
+    fn set_scale(&mut self, scale: f32) {
+        if (scale - self.scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.scale = scale;
+        SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
+        if let Some(c) = self.chat.as_mut() {
+            c.set_scale(scale);
+        }
+        self.next_frame = now_ms();
+    }
+
+    /// 把一帧（预乘 BGRA）贴到分层窗口
+    fn blit(&mut self, f: &Frame) {
+        let (fw, fh) = (f.w as i32, f.h as i32);
+        if fw <= 0 || fh <= 0 || f.bgra.len() < (fw * fh * 4) as usize {
+            return;
+        }
+        if self.dib.as_ref().is_none_or(|d| d.w != fw || d.h != fh) {
+            self.dib = None;
+            self.dib = create_dib(fw, fh);
+        }
+        let Some(dib) = &self.dib else { return };
+        unsafe {
+            std::ptr::copy_nonoverlapping(f.bgra.as_ptr(), dib.bits, (fw * fh * 4) as usize);
+        }
+        // 尺寸变了（DPI 变化）：以脚底中点为锚
+        if (fw, fh) != (self.w, self.h) {
+            self.x += (self.w - fw) / 2;
+            self.y += self.h - fh;
+            self.w = fw;
+            self.h = fh;
+        }
+        let dst = POINT { x: self.x, y: self.y };
+        let size = SIZE { cx: fw, cy: fh };
+        let src = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        unsafe {
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&dst),
+                Some(&size),
+                Some(dib.dc),
+                Some(&src),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+        }
+        self.layout_chat();
+        if !self.shown_once {
+            self.set_visible(true);
+        }
+    }
+
+    fn mouse_pos(&self, lp: LPARAM) -> (f32, f32, i32, i32) {
+        let cx = (lp.0 & 0xffff) as u16 as i16 as i32;
+        let cy = ((lp.0 >> 16) & 0xffff) as u16 as i16 as i32;
+        (cx as f32 / self.scale, cy as f32 / self.scale, self.x + cx, self.y + cy)
+    }
+}
+
+fn create_dib(w: i32, h: i32) -> Option<Dib> {
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // 自上而下
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() {
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(dc);
+            return None;
+        }
+        let old = SelectObject(dc, HGDIOBJ(bmp.0));
+        Some(Dib { dc, bmp, old, bits: bits as *mut u8, w, h })
+    }
+}
+
+fn create_main_window() -> Option<HWND> {
+    unsafe {
+        let hinst: HINSTANCE = GetModuleHandleW(None).ok()?.into();
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_DBLCLKS,
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinst,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            lpszClassName: sys::WINDOW_CLASS,
+            ..Default::default()
+        };
+        if RegisterClassExW(&wc) == 0 {
+            return None;
+        }
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            sys::WINDOW_CLASS,
+            w!("哈基米"),
+            WS_POPUP,
+            0,
+            0,
+            WIN_W as i32,
+            WIN_H as i32,
+            None,
+            None,
+            Some(hinst),
+            None,
+        )
+        .ok()
+    }
+}
+
+fn mouse(lp: LPARAM, f: impl FnOnce(&mut Plat, (f32, f32, i32, i32)) -> MouseEv) {
+    if let Some(ev) = with(|s| {
+        let p = s.mouse_pos(lp);
+        f(s, p)
+    }) {
+        emit(AppEvent::Mouse(ev));
+        pump();
+    }
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_APP_EVENT => {
+                let evs: Vec<AppEvent> = EVENT_QUEUE.lock().unwrap().drain(..).collect();
+                for e in evs {
+                    emit(e);
+                }
+                pump();
+                LRESULT(0)
+            }
+            WM_APP_MENU => {
+                let ids: Vec<String> = MENU_QUEUE.lock().unwrap().drain(..).collect();
+                for id in ids {
+                    if let Some(a) = menu::action_for(&id) {
+                        on_menu(a);
+                    }
+                }
+                pump();
+                LRESULT(0)
+            }
+            WM_APP_SECOND => {
+                // 再双击一次程序 = 把她叫到屏幕中间
+                with(|s| s.call_to_center());
+                emit(AppEvent::SecondInstance);
+                pump();
+                menu::refresh();
+                LRESULT(0)
+            }
+            WM_TIMER if wp.0 == TIMER_ID => {
+                tick();
+                LRESULT(0)
+            }
+            WM_DPICHANGED => {
+                // 可能是在借着状态时（SetWindowPos 里）同步进来的，转一道 Post 再处理
+                let _ = PostMessageW(Some(hwnd), WM_APP_DPI, WPARAM(wp.0 & 0xffff), LPARAM(0));
+                LRESULT(0)
+            }
+            WM_APP_DPI => {
+                let dpi = wp.0 as f32;
+                if dpi > 0.0 {
+                    with(|s| s.set_scale(dpi / 96.0));
+                    rearm();
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                let dbl = msg == WM_LBUTTONDBLCLK;
+                let _ = SetCapture(hwnd);
+                mouse(lp, |s, (x, y, sx, sy)| {
+                    s.drag_off = (sx - s.x, sy - s.y);
+                    s.dbl_pending = dbl;
+                    MouseEv::Down { button: Button::Left, x, y, sx, sy }
+                });
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let _ = ReleaseCapture();
+                let mut dbl = None;
+                mouse(lp, |s, (x, y, sx, sy)| {
+                    if std::mem::take(&mut s.dbl_pending) {
+                        dbl = Some((x, y));
+                    }
+                    MouseEv::Up { button: Button::Left, x, y, sx, sy }
+                });
+                if let Some((x, y)) = dbl {
+                    emit(AppEvent::Mouse(MouseEv::DoubleClick { x, y }));
+                    pump();
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN => {
+                mouse(lp, |_, (x, y, sx, sy)| MouseEv::Down { button: Button::Right, x, y, sx, sy });
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                mouse(lp, |_, (x, y, sx, sy)| MouseEv::Up { button: Button::Right, x, y, sx, sy });
+                menu::popup();
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                mouse(lp, |s, (x, y, sx, sy)| {
+                    if !s.tracking {
+                        s.tracking = true;
+                        let mut t = TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: s.hwnd,
+                            dwHoverTime: 0,
+                        };
+                        let _ = TrackMouseEvent(&mut t);
+                    }
+                    MouseEv::Move { x, y, sx, sy }
+                });
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                with(|s| s.tracking = false);
+                emit(AppEvent::Mouse(MouseEv::Leave));
+                pump();
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                do_quit();
+                LRESULT(0)
+            }
+            WM_ENDSESSION if wp.0 != 0 => {
+                // 关机/注销：存档
+                do_quit();
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
 }
