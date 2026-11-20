@@ -11,6 +11,7 @@
 
 mod chat;
 mod memo_menu;
+mod mind_menu;
 mod menu;
 mod perch;
 mod sys;
@@ -603,6 +604,11 @@ fn after(a: MenuAction) {
         }
         MenuAction::Quit => do_quit(),
         MenuAction::Memo(crate::types::MemoAct::OpenFile) => open_path(&crate::core::memo::ensure_file()),
+        MenuAction::Mind(crate::types::MindAct::OpenFile) => open_path(&crate::core::memory::ensure_file()),
+        // 清空记忆：弹框二次确认，确认了才真的发 Clear（行为层清空并哭一下）
+        MenuAction::Mind(crate::types::MindAct::ClearAsk) if mind_menu::confirm_clear(main_hwnd()) => {
+            on_menu(MenuAction::Mind(crate::types::MindAct::Clear));
+        }
         _ => {}
     }
     menu::refresh();
