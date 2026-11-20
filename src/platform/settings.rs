@@ -86,6 +86,8 @@ const LBN_SELCHANGE: u32 = 1;
 const BM_GETCHECK: u32 = 0xF0;
 const BM_SETCHECK: u32 = 0xF1;
 const EM_SETPASSWORDCHAR: u32 = 0xCC;
+/// 密码框的遮挡字符（U+2022 •）
+const PASSWORD_DOT: usize = 0x2022;
 const EM_LIMITTEXT: u32 = 0xC5;
 const EM_SETCUEBANNER: u32 = 0x1501;
 const TBM_GETPOS: u32 = 0x400;
@@ -584,6 +586,8 @@ impl Dlg {
         let inner = if multi { [r[0] + 7.0, r[1] + 4.0, r[2] - 10.0, r[3] - 7.0] } else { [r[0] + 9.0, r[1] + 4.0, r[2] - 16.0, r[3] - 8.0] };
         let auto = if multi { 0 } else { ES_AUTOHSCROLL };
         let h = self.add(page, w!("EDIT"), "", WS_TABSTOP | auto | style, 0, id, inner);
+        // 系统默认的 ● 在思源黑体里又大又挤，换成小圆点 •
+        if style & ES_PASSWORD != 0 { send(h, EM_SETPASSWORDCHAR, PASSWORD_DOT, 0); }
         self.frames.push(([r[0], r[1] - 2.0, r[2], r[3] + 4.0], h, page));
         h
     }
@@ -664,14 +668,15 @@ impl Dlg {
         let voice = self.combo(p, ID_VOICE, true, [FX, 236.0, FW, 0.0]);
         combo_fill(voice, &VOICES);
         self.label(p, "声音描述", [X0, 272.0, LW, 26.0]);
-        self.edit(p, ID_STYLE, ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL, [FX, 272.0, FW, 56.0]);
-        self.label(p, "音量", [X0, 338.0, LW, 30.0]);
-        let vol = self.add(p, w!("msctls_trackbar32"), "", WS_TABSTOP | TBS_NOTICKS, 0, ID_VOLUME, [FX - 6.0, 338.0, FW - 54.0, 30.0]);
+        // 三行高：不带滚动条，写长了用滚轮/方向键翻
+        self.edit(p, ID_STYLE, ES_MULTILINE | ES_AUTOVSCROLL, [FX, 272.0, FW, 78.0]);
+        self.label(p, "音量", [X0, 360.0, LW, 30.0]);
+        let vol = self.add(p, w!("msctls_trackbar32"), "", WS_TABSTOP | TBS_NOTICKS, 0, ID_VOLUME, [FX - 6.0, 360.0, FW - 54.0, 30.0]);
         send(vol, TBM_SETRANGE, 1, (100 << 16) as isize);
-        self.add(p, w!("STATIC"), "90%", SS_CENTERIMAGE, 0, ID_VOLUME_LABEL, [FX + FW - 52.0, 338.0, 52.0, 30.0]);
-        self.button(p, ID_PLAY, "试听", 0, [FX, 378.0, 110.0, 30.0]);
-        self.add(p, w!("STATIC"), "", 0, 0, ID_PLAY_RESULT, [FX + 118.0, 378.0, FW - 118.0, 44.0]);
-        self.hint(p, "没填 Key 时只能念内置的固定台词；AI 聊天回复要有 Key 才能出声。", [X0, 430.0, W - X0 - 16.0, 40.0]);
+        self.add(p, w!("STATIC"), "90%", SS_CENTERIMAGE, 0, ID_VOLUME_LABEL, [FX + FW - 52.0, 360.0, 52.0, 30.0]);
+        self.button(p, ID_PLAY, "试听", 0, [FX, 400.0, 110.0, 30.0]);
+        self.add(p, w!("STATIC"), "", 0, 0, ID_PLAY_RESULT, [FX + 118.0, 400.0, FW - 118.0, 44.0]);
+        self.hint(p, "没填 Key 时只能念内置的固定台词；AI 聊天回复要有 Key 才能出声。", [X0, 452.0, W - X0 - 16.0, 40.0]);
 
         // ---------------- 常规
         let p = 3;
@@ -949,7 +954,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
             with(|d| {
                 let (edit, chk) = if id == ID_KEY_SHOW { (ID_KEY, ID_KEY_SHOW) } else { (ID_TTS_KEY, ID_TTS_KEY_SHOW) };
                 let e = d.c(edit);
-                send(e, EM_SETPASSWORDCHAR, if checked(d.c(chk)) { 0 } else { 0x25CF }, 0);
+                send(e, EM_SETPASSWORDCHAR, if checked(d.c(chk)) { 0 } else { PASSWORD_DOT }, 0);
                 unsafe {
                     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(e), None, true);
                 }
