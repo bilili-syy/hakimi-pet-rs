@@ -153,6 +153,8 @@ enum Zone { Pet, Bubble, Status }
 const IDLE_FRAME_MS: u32 = 200;
 const SLEEP_FRAME_MS: u32 = 100;
 const ANIM_FRAME_MS: u32 = 33;
+/// 默认（60fps）时拖动的帧间隔；运行时按 config::frame_ms()，这里留给测试作参照
+#[allow(dead_code)]
 const DRAG_FRAME_MS: u32 = 16;
 const PET_TOP: f32 = 360.0 - 293.0;
 
@@ -551,8 +553,9 @@ impl Behavior {
     }
 
     fn next_interval(&self) -> u32 {
-        if self.routine.is_some() { return dance::FRAME_MS; }
-        let base = if self.dragging_cls { DRAG_FRAME_MS }
+        // 跳舞、拖动、灵动待机都按设置里的帧率（默认 60）
+        if self.routine.is_some() { return crate::core::config::frame_ms(); }
+        let base = if self.dragging_cls { crate::core::config::frame_ms() }
             else if self.animating() { ANIM_FRAME_MS }
             else if self.state == St::Sleep { SLEEP_FRAME_MS }
             else { IDLE_FRAME_MS };

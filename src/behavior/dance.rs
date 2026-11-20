@@ -16,6 +16,8 @@ use crate::render::{FxShape, FxSprite, Xf, anim};
 use crate::types::{Audio, Face, WinCmd};
 
 /// 跳舞时的帧间隔（≈60fps，和灵动待机一致）；跳完回到原来的空闲帧率
+/// 运行时按 config::frame_ms()（设置里的帧率），这里是默认值，测试用
+#[allow(dead_code)]
 pub const FRAME_MS: u32 = 16;
 /// 窗口左右挪一下的距离（逻辑像素）
 const NUDGE_PX: f32 = 10.0;

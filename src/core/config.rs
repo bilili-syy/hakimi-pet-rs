@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -116,6 +117,8 @@ pub struct Config {
     pub weather_city: String,
     /// 哈基米大小倍数（乘在系统 DPI 缩放上），1.0 = 标准；载入时夹到 0.5~2.0
     pub scale: f32,
+    /// 动画帧率上限：30 / 60 / 120（载入时就近取这三档）
+    pub fps: u32,
     /// 未知字段（_说明 之类）原样保留
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -151,6 +154,7 @@ impl Default for Config {
             moyu: MoyuConfig::default(),
             weather_city: String::new(),
             scale: 1.0,
+            fps: 60,
             extra,
         }
     }
@@ -191,7 +195,23 @@ pub fn merge(saved: &Value) -> Config {
     obj.insert("moyu".into(), sub::<MoyuConfig>(saved.get("moyu")));
     let mut c: Config = lenient(obj);
     c.scale = clamp_scale(c.scale);
+    c.fps = clamp_fps(c.fps);
     c
+}
+
+/// 帧率就近取 30 / 60 / 120
+pub fn clamp_fps(f: u32) -> u32 {
+    match f { 0..=44 => 30, 45..=89 => 60, _ => 120 }
+}
+
+/// 当前帧率对应的帧间隔（ms）。渲染热路径每帧都要问，不能每次克隆整份配置，所以单独存一份。
+static FRAME_MS: AtomicU32 = AtomicU32::new(16);
+
+pub fn frame_ms() -> u32 { FRAME_MS.load(Ordering::Relaxed) }
+
+fn publish(c: &Config) {
+    let ms = match clamp_fps(c.fps) { 30 => 33, 60 => 16, _ => 8 };
+    FRAME_MS.store(ms, Ordering::Relaxed);
 }
 
 /// 大小倍数夹到 0.5~2.0（NaN / 0 当 1.0）
@@ -231,6 +251,7 @@ pub fn reload() -> Config {
         Err(_) => Config::default(),
     };
     write(&c);
+    publish(&c);
     *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(c.clone());
     c
 }
@@ -249,6 +270,7 @@ pub fn update(f: impl FnOnce(&mut Config)) -> Config {
     };
     f(&mut c);
     write(&c);
+    publish(&c);
     *guard = Some(c.clone());
     c
 }
@@ -258,6 +280,7 @@ pub fn update(f: impl FnOnce(&mut Config)) -> Config {
 pub fn replace(c: Config) -> bool {
     let mut guard = CONFIG.write().unwrap_or_else(|e| e.into_inner());
     let ok = write(&c);
+    publish(&c);
     *guard = Some(c);
     ok
 }
