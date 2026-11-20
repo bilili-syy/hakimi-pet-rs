@@ -548,4 +548,26 @@ mod tests {
         r.draw(&sc2, 1.0);
         r.pixmap().unwrap().save_png(out.replace(".png", "2.png")).unwrap();
     }
+
+    /// 手动测性能：cargo test --release bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench() {
+        let mut r = Renderer::new();
+        let mut sc = Scene::default();
+        sc.outfits = vec!["scarf".into()];
+        sc.bubble = Some(BubbleView { text: "哈基米～哈基米～哈基米～哈基米哦南北绿豆～".into(), opacity: 1.0, scroll: 0.0 });
+        let t = std::time::Instant::now();
+        let n = 300;
+        for i in 0..n {
+            let p = i as f32 / 60.0;
+            sc.pet = anim::breathe(p.fract());
+            sc.tail = anim::tail_sway(p.fract());
+            sc.star = anim::star_bob(p.fract());
+            sc.face = if i % 50 < 2 { Face::Blink } else { Face::Idle };
+            r.update(&sc, 1.5);
+        }
+        eprintln!("avg frame {:?}", t.elapsed() / n);
+        std::thread::sleep(std::time::Duration::from_secs(4));
+    }
 }
