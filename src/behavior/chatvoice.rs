@@ -1,21 +1,32 @@
 //! 语音回答（config.tts.chatVoiceReply）：AI 回复到了先别出字，保持「思考中」，等语音合成好，
-//! 字和声音同一刻出来。长回复按句切开：每句的字在它的声音开始时才出现（下一句在上一句念的时候预先合成）。
-//! 合成失败 / 某一句 15 秒还没好：剩下的字直接全显示，不出声。
+//! 字和声音同一刻出来。回复按句切成一段段：每段的字在它的声音开始时才出现（下一段在上一段念的时候预先合成）。
+//! 合成失败 / 某一段 15 秒还没好：剩下的字直接全显示，不出声。
+//!
+//! 句级流水线：MiMo clone 合成耗时跟字数走（实测短句 ~2 秒、55 字 4–9 秒），所以第一段尽量短（一句话，
+//! 太长就在逗号处切），早点出声；后面的段在前一段念的时候合成。语气按情绪标签（Emotion::voice_mood，
+//! 和状态 → 语气同一张表），不再用「思考中」的语气。放歌时也念（audio 两个声道混音，说话时音乐自动压低）。
 //!
 //! 只有几个钩子接在 mod.rs：`on_chat_reply` 里调 `cv_start`，Speech / AudioDone / Later::ChatVoiceTimeout 先给这里看，
 //! `say_opts` 开头调 `cv_interrupted`（别的台词插进来时结束语音回答）。
 use super::*;
+use crate::services::emotion::Emotion;
+use std::collections::VecDeque;
 use crate::types::Audio;
 
 /// 每句最多等多久合成（毫秒）
 pub(super) const CV_WAIT_MS: u64 = 15_000;
 /// 最多切几段（再多就并到最后一段）
-const MAX_CHUNKS: usize = 3;
-/// 短于这个字数的句子和下一句合并（别一个「嗯！」也单独念）
+const MAX_CHUNKS: usize = 4;
+/// 第二段起：短于这个字数的句子和下一句合并（别一个「嗯！」也单独念，每次请求还有固定开销）
 const MIN_CHUNK: usize = 12;
-/// 整段不超过这么多字就不切。MiMo 每次合成要等好几秒（主要花在请求本身，跟字数关系不大），
-/// 切太碎反而句与句之间要干等；人设要求回复 ≤60 字，所以平常一整段一起出，只有长回复才分句
-const NO_SPLIT_UNDER: usize = 60;
+/// 整段不超过这么多字就不切（一次合成就很快）
+const SHORT_ALL: usize = 16;
+/// 第一段至少这么多字（「嗯！！」这种并到下一句）
+const FIRST_MIN: usize = 6;
+/// 第一段超过这么多字，就在逗号处切开，先念前半句
+const FIRST_MAX: usize = 30;
+/// 在逗号处切第一段时，前半句至少这么多字
+const FIRST_CUT_MIN: usize = 8;
 
 /// 进行中的语音回答
 #[derive(Debug, Default)]
@@ -25,25 +36,32 @@ pub(super) struct ChatVoice {
     shown: usize,
     /// 正在等合成结果的 token（对应第 shown 段）；0 = 没在等
     req: u64,
-    /// 上一段还在念时预先合成好的下一段
-    ready: Option<Audio>,
+    /// 上一段还在念时预先合成好的下一段（音频, 合成用的 token）
+    ready: Option<(Audio, u64)>,
     /// 正在念的那段的 token
     playing: Option<u64>,
     /// 下一段合成失败/超时：当前这段念完把剩下的字全显示
     failed: bool,
+    /// 回复的情绪标签（决定念的语气）
+    emo: Option<Emotion>,
+    /// 回复到达的时刻（trace：回复 → 首音）
+    started: u64,
 }
 
-/// 按句切：在 。！？!?～~… 和换行后断开（连着的标点算一起），太短的并到下一句，最多 MAX_CHUNKS 段
+fn clen(s: &str) -> usize { s.chars().count() }
+
+/// 按句切：在 。！？!?～~… 和换行后断开（连着的标点算一起）。
+/// 第一段是第一句（太短并下一句，太长在逗号处切），之后每段至少 MIN_CHUNK 字，最多 MAX_CHUNKS 段，拼起来等于原文
 pub fn split_sentences(text: &str) -> Vec<String> {
     let text = text.trim();
     if text.is_empty() {
         return Vec::new();
     }
-    if text.chars().count() <= NO_SPLIT_UNDER {
+    if clen(text) <= SHORT_ALL {
         return vec![text.to_string()];
     }
     let is_end = |c: char| "。！？!?～~…\n".contains(c);
-    let mut raw: Vec<String> = Vec::new();
+    let mut raw: VecDeque<String> = VecDeque::new();
     let mut cur = String::new();
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -57,20 +75,32 @@ pub fn split_sentences(text: &str) -> Vec<String> {
                     break;
                 }
             }
-            raw.push(std::mem::take(&mut cur));
+            raw.push_back(std::mem::take(&mut cur));
         }
     }
     if !cur.trim().is_empty() {
-        raw.push(cur);
+        raw.push_back(cur);
     }
     // 去掉换行两边的空白，丢空段
-    let raw: Vec<String> = raw.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    // 太短的并到下一句
-    let mut out: Vec<String> = Vec::new();
+    let mut raw: VecDeque<String> = raw.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    // 第一段
+    let mut first = String::new();
+    while clen(&first) < FIRST_MIN {
+        let Some(s) = raw.pop_front() else { break };
+        first.push_str(&s);
+    }
+    if clen(&first) > FIRST_MAX
+        && let Some(cut) = comma_cut(&first)
+    {
+        let rest = first.split_off(cut);
+        raw.push_front(rest);
+    }
+    let mut out = vec![first];
+    // 之后：太短的并到下一句
     let mut carry = String::new();
     for s in raw {
         carry.push_str(&s);
-        if carry.chars().count() >= MIN_CHUNK {
+        if clen(&carry) >= MIN_CHUNK {
             out.push(std::mem::take(&mut carry));
         }
     }
@@ -89,6 +119,21 @@ pub fn split_sentences(text: &str) -> Vec<String> {
     out
 }
 
+/// 第一段太长时的切点（字节位置）：最后一个前半句在 FIRST_CUT_MIN..=FIRST_MAX 字之间的逗号后面
+fn comma_cut(s: &str) -> Option<usize> {
+    let mut best = None;
+    for (n, (i, c)) in s.char_indices().enumerate() {
+        let len = n + 1;
+        if len > FIRST_MAX {
+            break;
+        }
+        if len >= FIRST_CUT_MIN && "，、；,;：:".contains(c) && i + c.len_utf8() < s.len() {
+            best = Some(i + c.len_utf8());
+        }
+    }
+    best
+}
+
 /// 气泡停留时间：2.5 秒起，每字 +0.15 秒，最多 20 秒（和原来一样）
 fn read_ms(text: &str) -> u64 {
     (2500 + text.encode_utf16().count() as u64 * 150).min(20_000)
@@ -97,8 +142,8 @@ fn read_ms(text: &str) -> u64 {
 impl Behavior {
     /// 这次回复要不要走「语音回答」
     pub(super) fn chat_voice_on(&self) -> bool {
-        if self.song.is_some() {
-            return false; // 只有一个声道：放歌时不念
+        if self.routine.is_some() {
+            return false; // 跳舞时不念（内置鼓点走语音声道）；放歌时照念（audio 混音）
         }
         if !self.io {
             return self.fake_chat_voice;
@@ -115,14 +160,22 @@ impl Behavior {
         !crate::core::config::get().tts.chat_voice_reply
     }
 
-    /// AI 回复到了：保持思考，先合成第一段
-    pub(super) fn cv_start(&mut self, text: &str) {
+    /// AI 回复到了：保持思考，先合成第一段。emo = 回复的情绪标签（决定语气）
+    pub(super) fn cv_start(&mut self, text: &str, emo: Option<Emotion>) {
         let chunks = split_sentences(text);
         if chunks.is_empty() {
             return;
         }
-        self.cv = Some(ChatVoice { chunks, ..Default::default() });
+        self.cv = Some(ChatVoice { chunks, emo, started: self.now, ..Default::default() });
         self.cv_request();
+    }
+
+    /// 语音回答念的语气：情绪标签优先，没有再按当前状态
+    pub(super) fn cv_mood(&self) -> VoiceMood {
+        match self.cv.as_ref().and_then(|cv| cv.emo) {
+            Some(e) => e.voice_mood(),
+            None => self.voice_mood(),
+        }
     }
 
     /// 给第 shown 段发合成请求，并挂一个超时
@@ -133,7 +186,7 @@ impl Behavior {
         if let Some(cv) = &mut self.cv {
             cv.req = token;
         }
-        let mood = self.voice_mood();
+        let mood = self.cv_mood();
         self.call(format!("cvspeak:{text}"));
         if self.io {
             crate::services::tts::speak(&self.tx, token, text, Some(mood), SpeakKind::Chat);
@@ -154,8 +207,8 @@ impl Behavior {
         }
         cv.req = 0;
         match audio {
-            Some(a) if cv.playing.is_some() => cv.ready = Some(a),
-            Some(a) => self.cv_reveal(Some(a)),
+            Some(a) if cv.playing.is_some() => cv.ready = Some((a, token)),
+            Some(a) => self.cv_reveal(Some((a, token))),
             None if cv.playing.is_some() => cv.failed = true,
             None => self.cv_give_up(),
         }
@@ -229,9 +282,10 @@ impl Behavior {
     }
 
     /// 显示下一段的字（累加到气泡里），同时开始念它；然后预合成下一段
-    fn cv_reveal(&mut self, audio: Option<Audio>) {
+    fn cv_reveal(&mut self, audio: Option<(Audio, u64)>) {
         let Some(cv) = &mut self.cv else { return };
         let first = cv.shown == 0;
+        let started = cv.started;
         cv.shown = (cv.shown + 1).min(cv.chunks.len());
         let text = cv.chunks[..cv.shown].concat();
         let more = cv.shown < cv.chunks.len();
@@ -242,9 +296,13 @@ impl Behavior {
         let dur = read_ms(&text);
         self.bubble = Some(Bubble { text, shown: self.now, hide_at: Some(self.now + 60_000), dur, token });
         self.bubble_fade.set(true, self.now);
-        if let Some(a) = audio {
+        if let Some((a, req)) = audio {
             self.call(format!("cvplay:{token}"));
+            if first {
+                self.call(format!("cv reply->first sound {}ms", self.now.saturating_sub(started)));
+            }
             if self.io {
+                crate::services::tts::lat_link(req, token);
                 let vol = crate::core::config::get().tts.volume;
                 crate::services::audio::play(token, a, vol);
             }
@@ -284,24 +342,52 @@ mod tests {
     fn split() {
         assert_eq!(split_sentences("  "), Vec::<String>::new());
         assert_eq!(split_sentences("晴天喵～"), vec!["晴天喵～"]);
-        // 一般长度（≤60 字）整段不切
+        // 很短的整段不切
+        let tiny = "好呀，我们出去玩吧喵！";
+        assert_eq!(split_sentences(tiny), vec![tiny]);
+        // 一般长度：第一句先念（早出声），后面的句子各成一段
         let short = "今天天气很好喵！我们出去玩吧～记得带伞，下午可能会下雨哦。";
-        assert_eq!(split_sentences(short), vec![short]);
-        // 长回复按句切，短句并到下一句，连着的标点算一起
+        let s = split_sentences(short);
+        assert_eq!(s, vec!["今天天气很好喵！", "我们出去玩吧～记得带伞，下午可能会下雨哦。"]);
+        // 长回复：「嗯！！」太短并到下一句；之后每段 ≥ MIN_CHUNK；最多 4 段；拼起来不丢字
         let long = "嗯！！这个问题哈基米知道……答案是四十二喵。宇宙、生命以及一切的终极答案就是它！不过哈基米觉得，比起答案，和你一起找答案更开心喵～你还想知道什么呀？";
-        assert!(long.chars().count() > 60);
         let s = split_sentences(long);
-        assert!(s.len() >= 2 && s.len() <= 3, "{s:?}");
-        assert!(s[0].starts_with("嗯！！这个问题哈基米知道……"));
-        assert!(s.iter().all(|c| c.chars().count() >= MIN_CHUNK));
+        assert_eq!(s[0], "嗯！！这个问题哈基米知道……");
+        assert!(s.len() >= 3 && s.len() <= MAX_CHUNKS, "{s:?}");
+        assert!(s[1..].iter().all(|c| c.chars().count() >= MIN_CHUNK), "{s:?}");
         assert_eq!(s.concat(), long);
-        // 最多 3 段，拼起来不丢字
+        // 最多 4 段
         let many = "一二三四五六七八九十一二。".repeat(8);
         let s = split_sentences(&many);
-        assert_eq!(s.len(), 3);
+        assert_eq!(s.len(), MAX_CHUNKS);
         assert_eq!(s.concat(), many);
-        // 没有句末标点的长段
+        // 第一句太长：在逗号处切，前半句先念
+        let comma = "哈基米觉得今天特别适合出去晒太阳，因为窗外的阳光暖洋洋的，小鸟也在叫，真的好舒服呀喵～";
+        let s = split_sentences(comma);
+        assert!(s[0].chars().count() <= FIRST_MAX && s[0].ends_with('，'), "{s:?}");
+        assert_eq!(s.concat(), comma);
+        // 没有标点的长段：没法切，整段
         let flat = "没有标点".repeat(20);
         assert_eq!(split_sentences(&flat), vec![flat.clone()]);
+    }
+
+    #[test]
+    fn emotion_mood_matches_state_mood() {
+        // 情绪标签的语气和同名状态的语气一致（同一张表）
+        for (e, st) in [
+            (Emotion::Happy, St::Happy),
+            (Emotion::Love, St::Love),
+            (Emotion::Shy, St::Shy),
+            (Emotion::Surprised, St::Surprised),
+            (Emotion::Cry, St::Cry),
+            (Emotion::Hiss, St::Hiss),
+            (Emotion::Think, St::Think),
+            (Emotion::Dizzy, St::Dizzy),
+            (Emotion::Stare, St::Stare),
+            (Emotion::Yawn, St::Yawn),
+        ] {
+            assert_eq!(st.voice_mood(), Some(e.voice_mood()), "{e:?}");
+        }
+        assert_eq!(Emotion::Idle.voice_mood(), VoiceMood::Calm);
     }
 }

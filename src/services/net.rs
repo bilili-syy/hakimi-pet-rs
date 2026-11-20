@@ -151,6 +151,17 @@ pub fn post_json_via(agent: &ureq::Agent, url: &str, headers: &[(&str, &str)], b
     Ok((status, text))
 }
 
+/// POST JSON，返回 (HTTP 状态码, 响应体读取器)：流式（SSE）边收边读用。非 2xx 也返回 Ok。
+/// 读取器丢掉就断开连接（可以用来真正掐断不要了的请求）。headers 里可能有 API Key，这里不打日志。
+pub fn post_json_stream(url: &str, headers: &[(&str, &str)], body: &serde_json::Value, timeout_secs: u64) -> Result<(u16, ureq::BodyReader<'static>), ureq::Error> {
+    let mut req = agent(timeout_secs).post(url).header("Content-Type", "application/json").header("Accept", "text/event-stream");
+    for (k, v) in headers { req = req.header(*k, *v); }
+    let res = req.send(serde_json::to_vec(body).unwrap_or_default())?;
+    let status = res.status().as_u16();
+    let reader = res.into_body().into_with_config().limit(MAX_BODY).reader();
+    Ok((status, reader))
+}
+
 /// GET，返回 (HTTP 状态码, 响应文本)。响应体最多 limit 字节
 pub fn get_text(url: &str, timeout_secs: u64, limit: u64) -> Result<(u16, String), ureq::Error> {
     let mut res = agent(timeout_secs).get(url).call()?;
