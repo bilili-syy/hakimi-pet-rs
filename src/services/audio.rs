@@ -1,38 +1,60 @@
-//! 音频播放（rodio）。同一时间只放一个声音：新的 play 会先停掉旧的（旧的发 AudioDone）。
+//! 音频播放（rodio）。两个声道：
+//! - 语音（play）：同一时间只放一句，新的 play 先停掉旧的（旧的发 AudioDone）
+//! - 音乐（play_file）：同一时间只放一首，新歌顶掉旧歌
+//!
+//! 两个声道互不打断，混在一起出声；有语音时音乐压低到 DUCK 倍，语音放完恢复。
 //! 一个常驻后台线程持有唯一的输出流（MixerDeviceSink），第一次出声时才打开设备，
 //! 空闲 IDLE_CLOSE 后关掉设备释放 WASAPI 资源，下次出声再开。
 //! 歌曲文件边读边解码（BufReader），不整个读进内存。
+//!
+//! 流式语音（MiMo SSE pcm16）：tts 先拿 [`stream_open`] 开一个 PCM 缓冲，把它的「句柄」当 Audio 交给行为层，
+//! 行为层照常 play；这里认出句柄就边收边播（缓冲暂时空了先补静音，收完放完才算结束）。
+//!
+//! 口型电平（level）和 is_playing 只看语音，不看音乐，也不看设置窗口的试听（token ≥ PREVIEW_TOKEN_MIN）。
 #![allow(dead_code)]
 use crate::types::{AppEvent, Audio, EventSender};
+use std::collections::VecDeque;
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use rodio::Source as _;
 use std::time::{Duration, Instant};
 
 /// 空闲多久关掉音频设备
 const IDLE_CLOSE: Duration = Duration::from_secs(30);
 /// 播放中多久检查一次是否放完
 const POLL: Duration = Duration::from_millis(40);
+/// 说话时音乐压到多少
+pub const DUCK: f32 = 0.35;
+/// 这个值以上的 token 算「试听」（设置窗口的 TEST_TOKEN = u64::MAX - 7）：照常出声，但不带口型、不算在说话
+pub const PREVIEW_TOKEN_MIN: u64 = u64::MAX - 1024;
+/// 流式语音：缓冲空着、又这么久没收到新数据，就当断流结束
+const STREAM_STALL: Duration = Duration::from_secs(8);
+
+pub fn is_preview(token: u64) -> bool { token >= PREVIEW_TOKEN_MIN }
 
 enum Src {
     Mem(Vec<u8>),
     File(PathBuf),
+    Stream(Arc<PcmStream>),
 }
 
 enum Cmd {
-    Play { token: u64, src: Src, volume: f32, max_secs: u32 },
-    Stop,
+    Play { token: u64, src: Src, volume: f32, max_secs: u32, music: bool },
+    Stop { voice: bool, music: bool },
+    /// 停掉正在放这个 token 的声道（不管是语音还是音乐）
+    StopToken(u64),
 }
 
 static TX: OnceLock<Mutex<Sender<Cmd>>> = OnceLock::new();
 static EVENTS: OnceLock<EventSender> = OnceLock::new();
 static PLAYING: AtomicBool = AtomicBool::new(false);
-/// 口型同步用：正在播放的声音最近 ~20ms 的 RMS（0..1 满幅，f32 的位），声卡线程写、UI 线程无锁读
+/// 口型同步用：正在播放的语音最近 ~20ms 的 RMS（0..1 满幅，f32 的位），声卡线程写、UI 线程无锁读
 static LEVEL: AtomicU32 = AtomicU32::new(0);
 
-/// 当前出声的音量（滚动 RMS，0 = 静音/没在放）。和音量设置无关（量的是解码出来的样本）
+/// 当前语音的音量（滚动 RMS，0 = 静音/没在说话）。和音量设置无关（量的是解码出来的样本）；音乐和试听不算
 pub fn level() -> f32 { f32::from_bits(LEVEL.load(Ordering::Relaxed)) }
 
 fn set_level(v: f32) { LEVEL.store(v.to_bits(), Ordering::Relaxed); }
@@ -60,27 +82,46 @@ fn done(token: u64) {
 }
 
 fn send(cmd: Cmd) {
-    let token = match &cmd { Cmd::Play { token, .. } => Some(*token), Cmd::Stop => None };
+    let token = match &cmd { Cmd::Play { token, .. } => Some(*token), _ => None };
     let ok = sender().is_some_and(|s| s.send(cmd).is_ok());
     if !ok && let Some(t) = token { done(t); }
 }
 
-/// 播放编码好的音频（wav/ogg），volume 0~1；放完发 AppEvent::AudioDone { token }
+/// 播放一句语音（wav/ogg/mp3，或 [`stream_open`] 给的流式句柄），volume 0~1；放完发 AppEvent::AudioDone { token }。
+/// 会顶掉正在念的上一句，不影响正在放的歌
 pub fn play(token: u64, audio: Audio, volume: f32) {
-    PLAYING.store(true, Ordering::SeqCst);
-    send(Cmd::Play { token, src: Src::Mem(audio.0), volume, max_secs: 0 });
+    if !is_preview(token) { PLAYING.store(true, Ordering::SeqCst); }
+    let src = match take_stream(&audio.0) {
+        Some(s) => Src::Stream(s),
+        None => Src::Mem(audio.0),
+    };
+    send(Cmd::Play { token, src, volume, max_secs: 0, music: false });
 }
 
-/// 播放本地歌曲文件（mp3/ogg/wav/m4a/flac/aac），最多 max_secs 秒；放完或到时发 AudioDone
+/// 播放本地歌曲文件（mp3/ogg/wav/m4a/flac/aac），最多 max_secs 秒；放完或到时发 AudioDone。
+/// 顶掉正在放的上一首，不打断语音（有语音时自动压低）
 pub fn play_file(token: u64, path: PathBuf, volume: f32, max_secs: u32) {
-    PLAYING.store(true, Ordering::SeqCst);
-    send(Cmd::Play { token, src: Src::File(path), volume, max_secs });
+    send(Cmd::Play { token, src: Src::File(path), volume, max_secs, music: true });
 }
 
-/// 停止当前声音
-pub fn stop() { send(Cmd::Stop); }
+/// 全停（语音和音乐）
+pub fn stop() { send(Cmd::Stop { voice: true, music: true }); }
 
-/// 当前是否在出声（行为层用来判断气泡要不要多留一会儿）
+/// 停掉这个 token 的声音（语音或音乐，哪个在放它停哪个；已经放完的不管）
+pub fn stop_token(token: u64) { send(Cmd::StopToken(token)); }
+
+/// 内存里的一段音乐（比如跳舞的内置鼓点）走音乐声道：不被说话顶掉，说话时自动压低
+pub fn play_music_mem(token: u64, audio: Audio, volume: f32, max_secs: u32) {
+    send(Cmd::Play { token, src: Src::Mem(audio.0), volume, max_secs, music: true });
+}
+
+/// 只停语音（歌照放）
+pub fn stop_voice() { send(Cmd::Stop { voice: true, music: false }); }
+
+/// 只停音乐（话照说）
+pub fn stop_music() { send(Cmd::Stop { voice: false, music: true }); }
+
+/// 当前是否在说话（行为层用来判断气泡要不要多留一会儿、口型要不要动）。音乐和试听不算
 pub fn is_playing() -> bool { PLAYING.load(Ordering::SeqCst) }
 
 /// 这段字节 rodio 能不能解码（不开声卡）。用来探测内置台词的格式是否受支持。
@@ -94,19 +135,165 @@ pub fn can_decode(bytes: &[u8]) -> bool {
         .is_ok_and(|mut d| d.next().is_some())
 }
 
+// ------------------------------------------------------------------ 流式 PCM
+
+/// 句柄格式：MAGIC + id（小端 u64）。只在 tts → 行为层 → audio::play 之间传，不落盘
+const MAGIC: &[u8; 8] = b"HKPCMSTR";
+/// 最多同时挂几个还没被 play 取走的流（行为层没播就丢了的，最老的先扔）
+const MAX_OPEN: usize = 8;
+
+/// 边收边播的 16 位单声道 PCM 缓冲。tts 线程写，声卡线程读
+pub struct PcmStream {
+    rate: u32,
+    buf: Mutex<PcmBuf>,
+}
+
+struct PcmBuf {
+    samples: VecDeque<f32>,
+    /// 上一块剩下的半个样本（字节数是奇数时）
+    odd: Option<u8>,
+    done: bool,
+    last_push: Instant,
+    /// 一共收到多少个样本（统计/测试用）
+    total: usize,
+}
+
+impl PcmStream {
+    fn new(rate: u32) -> Self {
+        Self { rate, buf: Mutex::new(PcmBuf { samples: VecDeque::new(), odd: None, done: false, last_push: Instant::now(), total: 0 }) }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PcmBuf> { self.buf.lock().unwrap_or_else(|e| e.into_inner()) }
+
+    /// 追加一块小端 16 位 PCM 字节
+    pub fn push_pcm16(&self, bytes: &[u8]) {
+        let mut b = self.lock();
+        let mut it = bytes.iter().copied();
+        if let Some(lo) = b.odd.take() {
+            match it.next() {
+                Some(hi) => b.samples.push_back(f32::from(i16::from_le_bytes([lo, hi])) / 32768.0),
+                None => {
+                    b.odd = Some(lo);
+                    return;
+                }
+            }
+        }
+        loop {
+            match (it.next(), it.next()) {
+                (Some(lo), Some(hi)) => b.samples.push_back(f32::from(i16::from_le_bytes([lo, hi])) / 32768.0),
+                (Some(lo), None) => {
+                    b.odd = Some(lo);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        b.total = b.total.saturating_add(bytes.len() / 2);
+        b.last_push = Instant::now();
+    }
+
+    /// 收完了（正常结束或出错都调）：放完缓冲里剩下的就结束
+    pub fn finish(&self) { self.lock().done = true; }
+
+    pub fn is_done(&self) -> bool { self.lock().done }
+
+    /// 一次最多取 n 个样本；返回 (样本, 是否已经结束且取空)
+    fn pull(&self, n: usize, out: &mut Vec<f32>) -> bool {
+        let mut b = self.lock();
+        let k = n.min(b.samples.len());
+        out.extend(b.samples.drain(..k));
+        let stalled = b.samples.is_empty() && b.last_push.elapsed() > STREAM_STALL;
+        (b.done || stalled) && b.samples.is_empty()
+    }
+}
+
+static STREAMS: Mutex<Vec<(u64, Arc<PcmStream>)>> = Mutex::new(Vec::new());
+static STREAM_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 开一个流式 PCM 缓冲（rate Hz、单声道、16 位）。返回能当 Audio 传的句柄和写入端
+pub fn stream_open(rate: u32) -> (Audio, Arc<PcmStream>) {
+    let id = STREAM_SEQ.fetch_add(1, Ordering::Relaxed);
+    let s = Arc::new(PcmStream::new(rate.max(8000)));
+    let mut v = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+    v.push((id, s.clone()));
+    while v.len() > MAX_OPEN { v.remove(0); }
+    let mut h = MAGIC.to_vec();
+    h.extend_from_slice(&id.to_le_bytes());
+    (Audio(h), s)
+}
+
+/// 这段 Audio 是不是流式句柄
+pub fn is_stream(bytes: &[u8]) -> bool { bytes.len() == 16 && bytes.starts_with(MAGIC) }
+
+/// 句柄 → 流（取走，一个流只能播一次）
+fn take_stream(bytes: &[u8]) -> Option<Arc<PcmStream>> {
+    if !is_stream(bytes) { return None; }
+    let id = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+    let mut v = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = v.iter().position(|(k, _)| *k == id)?;
+    Some(v.remove(i).1)
+}
+
+/// 流式 PCM → rodio Source。缓冲暂时空了补静音（不结束），收完且放空才结束
+struct StreamSrc {
+    s: Arc<PcmStream>,
+    local: Vec<f32>,
+    pos: usize,
+    ended: bool,
+}
+
+impl StreamSrc {
+    fn new(s: Arc<PcmStream>) -> Self { Self { s, local: Vec::with_capacity(2048), pos: 0, ended: false } }
+}
+
+impl Iterator for StreamSrc {
+    type Item = rodio::Sample;
+
+    fn next(&mut self) -> Option<rodio::Sample> {
+        if self.pos >= self.local.len() {
+            if self.ended { return None; }
+            self.local.clear();
+            self.pos = 0;
+            let end = self.s.pull(1024, &mut self.local);
+            if self.local.is_empty() {
+                if end {
+                    self.ended = true;
+                    return None;
+                }
+                return Some(0.0); // 还没收到：先补一个静音样本
+            }
+        }
+        let v = self.local[self.pos];
+        self.pos += 1;
+        Some(v)
+    }
+}
+
+impl rodio::Source for StreamSrc {
+    fn current_span_len(&self) -> Option<usize> { None }
+    fn channels(&self) -> rodio::ChannelCount { std::num::NonZero::<u16>::MIN }
+    fn sample_rate(&self) -> rodio::SampleRate { std::num::NonZero::new(self.s.rate).unwrap_or(std::num::NonZero::<u32>::MIN) }
+    fn total_duration(&self) -> Option<Duration> { None }
+}
+
 // ------------------------------------------------------------------ 后台线程
 
 struct Current {
     token: u64,
     player: rodio::Player,
+    /// 音乐的原始音量（压低/恢复用）
+    volume: f32,
 }
 
 fn worker(rx: Receiver<Cmd>) {
     let mut sink: Option<rodio::MixerDeviceSink> = None;
-    let mut cur: Option<Current> = None;
+    let mut voice: Option<Current> = None;
+    let mut music: Option<Current> = None;
+    let mut ducked = false;
     let mut idle_since = Instant::now();
     loop {
-        let msg = if cur.is_some() {
+        let busy = voice.is_some() || music.is_some();
+        let msg = if busy {
             rx.recv_timeout(POLL)
         } else if sink.is_some() {
             rx.recv_timeout(IDLE_CLOSE)
@@ -114,12 +301,16 @@ fn worker(rx: Receiver<Cmd>) {
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
         };
         match msg {
-            Ok(Cmd::Play { token, src, volume, max_secs }) => {
-                finish(&mut cur);
-                match start(&mut sink, src, volume, max_secs) {
+            Ok(Cmd::Play { token, src, volume, max_secs, music: is_music }) => {
+                let slot = if is_music { &mut music } else { &mut voice };
+                finish(slot);
+                let meter = !is_music && !is_preview(token);
+                match start(&mut sink, src, volume, max_secs, meter) {
                     Ok(player) => {
-                        crate::core::log::trace(&format!("audio start:{token}"));
-                        cur = Some(Current { token, player })
+                        crate::core::log::trace(&format!("audio start:{token}{}", if is_music { " music" } else { "" }));
+                        if !is_music { super::tts::lat_sound(token); }
+                        *slot = Some(Current { token, player, volume });
+                        ducked = false; // 下面按现状重新压
                     }
                     Err(e) => {
                         crate::core::log::log(&format!("audio error {e}"));
@@ -127,31 +318,53 @@ fn worker(rx: Receiver<Cmd>) {
                     }
                 }
             }
-            Ok(Cmd::Stop) => finish(&mut cur),
+            Ok(Cmd::Stop { voice: v, music: m }) => {
+                if v { finish(&mut voice); }
+                if m { finish(&mut music); }
+            }
+            Ok(Cmd::StopToken(t)) => {
+                for slot in [&mut voice, &mut music] {
+                    if slot.as_ref().is_some_and(|c| c.token == t) { finish(slot); }
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                finish(&mut cur);
+                finish(&mut voice);
+                finish(&mut music);
                 return;
             }
         }
-        if cur.as_ref().is_some_and(|c| c.player.empty()) {
-            let c = cur.take();
-            if let Some(c) = c { done(c.token); }
+        for slot in [&mut voice, &mut music] {
+            if slot.as_ref().is_some_and(|c| c.player.empty()) && let Some(c) = slot.take() {
+                done(c.token);
+            }
         }
-        if cur.is_some() {
-            idle_since = Instant::now();
-        } else {
-            // 只有队列里确实没有新的 play 时才认为静音了
+        // 说话时压低音乐，说完恢复
+        let talking = voice.is_some();
+        if let Some(m) = &music && talking != ducked {
+            m.player.set_volume(duck_volume(m.volume, talking));
+            ducked = talking;
+        }
+        if voice.is_none() {
+            // 只有队列里确实没有新的 play 时才认为不说话了
             PLAYING.store(false, Ordering::SeqCst);
             set_level(0.0);
-            if sink.is_some() && idle_since.elapsed() >= IDLE_CLOSE {
-                sink = None; // 关掉设备
-            }
+        }
+        if voice.is_some() || music.is_some() {
+            idle_since = Instant::now();
+        } else if sink.is_some() && idle_since.elapsed() >= IDLE_CLOSE {
+            sink = None; // 关掉设备
         }
     }
 }
 
-/// 停掉当前的声音并发 AudioDone
+/// 音乐该用的音量：说话时压到 DUCK 倍
+pub fn duck_volume(base: f32, talking: bool) -> f32 {
+    let v = base.clamp(0.0, 1.0);
+    if talking { v * DUCK } else { v }
+}
+
+/// 停掉这个声道当前的声音并发 AudioDone
 fn finish(cur: &mut Option<Current>) {
     if let Some(c) = cur.take() {
         c.player.stop();
@@ -160,7 +373,7 @@ fn finish(cur: &mut Option<Current>) {
     }
 }
 
-fn start(sink: &mut Option<rodio::MixerDeviceSink>, src: Src, volume: f32, max_secs: u32) -> Result<rodio::Player, String> {
+fn start(sink: &mut Option<rodio::MixerDeviceSink>, src: Src, volume: f32, max_secs: u32, meter: bool) -> Result<rodio::Player, String> {
     if sink.is_none() {
         let mut s = rodio::DeviceSinkBuilder::open_default_sink().map_err(|e| format!("open device: {e}"))?;
         s.log_on_drop(false);
@@ -172,14 +385,17 @@ fn start(sink: &mut Option<rodio::MixerDeviceSink>, src: Src, volume: f32, max_s
     match src {
         Src::Mem(bytes) => {
             let len = bytes.len() as u64;
+            let t0 = Instant::now();
             let dec = rodio::Decoder::builder()
                 .with_data(Cursor::new(bytes))
                 .with_byte_len(len)
                 .with_seekable(true)
                 .build()
                 .map_err(|e| format!("decode: {e}"))?;
-            append(&player, dec, max_secs);
+            crate::core::log::trace(&format!("audio decoder ready {}ms", t0.elapsed().as_millis()));
+            append(&player, Box::new(dec), max_secs, meter);
         }
+        Src::Stream(st) => append(&player, Box::new(StreamSrc::new(st)), max_secs, meter),
         Src::File(path) => {
             let f = std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -187,36 +403,35 @@ fn start(sink: &mut Option<rodio::MixerDeviceSink>, src: Src, volume: f32, max_s
             let mut b = rodio::Decoder::builder().with_data(BufReader::new(f)).with_byte_len(len).with_seekable(true);
             if !ext.is_empty() { b = b.with_hint(&ext); }
             let dec = b.build().map_err(|e| format!("decode {}: {e}", path.display()))?;
-            append(&player, dec, max_secs);
+            append(&player, Box::new(dec), max_secs, meter);
         }
     }
     Ok(player)
 }
 
-fn append<S>(player: &rodio::Player, src: S, max_secs: u32)
-where
-    S: rodio::Source + Send + 'static,
-{
-    if max_secs > 0 {
-        player.append(Tap::new(src.take_duration(Duration::from_secs(u64::from(max_secs)))));
-    } else {
-        player.append(Tap::new(src));
-    }
+/// 所有声音统一装进一个 Box<dyn Source>：Tap / take_duration / Player 的整条泛型链只实例化一份
+/// （每多一种来源类型都会多一份重采样、混音代码，exe 会变大）
+type BoxSrc = Box<dyn rodio::Source + Send>;
+
+fn append(player: &rodio::Player, src: BoxSrc, max_secs: u32, meter: bool) {
+    let src: BoxSrc = if max_secs > 0 { Box::new(src.take_duration(Duration::from_secs(u64::from(max_secs)))) } else { src };
+    player.append(Tap::new(src, meter));
 }
 
-/// 透传样本的同时算滚动 RMS（每 ~20ms 一个窗口）写进 LEVEL。样本由声卡线程按播放进度拉取，
-/// 所以 LEVEL 跟着「正在出声」的位置走（只差设备缓冲那十几毫秒）
+/// 透传样本的同时算滚动 RMS（每 ~20ms 一个窗口）写进 LEVEL（meter=false 时不写：音乐、试听）。
+/// 样本由声卡线程按播放进度拉取，所以 LEVEL 跟着「正在出声」的位置走（只差设备缓冲那十几毫秒）
 struct Tap<S> {
     inner: S,
     acc: f32,
     n: u32,
     win: u32,
+    meter: bool,
 }
 
 impl<S: rodio::Source> Tap<S> {
-    fn new(inner: S) -> Self {
+    fn new(inner: S, meter: bool) -> Self {
         let rate = u32::from(inner.sample_rate()) * u32::from(inner.channels().get());
-        Self { inner, acc: 0.0, n: 0, win: (rate / 50).max(64) }
+        Self { inner, acc: 0.0, n: 0, win: (rate / 50).max(64), meter }
     }
 }
 
@@ -226,6 +441,7 @@ impl<S: rodio::Source> Iterator for Tap<S> {
     #[inline]
     fn next(&mut self) -> Option<rodio::Sample> {
         let s = self.inner.next();
+        if !self.meter { return s; }
         match s {
             Some(v) => {
                 self.acc += v * v;
@@ -262,7 +478,7 @@ mod tests {
         // 1 秒 440Hz 正弦，幅度 0.5 → RMS ≈ 0.354
         let wave = rodio::source::SineWave::new(440.0).amplify(0.5).take_duration(std::time::Duration::from_millis(200));
         let rate = u32::from(wave.sample_rate());
-        let mut tap = super::Tap::new(wave);
+        let mut tap = super::Tap::new(wave, true);
         assert_eq!(u32::from(tap.sample_rate()), rate);
         let first: Vec<f32> = tap.by_ref().take(rate as usize / 10).collect();
         assert_eq!(first.len(), rate as usize / 10);
@@ -271,6 +487,59 @@ mod tests {
         // 放完归零
         for _ in tap.by_ref() {}
         assert_eq!(super::level(), 0.0);
+    }
+
+    #[test]
+    fn tap_without_meter_leaves_level_alone() {
+        use rodio::Source;
+        // 音乐/试听不动口型电平（这里只验证不写，并行测试里别的 Tap 可能在写，所以只看自己写没写）
+        let wave = rodio::source::SineWave::new(440.0).take_duration(std::time::Duration::from_millis(50));
+        let mut tap = super::Tap::new(wave, false);
+        assert!(!tap.meter);
+        assert!(tap.by_ref().count() > 0);
+        assert_eq!(tap.n, 0);
+    }
+
+    #[test]
+    fn preview_and_duck() {
+        assert!(super::is_preview(u64::MAX - 7));
+        assert!(!super::is_preview(12345));
+        assert!((super::duck_volume(0.8, true) - 0.8 * super::DUCK).abs() < 1e-6);
+        assert_eq!(super::duck_volume(0.8, false), 0.8);
+        assert_eq!(super::duck_volume(3.0, false), 1.0);
+    }
+
+    #[test]
+    fn pcm_stream_plays_while_receiving() {
+        use rodio::Source;
+        let (h, s) = super::stream_open(24_000);
+        assert!(super::is_stream(&h.0));
+        assert!(!super::is_stream(b"RIFF...."));
+        let st = super::take_stream(&h.0).expect("handle");
+        assert!(super::take_stream(&h.0).is_none(), "一个流只能取一次");
+        let mut src = super::StreamSrc::new(st);
+        assert_eq!(u32::from(src.sample_rate()), 24_000);
+        assert_eq!(src.channels().get(), 1);
+        // 还没数据：补静音，不结束
+        assert_eq!(src.next(), Some(0.0));
+        // 奇数字节分两块送：0x4000 = 16384 → 0.5
+        s.push_pcm16(&[0x00]);
+        s.push_pcm16(&[0x40, 0x00, 0xC0]);
+        assert_eq!(src.next(), Some(0.5));
+        assert_eq!(src.next(), Some(-0.5));
+        assert_eq!(src.next(), Some(0.0)); // 又空了
+        s.push_pcm16(&[0xFF, 0x7F]);
+        s.finish();
+        assert!((src.next().unwrap() - 32767.0 / 32768.0).abs() < 1e-6);
+        assert_eq!(src.next(), None);
+        assert_eq!(src.next(), None);
+    }
+
+    #[test]
+    fn stream_registry_is_bounded() {
+        let hs: Vec<_> = (0..super::MAX_OPEN + 3).map(|_| super::stream_open(24_000).0).collect();
+        // 最老的几个被扔掉，最新的还在
+        assert!(super::take_stream(&hs.last().unwrap().0).is_some());
     }
 
     #[test]

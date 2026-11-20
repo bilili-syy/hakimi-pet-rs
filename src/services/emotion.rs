@@ -3,7 +3,7 @@
 //!
 //! 一次性回复用 [`analyze`]；流式回复（标签可能被拆成 "[ha" + "ppy]"）用 [`TagStream`]。
 //! 只做文字处理，不碰聊天流程本身。
-use crate::types::Face;
+use crate::types::{Face, VoiceMood};
 
 /// 只用现有立绘名
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -30,6 +30,19 @@ impl Emotion {
             Emotion::Stare => Face::Stare,
             Emotion::Yawn => Face::Yawn,
             Emotion::Idle => Face::Idle,
+        }
+    }
+
+    /// 情绪 → TTS 语气。和行为层「状态 → 语气」（behavior/mod.rs St::voice_mood）用同一张表：
+    /// 同一种表情不管是标签给的还是状态给的，念出来语气一样，缓存键也一样（能互相命中）
+    pub fn voice_mood(self) -> VoiceMood {
+        match self {
+            Emotion::Happy | Emotion::Love | Emotion::Shy => VoiceMood::Happy,
+            Emotion::Cry | Emotion::Dizzy => VoiceMood::Sad,
+            Emotion::Yawn => VoiceMood::Sleepy,
+            Emotion::Hiss => VoiceMood::Mad,
+            Emotion::Think => VoiceMood::Think,
+            Emotion::Surprised | Emotion::Stare | Emotion::Idle => VoiceMood::Calm,
         }
     }
 

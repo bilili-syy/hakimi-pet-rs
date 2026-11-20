@@ -1,8 +1,12 @@
 //! 语音：移植 Electron 版 src/main/tts.js
-//! - 小米 MiMo TTS（OpenAI 兼容 /v1/chat/completions，返回 base64 wav），三种模式 clone / preset / design
+//! - 小米 MiMo TTS（OpenAI 兼容 /v1/chat/completions），三种模式 clone / preset / design
+//!   - clone：一次性请求，回 base64 mp3（实测 SSE 也只回一个大块，流式没收益）
+//!   - preset / design：前台台词走 SSE 流式 pcm16，收到第一块就开始播（audio::stream_open 句柄），收完存成 wav 缓存
+//!   - 预热、设置窗口试听：一律一次性 mp3
+//! - 延迟追踪：HAKIMI_TRACE=1 时每句记「查缓存 → 发请求 → 首字节 → 首块音频/收完 → 首音播出」（见 [`lat`]）
 //! - 内置台词：assets/voice/lines/<sha1(text) 前16位>.ogg（只在 clone 模式用，crate::assets::get 读）
 //! - tts-cache：每句存一份，两个键（台词+情绪、只按台词）用硬链接指向同一个文件；按修改时间淘汰，最多 400 句 / 40MB
-//! - 同一时间只发一个请求；新台词来了旧的立刻回 None；429 冷却 10 秒；5xx/网络错误重试一次
+//! - 同一时间只发一个请求；新台词来了旧的立刻回 None；429 冷却 10 秒；5xx/网络错误/超时重试一次（第一次的超时按字数 8–20 秒，见 [`first_timeout`]）
 //! - 预热：后台慢慢合成固定台词，前台说话时让路
 //!
 //! 和原版的差别：ureq 是同步的，没法真正掐断在途请求。被顶掉的请求会立刻回 `audio: None`，
@@ -13,6 +17,7 @@ use crate::types::{AppEvent, Audio, EventSender, SpeakKind, VoiceMood};
 use base64::Engine;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -30,6 +35,10 @@ const CACHE_EXTS: [&str; 2] = ["mp3", "wav"];
 /// 预热最多多少条（main.js 里 items.slice(0, 300)）
 pub const MAX_PREWARM: usize = 300;
 const COOLDOWN: Duration = Duration::from_secs(10);
+/// MiMo 流式 pcm16 的采样率（单声道 16 位）
+pub const STREAM_RATE: u32 = 24_000;
+/// 流式请求整次的超时（秒）。长句 ~10 秒音频实测 3 秒收完
+const STREAM_TIMEOUT: u64 = 30;
 
 /// 状态 → 情绪标签（MiMo 支持在文本开头写 (风格)）
 pub fn mood_tag(m: VoiceMood) -> &'static str {
@@ -189,6 +198,61 @@ fn trim_cache_in(dir: &std::path::Path, max_entries: usize, max_bytes: u64) {
     }
 }
 
+// ------------------------------------------------------------------ 延迟追踪
+
+/// 每句（按行为层 token）从 speak() 开始计时，HAKIMI_TRACE=1 时各阶段写一行 trace：
+/// `tts lat #12 +3ms cache miss` … `tts lat #12 +1840ms first sound`。平时也计时（很便宜），只是不写
+mod lat {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static T0: Mutex<Vec<(u64, Instant)>> = Mutex::new(Vec::new());
+
+    pub fn begin(token: u64) {
+        let mut v = T0.lock().unwrap_or_else(|e| e.into_inner());
+        v.retain(|(_, t)| t.elapsed().as_secs() < 120);
+        v.retain(|(k, _)| *k != token);
+        if v.len() >= 64 { v.remove(0); }
+        v.push((token, Instant::now()));
+    }
+
+    /// 从 speak() 到现在多少毫秒（不认识的 token = None）
+    pub fn since(token: u64) -> Option<u128> {
+        let v = T0.lock().unwrap_or_else(|e| e.into_inner());
+        v.iter().find(|(k, _)| *k == token).map(|(_, t)| t.elapsed().as_millis())
+    }
+
+    pub fn mark(token: u64, what: &str) {
+        if let Some(ms) = since(token) { crate::core::log::trace(&format!("tts lat #{token} +{ms}ms {what}")); }
+    }
+
+    pub fn link(from: u64, to: u64) {
+        let mut v = T0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = v.iter_mut().find(|(k, _)| *k == from) { e.0 = to; }
+    }
+
+    /// 首音：记一行并结束这句的计时
+    pub fn end(token: u64) {
+        let mut v = T0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = v.iter().position(|(k, _)| *k == token) {
+            let (_, t) = v.remove(i);
+            drop(v);
+            crate::core::log::trace(&format!("tts lat #{token} +{}ms first sound", t.elapsed().as_millis()));
+        }
+    }
+}
+
+/// 行为层换了 token 去播（语音回答：合成用一个 token，播放用另一个）：把计时挪过去
+pub fn lat_link(from: u64, to: u64) { lat::link(from, to); }
+
+/// audio 线程开始出声时调（语音声道）
+pub fn lat_sound(token: u64) { lat::end(token); }
+
+/// 错误信息里万一带了 Key（服务端回显请求头之类），换成 ***
+fn redact(msg: &str, key: &str) -> String {
+    let k = key.trim();
+    if k.len() >= 6 { msg.replace(k, "***") } else { msg.to_string() }
+}
+
 // ------------------------------------------------------------------ 请求体
 
 fn ref_voice() -> Option<String> {
@@ -239,6 +303,7 @@ fn preset_body(t: &TtsConfig, content: &str) -> Value {
 
 struct Job {
     seq: u64,
+    token: u64,
     t: TtsConfig,
     text: String,
     mood: Option<VoiceMood>,
@@ -294,6 +359,7 @@ fn in_cooldown(st: &State) -> bool { st.cooldown_until.is_some_and(|t| Instant::
 /// 新请求来了要掐掉旧的在途请求（旧的回 None）。
 pub fn speak(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMood>, kind: SpeakKind) {
     let t = crate::core::config::get().tts;
+    lat::begin(token);
     let (seq, old) = {
         let mut st = state();
         st.next_seq += 1;
@@ -312,15 +378,20 @@ pub fn speak(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMood>
     let spawned = std::thread::Builder::new().name("hakimi-tts-lookup".into()).spawn(move || {
         let text = clean(&text);
         if text.is_empty() || !speakable(&text) { return answer(seq, None); }
-        if let Some(a) = read_cache(&t, &text, mood) { return answer(seq, Some(a)); }
+        if let Some(a) = read_cache(&t, &text, mood) {
+            lat::mark(token, "cache hit");
+            return answer(seq, Some(a));
+        }
         if t.api_key.is_empty() { return answer(seq, None); }
         let mut st = state();
         if in_cooldown(&st) {
             drop(st);
+            crate::core::log::trace("tts skipped: cooling down after 429");
             return answer(seq, None);
         }
         if !st.pending.iter().any(|p| p.0 == seq) { return; }
-        st.fg = Some(Job { seq, t, text, mood });
+        lat::mark(token, "cache miss, queued");
+        st.fg = Some(Job { seq, token, t, text, mood });
         ensure_worker(&mut st);
         drop(st);
         WAKE.notify_all();
@@ -400,11 +471,24 @@ fn worker() {
     }
 }
 
+/// clone 一次性请求第一次的超时（秒），按字数给：实测正常时短句 ~2 秒、65 字 ~4–5 秒，
+/// 但偶尔会有单个请求卡 20–40 秒（服务端，下一个请求又正常）。与其干等，不如早点断开重发一次（重发给 25 秒）
+pub fn first_timeout(text: &str) -> u64 { (6 + text.chars().count() as u64 * 15 / 100).clamp(8, 20) }
+
+/// 这个模式的前台台词走不走流式
+pub fn streams(t: &TtsConfig) -> bool { matches!(t.mode.as_str(), "preset" | "design") }
+
 fn run_fg(job: Job) {
     let mut result = Err(Fail { retry: false, msg: "superseded".into() });
+    let stream = streams(&job.t);
     for attempt in 0..2 {
         if !is_pending(job.seq) { break; }
-        result = request_once(&job.t, &job.text, job.mood, if attempt == 0 { 20 } else { 25 });
+        lat::mark(job.token, if attempt == 0 { "send" } else { "retry" });
+        result = if stream {
+            request_stream(&job, attempt)
+        } else {
+            request_once_lat(&job.t, &job.text, job.mood, if attempt == 0 { first_timeout(&job.text) } else { 25 }, job.token)
+        };
         match &result {
             Err(f) if f.retry => continue,
             _ => break,
@@ -416,17 +500,146 @@ fn run_fg(job: Job) {
         st.last_fg = Some(Instant::now());
     }
     match result {
-        Ok(wav) => {
+        Ok(Some(wav)) => {
             crate::core::log::trace(&format!("voice online {} ({} B)", job.text, wav.len()));
             answer(job.seq, Some(wav))
         }
+        // 流式：已经在首块时回复过了
+        Ok(None) => crate::core::log::trace(&format!("voice stream done {}", job.text)),
         Err(f) => {
             if is_pending(job.seq) && f.msg != "superseded" {
-                crate::core::log::log(&format!("tts error {}", f.msg));
+                crate::core::log::log(&format!("tts error {}（这句不出声，只显示文字）", redact(&f.msg, &job.t.api_key)));
             }
             answer(job.seq, None);
         }
     }
+}
+
+fn request_once_lat(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_secs: u64, token: u64) -> Result<Option<Vec<u8>>, Fail> {
+    let r = request_once_at(t, text, mood, timeout_secs, Some(token));
+    r.map(Some)
+}
+
+/// 流式合成一句（preset/design）：收到第一块音频就回复行为层（句柄），之后边收边往缓冲里写；
+/// 收完存 wav 缓存。首块之前被顶掉就直接断开连接（真的掐断，不像一次性请求只能等它跑完）
+fn request_stream(job: &Job, attempt: u32) -> Result<Option<Vec<u8>>, Fail> {
+    let t = &job.t;
+    let mut body = build_body(t, &job.text, job.mood);
+    body["audio"]["format"] = json!("pcm16");
+    body["stream"] = json!(true);
+    let (status, reader) = super::net::post_json_stream(API, &[("api-key", &t.api_key)], &body, STREAM_TIMEOUT).map_err(|e| Fail {
+        retry: true,
+        msg: if matches!(e, ureq::Error::Timeout(_)) { "timeout".into() } else { e.to_string() },
+    })?;
+    lat::mark(job.token, &format!("headers (HTTP {status})"));
+    if status == 429 {
+        state().cooldown_until = Some(Instant::now() + COOLDOWN);
+        return Err(Fail { retry: false, msg: "HTTP 429（限流，冷却 10 秒）".into() });
+    }
+    if !(200..300).contains(&status) {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::Read::take(reader, 4096), &mut text);
+        let snippet: String = text.chars().take(200).collect();
+        return Err(Fail { retry: status >= 500, msg: format!("HTTP {status}: {snippet}") });
+    }
+    let mut pcm: Vec<u8> = Vec::new();
+    let mut sink: Option<std::sync::Arc<super::audio::PcmStream>> = None;
+    let mut chunks = 0u32;
+    let mut err: Option<String> = None;
+    for line in std::io::BufReader::new(reader).lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                err = Some(e.to_string());
+                break;
+            }
+        };
+        match sse_line(&line) {
+            Sse::Audio(b) => {
+                chunks += 1;
+                if sink.is_none() {
+                    // 首块之前已经被新台词顶掉：断开连接，不要了
+                    if !is_pending(job.seq) { return Err(Fail { retry: false, msg: "superseded".into() }); }
+                    let (handle, w) = super::audio::stream_open(STREAM_RATE);
+                    lat::mark(job.token, &format!("first audio chunk ({} B)", b.len()));
+                    w.push_pcm16(&b);
+                    sink = Some(w);
+                    answer(job.seq, Some(handle.0));
+                } else if let Some(w) = &sink {
+                    w.push_pcm16(&b);
+                }
+                pcm.extend_from_slice(&b);
+            }
+            Sse::Done => break,
+            Sse::Error(m) => {
+                err = Some(m);
+                break;
+            }
+            Sse::Other => {}
+        }
+    }
+    if let Some(w) = &sink { w.finish(); }
+    match (sink.is_some(), err) {
+        (true, None) => {
+            lat::mark(job.token, &format!("stream done ({chunks} chunks, {} B pcm)", pcm.len()));
+            let wav = pcm16_wav(STREAM_RATE, &pcm);
+            write_cache(t, &job.text, job.mood, &wav);
+            Ok(None)
+        }
+        // 播到一半断了：已经收到的照样放完，不进缓存
+        (true, Some(e)) => {
+            crate::core::log::log(&format!("tts stream cut off after {chunks} chunks: {}", redact(&e, &t.api_key)));
+            Ok(None)
+        }
+        (false, e) => Err(Fail { retry: attempt == 0 && e.is_some(), msg: e.unwrap_or_else(|| "no audio in stream".into()) }),
+    }
+}
+
+/// SSE 的一行
+#[derive(Debug, PartialEq)]
+enum Sse {
+    Audio(Vec<u8>),
+    Done,
+    Error(String),
+    Other,
+}
+
+fn sse_line(line: &str) -> Sse {
+    let Some(p) = line.trim().strip_prefix("data:") else { return Sse::Other };
+    let p = p.trim();
+    if p == "[DONE]" { return Sse::Done; }
+    let Ok(v) = serde_json::from_str::<Value>(p) else { return Sse::Other };
+    if let Some(e) = v.get("error") {
+        let m = e.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| e.to_string());
+        return Sse::Error(m.chars().take(200).collect());
+    }
+    let data = v.pointer("/choices/0/delta/audio/data").and_then(Value::as_str).unwrap_or("");
+    if data.is_empty() { return Sse::Other; }
+    match base64::engine::general_purpose::STANDARD.decode(data.trim()) {
+        Ok(b) if !b.is_empty() => Sse::Audio(b),
+        Ok(_) => Sse::Other,
+        Err(e) => Sse::Error(format!("bad base64: {e}")),
+    }
+}
+
+/// 16 位单声道 PCM → wav 文件字节
+pub fn pcm16_wav(rate: u32, pcm: &[u8]) -> Vec<u8> {
+    let n = (pcm.len() & !1) as u32;
+    let mut v = Vec::with_capacity(44 + n as usize);
+    v.extend_from_slice(b"RIFF");
+    v.extend_from_slice(&(36 + n).to_le_bytes());
+    v.extend_from_slice(b"WAVEfmt ");
+    v.extend_from_slice(&16u32.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
+    v.extend_from_slice(&rate.to_le_bytes());
+    v.extend_from_slice(&(rate * 2).to_le_bytes());
+    v.extend_from_slice(&2u16.to_le_bytes());
+    v.extend_from_slice(&16u16.to_le_bytes());
+    v.extend_from_slice(b"data");
+    v.extend_from_slice(&n.to_le_bytes());
+    v.extend_from_slice(&pcm[..n as usize]);
+    v
 }
 
 struct Fail {
@@ -434,11 +647,16 @@ struct Fail {
     msg: String,
 }
 
-/// 发一次合成请求；成功写缓存并返回 wav 字节
+/// 发一次合成请求；成功写缓存并返回音频字节（mp3）
 fn request_once(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_secs: u64) -> Result<Vec<u8>, Fail> {
+    request_once_at(t, text, mood, timeout_secs, None)
+}
+
+fn request_once_at(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_secs: u64, token: Option<u64>) -> Result<Vec<u8>, Fail> {
     let body = build_body(t, text, mood);
     let r = super::net::post_json(API, &[("api-key", &t.api_key)], &body, timeout_secs);
     drop(body);
+    if let Some(tok) = token { lat::mark(tok, "response read"); }
     let (status, text_body) = r.map_err(|e| Fail {
         retry: true,
         msg: if matches!(e, ureq::Error::Timeout(_)) { "timeout".into() } else { e.to_string() },
@@ -461,6 +679,7 @@ fn request_once(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_secs
     let wav = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|e| Fail { retry: false, msg: format!("bad base64: {e}") })?;
+    if let Some(tok) = token { lat::mark(tok, &format!("decoded ({} B)", wav.len())); }
     write_cache(t, text, mood, &wav);
     Ok(wav)
 }
@@ -542,6 +761,182 @@ mod tests {
         assert_eq!(b["messages"][0]["content"], t.style.as_str());
         assert!(b["audio"].get("voice").is_none());
         assert!(ref_voice().is_some_and(|s| s.starts_with("data:audio/mpeg;base64,") && s.len() < 100_000));
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn parse_sse_lines() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 0, 2, 0]);
+        let l = format!(r#"data: {{"choices":[{{"delta":{{"audio":{{"data":"{b64}"}}}}}}]}}"#);
+        assert_eq!(sse_line(&l), Sse::Audio(vec![1, 0, 2, 0]));
+        assert_eq!(sse_line("data: [DONE]"), Sse::Done);
+        assert_eq!(sse_line(""), Sse::Other);
+        assert_eq!(sse_line(": keep-alive"), Sse::Other);
+        assert_eq!(sse_line(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#), Sse::Other);
+        assert_eq!(sse_line(r#"data: {"error":{"message":"quota"}}"#), Sse::Error("quota".into()));
+        assert!(matches!(sse_line(r#"data: {"choices":[{"delta":{"audio":{"data":"@@@"}}}]}"#), Sse::Error(_)));
+    }
+
+    #[test]
+    fn wav_from_pcm_decodes() {
+        let pcm: Vec<u8> = (0..4800u32).flat_map(|i| (((i % 100) as i16 - 50) * 300).to_le_bytes()).collect();
+        let wav = pcm16_wav(STREAM_RATE, &pcm);
+        assert_eq!(wav.len(), 44 + pcm.len());
+        assert_eq!(audio_ext(&wav), "wav");
+        assert!(crate::services::audio::can_decode(&wav));
+        // 奇数字节截掉半个样本
+        assert_eq!(pcm16_wav(STREAM_RATE, &[1, 2, 3]).len(), 46);
+    }
+
+    #[test]
+    fn stream_only_for_preset_and_design() {
+        let mut t = TtsConfig::default();
+        assert!(!streams(&t));
+        t.mode = "preset".into();
+        assert!(streams(&t));
+        t.mode = "design".into();
+        assert!(streams(&t));
+    }
+
+    #[test]
+    fn first_timeout_by_length() {
+        assert_eq!(first_timeout("喵～"), 8);
+        assert_eq!(first_timeout(&"喵".repeat(30)), 10);
+        assert_eq!(first_timeout(&"喵".repeat(65)), 15);
+        assert_eq!(first_timeout(&"喵".repeat(300)), 20);
+    }
+
+    #[test]
+    fn redact_key() {
+        assert_eq!(redact("bad key sk-abcdef123 here", "sk-abcdef123"), "bad key *** here");
+        assert_eq!(redact("x", ""), "x");
+    }
+
+    #[test]
+    fn lat_marks() {
+        lat::begin(9_000_001);
+        assert!(lat::since(9_000_001).is_some());
+        lat::link(9_000_001, 9_000_003);
+        assert!(lat::since(9_000_001).is_none());
+        lat::end(9_000_003);
+        assert!(lat::since(9_000_003).is_none());
+        lat::begin(9_000_001);
+        lat::end(9_000_001);
+        assert!(lat::since(9_000_001).is_none());
+        assert!(lat::since(9_000_002).is_none());
+    }
+}
+
+/// 真联网测延迟：`HAKIMI_LIVE=1 cargo test --release -- --ignored live_latency --nocapture`。
+/// 只读 config.json（不走 config::get，那个会写回文件），不打印 Key；合成结果会进 tts-cache（文字带时间戳，不会和平时的台词撞）。
+/// 声卡真开，但音量 0；「首音」= play 之后第一次量到非静音样本
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::types::{Audio, EventSender};
+    use std::sync::mpsc::{Receiver, channel};
+
+    fn cfg() -> Option<TtsConfig> {
+        let text = std::fs::read_to_string(crate::core::paths::config_file()).ok()?;
+        let t = crate::core::config::parse(&text).tts;
+        (!t.api_key.trim().is_empty()).then_some(t)
+    }
+
+    fn first_sound(token: u64, a: Vec<u8>) -> u128 {
+        // 先等上一句停干净（电平归零），否则量到的是上一句的尾巴
+        crate::services::audio::stop();
+        let w = Instant::now();
+        while (crate::services::audio::level() > 0.0 || crate::services::audio::is_playing()) && w.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let t0 = Instant::now();
+        crate::services::audio::play(token, Audio(a), 0.0);
+        while t0.elapsed() < Duration::from_secs(15) {
+            if crate::services::audio::level() > 0.0005 { return t0.elapsed().as_millis(); }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        u128::MAX
+    }
+
+    fn nonce() -> String {
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() % 1000).unwrap_or(0);
+        format!("第{n}次")
+    }
+
+    /// 走真的前台调度（run_fg）：返回 (收到可播音频的耗时, 首音耗时, 合成整句完成的耗时)
+    fn fg(t: &TtsConfig, text: &str, token: u64, rx: &Receiver<AppEvent>, tx: &EventSender) -> (u128, u128, u128) {
+        let seq = 1_000_000 + token;
+        state().pending.push((seq, token, tx.clone()));
+        let job = Job { seq, token, t: t.clone(), text: text.to_string(), mood: Some(VoiceMood::Happy) };
+        let t0 = Instant::now();
+        let h = std::thread::spawn(move || run_fg(job));
+        let audio = loop {
+            match rx.recv_timeout(Duration::from_secs(40)) {
+                Ok(AppEvent::Speech { token: k, audio }) if k == token => break audio,
+                Ok(_) => continue,
+                Err(_) => break None,
+            }
+        };
+        let got = t0.elapsed().as_millis();
+        let Some(a) = audio else { return (got, u128::MAX, t0.elapsed().as_millis()) };
+        let fs = first_sound(token, a.0);
+        let _ = h.join();
+        (got, got + fs, t0.elapsed().as_millis())
+    }
+
+    #[test]
+    #[ignore]
+    fn live_latency() {
+        if std::env::var_os("HAKIMI_LIVE").is_none() { return; }
+        let Some(base) = cfg() else { return println!("no MiMo key, skipped") };
+        let (etx, rx) = channel();
+        let etx = std::sync::Mutex::new(etx);
+        let tx = EventSender::new(move |ev| { let _ = etx.lock().unwrap().send(ev); });
+        crate::services::audio::init(tx.clone());
+        let reply = "今天天气很好喵，阳光暖洋洋的，晒得哈基米都想打滚了！我们一起出去散散步吧，顺便买点小鱼干～记得带伞哦，下午可能会下雨，别淋湿了喵。";
+        let mut tok = 100u64;
+        let mut next = || { tok += 1; tok };
+
+        // 1. 缓存命中（内置台词，clone）
+        let mut clone = base.clone();
+        clone.mode = "clone".into();
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let a = read_cache(&clone, SAMPLE, None).expect("bundled line");
+            let read = t0.elapsed().as_millis();
+            let fs = first_sound(next(), a);
+            println!("cache hit: read {read}ms, first sound {}ms", read + fs);
+            std::thread::sleep(Duration::from_millis(2500));
+        }
+        // 2. clone：整段回复一次合成（改之前语音回答的做法） vs 第一段（改之后）
+        // = behavior::chatvoice::split_sentences(reply)[0]
+        let first = "今天天气很好喵，阳光暖洋洋的，晒得哈基米都想打滚了！";
+        for _ in 0..3 {
+            let (got, fs, _) = fg(&clone, &format!("{}{reply}", nonce()), next(), &rx, &tx);
+            println!("clone whole reply ({} chars): audio {got}ms, first sound {fs}ms", reply.chars().count());
+            let (got, fs, _) = fg(&clone, &format!("{}{first}", nonce()), next(), &rx, &tx);
+            println!("clone first chunk ({} chars): audio {got}ms, first sound {fs}ms", first.chars().count() + 4);
+        }
+        // 3. preset：一次性 mp3（改之前） vs SSE 流式（改之后）
+        let mut preset = base.clone();
+        preset.mode = "preset".into();
+        for text in ["喵～今天也要开开心心的哦！", reply] {
+            for _ in 0..2 {
+                let k = next();
+                let t0 = Instant::now();
+                let a = request_once(&preset, &format!("{}{text}", nonce()), Some(VoiceMood::Happy), 25).ok();
+                let got = t0.elapsed().as_millis();
+                let fs = a.map(|a| got + first_sound(k, a)).unwrap_or(u128::MAX);
+                println!("preset mp3 one-shot ({} chars): audio {got}ms, first sound {fs}ms", text.chars().count());
+                let (got, fs, all) = fg(&preset, &format!("{}{text}", nonce()), next(), &rx, &tx);
+                println!("preset pcm16 stream ({} chars): first chunk {got}ms, first sound {fs}ms, all received {all}ms", text.chars().count());
+            }
+        }
+        crate::services::audio::stop();
     }
 }
 

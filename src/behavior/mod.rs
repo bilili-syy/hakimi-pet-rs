@@ -724,7 +724,7 @@ impl Behavior {
     /// 气泡先出，声音随后到；新台词会打断旧的
     fn voice(&mut self, text: &str, kind: SpeakKind, token: u64) {
         self.stop_voice();
-        if self.song.is_some() { return; } // 只有一个声道：放歌时不念
+        if self.routine.is_some() { return; } // 跳舞时不念（内置鼓点走语音声道）；放歌时照念，audio 混音、压低音乐
         self.voice_req = token;
         let mood = self.voice_mood();
         self.call(format!("speak:{text}"));
@@ -733,9 +733,9 @@ impl Behavior {
 
     fn stop_voice(&mut self) {
         self.voice_req = 0;
-        if self.voice_playing.take().is_some() {
+        if let Some(tok) = self.voice_playing.take() {
             self.call("stop".into());
-            if self.io { crate::services::audio::stop(); }
+            if self.io { crate::services::audio::stop_token(tok); }
         }
     }
 
@@ -875,9 +875,9 @@ impl Behavior {
     }
 
     fn stop_song(&mut self) {
-        if self.song.take().is_some() {
+        if let Some(tok) = self.song.take() {
             self.call("stop".into());
-            if self.io { crate::services::audio::stop(); }
+            if self.io { crate::services::audio::stop_token(tok); }
         }
     }
 
@@ -886,7 +886,6 @@ impl Behavior {
         self.stop_song();
         let path = if self.io { crate::services::songs::pick() } else { None };
         let Some(path) = path else { return self.go_dance(7000, None) };
-        self.stop_voice();
         let tok = self.next_token();
         self.song = Some(tok);
         // 不知道歌多长：先按最长 60 秒跳，放完（AudioDone）就停
@@ -1298,7 +1297,7 @@ impl Behavior {
         let (r, emo) = self.emotion_split(r);
         // 语音回答：先合成，字和声音一起出来（chatvoice.rs）；这期间保持思考中
         if r.ok && self.chat_voice_on() {
-            self.cv_start(&r.text);
+            self.cv_start(&r.text, emo);
             if self.cv.is_some() {
                 // 第一段出字时再换表情（emotion_cv_reveal），整段念完 2 秒后回平时
                 self.emotion_cv_pending(emo, r.text.chars().count());
