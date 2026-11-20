@@ -6,4 +6,5 @@ pub mod log;
 pub mod memo;
 pub mod paths;
 pub mod save;
+pub mod skin;
 pub mod stats;

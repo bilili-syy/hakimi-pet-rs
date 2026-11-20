@@ -32,7 +32,7 @@ pub enum Node {
     Sep,
     /// 子菜单 (文字, 内容)
     Sub(&'static str, &'static [Node]),
-    /// 运行时生成的子菜单："dance"（舞谱表）/ "memo"（备忘录，平台层 memo_menu 管）
+    /// 运行时生成的子菜单："dance"（舞谱表）/ "memo"（备忘录，平台层 memo_menu 管）/ "skin"（角色包，skin_menu 管）
     Gen(&'static str),
 }
 use Node::{Check, Gen, Item, Sep, Sub};
@@ -87,6 +87,9 @@ const COSTUME: &[Node] = &[
     Check("outfit:scarf", "🧣 四色围巾"),
     Sep,
     Item("outfit:clear", "摘掉配件"),
+    Sep,
+    // 「🎭 角色」：角色包列表 + 打开皮肤文件夹 + 刷新（platform/skin_menu.rs）
+    Gen("skin"),
 ];
 
 /// 整个右键 / 托盘菜单
@@ -263,6 +266,7 @@ fn build(nodes: &[Node], into: &dyn Container, items: &mut Vec<(String, Handle)>
                 items.push((title.to_string(), Handle::Sub(s)));
             }
             Gen("memo") => into.add(&super::memo_menu::init()),
+            Gen("skin") => into.add(&super::skin_menu::init()),
             Gen(kind) => {
                 let (title, list) = gen_items(kind);
                 let s = Submenu::new(title, true);
@@ -381,6 +385,7 @@ pub fn refresh() {
         }
     });
     super::memo_menu::refresh(POPUP_OPEN.with(|p| p.get()));
+    super::skin_menu::refresh(POPUP_OPEN.with(|p| p.get()));
 }
 
 /// 在光标处弹出右键菜单（模态，返回时点击已进队列）
@@ -400,6 +405,7 @@ pub fn popup() {
 /// 删除托盘图标（退出时）
 pub fn shutdown() {
     super::memo_menu::shutdown();
+    super::skin_menu::shutdown();
     MENUS.with(|m| {
         if let Ok(mut g) = m.try_borrow_mut() {
             *g = None;
@@ -461,6 +467,8 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
         _ => {
             if let Some(a) = super::memo_menu::parse(id) {
                 a
+            } else if let Some(a) = super::skin_menu::parse(id) {
+                a
             } else if let Some(m) = id.strip_prefix("pomo:") {
                 A::PomodoroStart(m.parse().ok()?)
             } else if let Some(d) = id.strip_prefix("dance:") {
@@ -505,6 +513,7 @@ mod tests {
         assert_eq!(parse_id("checkin", off), Some(A::CheckIn));
         assert_eq!(parse_id("weather", off), Some(A::WeatherReport));
         assert_eq!(parse_id("climb", off), Some(A::Climb));
+        assert_eq!(parse_id("skin:demo", off), Some(A::Costume("skin:demo".into())));
         assert_eq!(parse_id("settings", off), Some(A::OpenSettings));
         assert_eq!(parse_id("settings:file", off), Some(A::OpenConfigFile));
         assert_eq!(parse_id("settings:reload", off), Some(A::ReloadSettings));

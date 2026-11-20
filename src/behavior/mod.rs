@@ -4,6 +4,7 @@ pub mod fx;
 pub mod lines;
 pub mod play;
 mod memo;
+mod skin;
 pub mod beat;
 pub mod dance;
 mod live;
@@ -260,6 +261,8 @@ impl Behavior {
         let (stats, away) = Stats::load(saved);
         let cfg = crate::core::config::get();
         let mut b = Self::with(tx, stats, existed, away, cfg.costume, cfg.outfit, true);
+        // 角色包：扫描 skins 目录，按 save.json 的 skin 字段选中（只读清单，图片用到才解码）
+        crate::core::skin::init(&crate::core::skin::saved_id(&b.stats.data.extra));
         b.save();
         b
     }
@@ -696,6 +699,9 @@ impl Behavior {
 
     fn say_opts(&mut self, text: &str, ms: u64, voice: bool, kind: SpeakKind) {
         self.cv_interrupted();
+        // 角色包的 lines 替换固定台词（聊天回复不换）
+        let over = if kind == SpeakKind::Line && self.io { skin::line_override(text) } else { None };
+        let text = over.as_deref().unwrap_or(text);
         let token = if voice { self.next_token() } else { 0 };
         self.bubble = Some(Bubble { text: text.to_string(), shown: self.now, hide_at: Some(self.now + ms), dur: ms, token });
         self.bubble_fade.set(true, self.now);
@@ -1131,6 +1137,8 @@ impl Behavior {
             MenuAction::Status => self.show_status(),
             MenuAction::Chat => self.open_chat(),
             MenuAction::Costume(id) => {
+                // 「🎭 角色」子菜单（skin:…）
+                if self.on_skin_menu(&id) { return; }
                 let id = crate::core::costume::normalize(&id).to_string();
                 if id == self.costume { return; }
                 if self.io { let v = crate::core::costume::config_value(&id); crate::core::config::update(|c| c.costume = v); }
