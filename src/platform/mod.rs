@@ -765,8 +765,8 @@ impl Plat {
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        unsafe {
-            let _ = UpdateLayeredWindow(
+        let r = unsafe {
+            UpdateLayeredWindow(
                 self.hwnd,
                 None,
                 Some(&dst),
@@ -776,7 +776,18 @@ impl Plat {
                 COLORREF(0),
                 Some(&blend),
                 ULW_ALPHA,
-            );
+            )
+        };
+        // 只在出错状态变化时记一笔，免得每帧刷日志
+        static ULW_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if ULW_FAILING.swap(r.is_err(), Ordering::Relaxed) != r.is_err() {
+            match &r {
+                Err(e) => crate::core::log::log(&format!(
+                    "UpdateLayeredWindow failed: {e} (frame {fw}x{fh} at {},{})",
+                    self.x, self.y
+                )),
+                Ok(()) => crate::core::log::log("UpdateLayeredWindow ok again"),
+            }
         }
         self.layout_chat();
         if !self.shown_once {
