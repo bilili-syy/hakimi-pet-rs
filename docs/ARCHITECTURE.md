@@ -55,3 +55,12 @@ src/
 - 每个 PR 前：`cargo build` 和 `cargo test` 通过，`cargo clippy` 无新警告。
 - 工具链：stable-x86_64-pc-windows-gnu。
 - 内存目标：总常驻 < 40MB。别把所有立绘一次性解码，别把大文件读进内存转 base64。
+
+## 新互动（feat/interactions）
+- 行为：`behavior/play.rs`（`Play` 状态 + `impl Behavior` 钩子）。mod.rs 里只有几个钩子调用：`sync_play` / `on_play_timer` / `think_play` / `landed_play` / `maybe_checkin`。新功能尽量也照这个样子单独放文件。
+- 平台：`platform/perch.rs`（爬前台窗口：资格判断是纯函数）、`platform/toy.rs`（小道具分层窗口：小鱼干/罐头可拖，逗猫棒点穿跟随光标）。
+  滚轮 `WM_MOUSEWHEEL` → `MouseEv::Wheel`；`WinCmd::CursorPoll(ms)` 打开慢速 GetCursorPos 轮询（只在可见时，位置变了才发 `AppEvent::Cursor`）。
+  自测钩子：`PostMessage(hwnd, WM_APP+9, i, 0)` = 点 `DEBUG_MENU[i]`。
+- 天气：`services/weather.rs`，公开 `refresh(tx)`（后台拉 wttr.in，结果发 `AppEvent::Weather` 并缓存）、`latest() -> Option<WeatherInfo>`、`report_line(&w)`。
+- 存档新增字段（save.json，camelCase）：`checkinLast` `checkinStreak` `checkinTotal` `gameBest` `weatherReportLast`；未知字段照旧保留。
+- 菜单新增：扔小鱼干（feed）/ 直接喂（feednow）/ 逗猫棒（game）/ 签到（checkin）/ 天气播报（weather）/ 爬窗口（climb）。

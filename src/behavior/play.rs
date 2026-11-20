@@ -473,7 +473,8 @@ impl Behavior {
 
     // ------------------------------------------------------------ 滚轮
     pub(super) fn on_wheel(&mut self, delta: i32) {
-        if self.chatting || matches!(self.state, St::Drag | St::Fall) || self.play.game.is_some() { return; }
+        if self.chat_busy() || matches!(self.state, St::Drag | St::Fall) || self.play.game.is_some() { return; }
+        self.yield_chat();
         match self.play.wheel.on(self.now, delta) {
             WheelOut::None => {}
             WheelOut::Purr => {
@@ -508,6 +509,7 @@ impl Behavior {
     /// 菜单「喂小鱼干」：在她旁边扔一条，她会去追；也可以拖到她嘴边
     pub(super) fn toss_food(&mut self) {
         if self.play.game.is_some() { return; }
+        self.yield_chat();
         if self.play.food.is_some() {
             self.say(&pick(FOOD_BUSY), 2000);
             return;
@@ -889,7 +891,8 @@ impl Behavior {
 
     // ------------------------------------------------------------ 逗猫棒
     pub(super) fn start_game(&mut self) {
-        if self.play.game.is_some() || self.chatting || self.waiting { return; }
+        if self.play.game.is_some() || self.chat_busy() || self.waiting { return; }
+        self.yield_chat();
         if self.play.food.is_some() {
             self.say(&pick(GAME_BUSY), 2200);
             return;

@@ -611,7 +611,10 @@ fn do_quit() {
     }
 }
 
-/// 聊天框里按了 Esc
+/// 聊天输入框里有没有打了字（行为层用：空输入框遇到别的动作就顺手关掉，有字就留着）
+pub fn chat_has_text() -> bool { chat::has_text() }
+
+/// 聊天框里按了 Esc / 点了「×」
 pub(crate) fn chat_escape() {
     with(|s| {
         if let Some(c) = s.chat.as_mut() {

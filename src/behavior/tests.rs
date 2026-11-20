@@ -305,3 +305,46 @@ fn rubbing_head_counts_as_pat() {
     }
     assert_eq!(b.state, St::Shy);
 }
+
+#[test]
+fn empty_chat_box_yields_to_other_actions() {
+    let mut b = mk();
+    tick(&mut b, 3000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 3000);
+    assert!(b.chatting);
+    // 空输入框：喂食会顺手把框关掉
+    let out = ev(&mut b, AppEvent::Menu(MenuAction::Feed), 3500);
+    assert!(out.contains(&WinCmd::ChatInput(ChatInputCmd::Close)));
+    assert!(!b.chatting);
+    // 再开，空着时被拖起来也会关
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 9000);
+    ev(&mut b, AppEvent::Mouse(MouseEv::Down { button: Button::Left, x: 120.0, y: 250.0, sx: 500, sy: 500 }), 9100);
+    let out = ev(&mut b, AppEvent::Mouse(MouseEv::Move { x: 160.0, y: 250.0, sx: 540, sy: 500 }), 9150);
+    assert!(out.contains(&WinCmd::ChatInput(ChatInputCmd::Close)));
+    assert!(!b.chatting);
+}
+
+#[test]
+fn typed_chat_box_stays_and_blocks_autonomy() {
+    let mut b = mk();
+    tick(&mut b, 3000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 3000);
+    b.fake_chat_text = true;
+    // 打了字：喂食不关框
+    let out = ev(&mut b, AppEvent::Menu(MenuAction::Feed), 3500);
+    assert!(!out.contains(&WinCmd::ChatInput(ChatInputCmd::Close)));
+    assert!(b.chatting);
+    // 明确点「溜达」：照走，框留着（平台层让框跟着她）
+    let out = ev(&mut b, AppEvent::Menu(MenuAction::Walk), 8000);
+    assert!(out.iter().any(|c| matches!(c, WinCmd::Walk { .. })));
+    assert!(!out.contains(&WinCmd::ChatInput(ChatInputCmd::Close)));
+    assert!(b.chatting);
+    // 走完后不自己溜达/睡觉：很久之后还是不动
+    ev(&mut b, AppEvent::WalkDone { hit_edge: false }, 12_000);
+    for t in (12_000..200_000).step_by(1000) {
+        let (_, out) = tick(&mut b, t);
+        assert!(!out.iter().any(|c| matches!(c, WinCmd::Walk { .. })), "walked at {t}");
+    }
+    assert!(b.chatting);
+    assert_ne!(b.state, St::Sleep);
+}
