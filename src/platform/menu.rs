@@ -96,6 +96,8 @@ pub fn init() {
     }
     let _ = costume_sub.append(&sep());
     let _ = costume_sub.append(&item("outfit:clear", "摘掉配件"));
+    // 「🎭 角色」子菜单（角色包）追加在换装末尾
+    super::skin_menu::init(&costume_sub);
 
     let dance_sub = Submenu::new("💃 跳个舞", true);
     for s in &crate::behavior::dance::SCORES {
@@ -226,6 +228,7 @@ pub fn refresh() {
         }
     });
     super::memo_menu::refresh(POPUP_OPEN.with(|p| p.get()));
+    super::skin_menu::refresh(POPUP_OPEN.with(|p| p.get()));
 }
 
 /// 在光标处弹出右键菜单（模态，返回时点击已进队列）
@@ -245,6 +248,7 @@ pub fn popup() {
 /// 删除托盘图标（退出时）
 pub fn shutdown() {
     super::memo_menu::shutdown();
+    super::skin_menu::shutdown();
     MENUS.with(|m| {
         if let Ok(mut g) = m.try_borrow_mut() {
             *g = None;
@@ -306,6 +310,8 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
         _ => {
             if let Some(a) = super::memo_menu::parse(id) {
                 a
+            } else if let Some(a) = super::skin_menu::parse(id) {
+                a
             } else if let Some(m) = id.strip_prefix("pomo:") {
                 A::PomodoroStart(m.parse().ok()?)
             } else if let Some(d) = id.strip_prefix("dance:") {
@@ -350,5 +356,6 @@ mod tests {
         assert_eq!(parse_id("checkin", off), Some(A::CheckIn));
         assert_eq!(parse_id("weather", off), Some(A::WeatherReport));
         assert_eq!(parse_id("climb", off), Some(A::Climb));
+        assert_eq!(parse_id("skin:demo", off), Some(A::Costume("skin:demo".into())));
     }
 }

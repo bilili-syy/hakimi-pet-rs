@@ -11,6 +11,7 @@
 
 mod chat;
 mod memo_menu;
+mod skin_menu;
 mod menu;
 mod perch;
 mod sys;
@@ -603,6 +604,8 @@ fn after(a: MenuAction) {
         }
         MenuAction::Quit => do_quit(),
         MenuAction::Memo(crate::types::MemoAct::OpenFile) => open_path(&crate::core::memo::ensure_file()),
+        // 「🎭 角色」→「打开皮肤文件夹」（不存在先建）
+        MenuAction::Costume(c) if c == crate::core::skin::MENU_OPEN => open_path(&crate::core::skin::ensure_dir()),
         _ => {}
     }
     menu::refresh();
