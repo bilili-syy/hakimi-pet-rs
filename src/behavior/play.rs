@@ -164,8 +164,8 @@ pub fn gaze(dx: f32, dy: f32) -> (f32, f32) {
     if !(40.0..=400.0).contains(&d) { return (0.0, 0.0); }
     // 越近歪得越明显，但有上限
     let k = (dx / 400.0).clamp(-1.0, 1.0);
-    let lean = (k * 22.0).clamp(-9.0, 9.0);
-    let tilt = (k * 7.0).clamp(-3.0, 3.0);
+    let lean = (k * 30.0).clamp(-14.0, 14.0);
+    let tilt = (k * 9.0).clamp(-4.0, 4.0);
     (lean, tilt)
 }
 
@@ -606,7 +606,7 @@ impl Behavior {
     /// think() 开头调用；返回 true = 已经决定了下一步
     pub(super) fn think_play(&mut self) -> bool {
         if self.play.game.is_some() { return true; }
-        if self.play.food.as_ref().is_some_and(|f| f.phase == FoodPhase::Ground) {
+        if self.play.food.as_ref().is_some_and(|f| f.phase == FoodPhase::Ground || f.phase == FoodPhase::Chasing) {
             self.chase_food();
             return true;
         }
@@ -849,6 +849,15 @@ impl Behavior {
     }
 
     pub(super) fn do_checkin(&mut self, manual: bool) {
+        // 自动签到别打断正在追小鱼干/玩游戏/被拎着：过几秒再来
+        let busy = self.play.game.is_some()
+            || self.play.food.is_some()
+            || self.chatting
+            || matches!(self.state, St::Walk | St::Drag | St::Fall | St::Eat);
+        if !manual && busy {
+            self.play.checkin_at = Some(self.now + 4000);
+            return;
+        }
         let today = self.today();
         let before = self.stats.level().0;
         let Some(c) = self.stats.checkin(&today) else {
@@ -1001,9 +1010,9 @@ mod tests {
         assert_eq!(gaze(500.0, 0.0), (0.0, 0.0));
         assert_eq!(gaze(10.0, 10.0), (0.0, 0.0));
         let (l, t) = gaze(200.0, -50.0);
-        assert!(l > 0.0 && l <= 9.0 && t > 0.0 && t <= 3.0);
+        assert!(l > 0.0 && l <= 14.0 && t > 0.0 && t <= 4.0);
         let (l, _) = gaze(-390.0, 0.0);
-        assert_eq!(l, -9.0);
+        assert_eq!(l, -14.0);
     }
 
     #[test]

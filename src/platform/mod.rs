@@ -46,6 +46,9 @@ pub(crate) const WM_APP_EVENT: u32 = WM_APP + 1;
 pub(crate) const WM_APP_MENU: u32 = WM_APP + 2;
 pub(crate) const WM_APP_SECOND: u32 = WM_APP + 3;
 const WM_APP_DPI: u32 = WM_APP + 4;
+/// 自动化/自测用：PostMessage(hwnd, WM_APP+9, i, 0) 等于点了 DEBUG_MENU[i] 那个菜单项
+const WM_APP_DEBUG_MENU: u32 = WM_APP + 9;
+const DEBUG_MENU: [&str; 9] = ["feed", "feednow", "game", "climb", "weather", "checkin", "status", "walk", "pat"];
 const TIMER_ID: usize = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// 溜达/下落的物理步长（原版 setInterval 16）
@@ -1184,6 +1187,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                 }
                 pump();
+                LRESULT(0)
+            }
+            WM_APP_DEBUG_MENU => {
+                if let Some(a) = DEBUG_MENU.get(wp.0).and_then(|id| menu::parse_id(id, |_| false)) {
+                    on_menu(a);
+                    pump();
+                }
                 LRESULT(0)
             }
             WM_APP_SECOND => {

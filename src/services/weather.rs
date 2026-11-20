@@ -96,7 +96,12 @@ pub fn parse(body: &str) -> Option<WeatherInfo> {
     let cur = v.get("current_condition")?.get(0)?;
     let temp = num(cur.get("temp_C")?)? as f32;
     let code = num(cur.get("weatherCode")?)? as u32;
-    let desc = cur.get("lang_zh").and_then(first_value).or_else(|| cur.get("weatherDesc").and_then(first_value)).unwrap_or_default();
+    // 只要中文描述；没有中文（wttr 有时只给英文）就留空，播报时用天气大类的中文名
+    let desc = ["lang_zh", "lang_zh-cn"]
+        .iter()
+        .find_map(|k| cur.get(*k).and_then(first_value))
+        .filter(|d| !d.is_ascii())
+        .unwrap_or_default();
     let city = v
         .get("nearest_area")
         .and_then(|a| a.get(0))
@@ -173,7 +178,7 @@ mod tests {
     fn report() {
         let l = report_line(&parse(BODY).unwrap());
         assert_eq!(l, "Shanghai现在小雨，12°C，今天 9~15°C，降雨概率 85%。出门记得带伞喵！");
-        let w = parse(r#"{"current_condition":[{"temp_C":"20","weatherCode":"113","lang_zh":[{"value":""}]}]}"#).unwrap();
+        let w = parse(r#"{"current_condition":[{"temp_C":"20","weatherCode":"113","weatherDesc":[{"value":"Sunny"}]}]}"#).unwrap();
         assert_eq!(report_line(&w), "现在晴，20°C。哈基米播报完毕喵～");
     }
 }
