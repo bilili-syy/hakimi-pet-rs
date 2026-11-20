@@ -95,3 +95,8 @@ src/
 - 天气：`services/weather.rs`，公开 `refresh(tx)`（后台拉 wttr.in，结果发 `AppEvent::Weather` 并缓存）、`latest() -> Option<WeatherInfo>`、`report_line(&w)`。
 - 存档新增字段（save.json，camelCase）：`checkinLast` `checkinStreak` `checkinTotal` `gameBest` `weatherReportLast`；未知字段照旧保留。
 - 菜单新增：扔小鱼干（feed）/ 直接喂（feednow）/ 逗猫棒（game）/ 签到（checkin）/ 天气播报（weather）/ 爬窗口（climb）。
+
+## 换装（feat/outfits）
+- 清单在 `core/costume.rs` 的 `COSTUMES`（菜单顺序、文字）；加一套衣服 = 放 `assets/outfits/<id>/` 8 张（idle/happy/drag/sit/sleep/eat/think/hungry，400×587）+ 加一行。
+- 默认是奶白水手服 `sailor`：config.json 里写 `""`（和 Electron 版互通，老配置的 `""` 也就换成了新默认）；原装卫衣是 `hoodie`。
+- 水手服走分层：`outfits/sailor/layered/{idle,blink,walk1,walk2,happy,eat,hungry}.png` + 原来的 tail/star 层；drag/sit/sleep/think 单张，其余表情按 `costume_alias` 回落。

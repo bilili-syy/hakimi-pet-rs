@@ -263,7 +263,7 @@ impl Behavior {
 
     /// 不读磁盘的构造（测试和 new 共用）
     pub fn with(tx: EventSender, stats: Stats, saved_existed: bool, away_min: f64, costume: String, outfits: Vec<String>, io: bool) -> Self {
-        let costume = if ["xmas", "maid", "jk"].contains(&costume.as_str()) { costume } else { String::new() };
+        let costume = crate::core::costume::normalize(&costume).to_string();
         let mut b = Self {
             tx,
             scene: Scene::default(),
@@ -1140,9 +1140,9 @@ impl Behavior {
             MenuAction::Status => self.show_status(),
             MenuAction::Chat => self.open_chat(),
             MenuAction::Costume(id) => {
-                let id = if ["xmas", "maid", "jk"].contains(&id.as_str()) { id } else { String::new() };
+                let id = crate::core::costume::normalize(&id).to_string();
                 if id == self.costume { return; }
-                if self.io { let v = id.clone(); crate::core::config::update(|c| c.costume = v); }
+                if self.io { let v = crate::core::costume::config_value(&id); crate::core::config::update(|c| c.costume = v); }
                 self.costume = id;
                 self.outfit_changed(true, false);
             }
@@ -1161,7 +1161,7 @@ impl Behavior {
                 } else {
                     (self.costume.clone(), self.outfits.clone())
                 };
-                self.costume = if ["xmas", "maid", "jk"].contains(&c.as_str()) { c } else { String::new() };
+                self.costume = crate::core::costume::normalize(&c).to_string();
                 self.outfits = o;
                 self.say(&pick(lines::RELOADED), 2600);
             }

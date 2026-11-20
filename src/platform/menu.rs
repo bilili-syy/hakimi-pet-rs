@@ -15,8 +15,7 @@ use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, KillTimer, PostMessageW, SetTimer};
 
-pub const COSTUMES: [(&str, &str); 4] =
-    [("", "🤍 原装卫衣"), ("xmas", "🎄 圣诞小红裙"), ("maid", "🎀 女仆装"), ("jk", "🏫 JK 水手服")];
+use crate::core::costume::COSTUMES;
 pub const OUTFITS: [(&str, &str); 3] = [("santa", "🎅 圣诞帽"), ("glasses", "👓 圆眼镜"), ("scarf", "🧣 四色围巾")];
 /// 托盘左键单击的伪菜单 id
 pub const TRAY_LEFT: &str = "tray:left";
@@ -74,7 +73,12 @@ const TOOLS: &[Node] = &[
     Item("weather", "🌦️ 天气播报"),
 ];
 const COSTUME: &[Node] = &[
-    Check("costume:", "🤍 原装卫衣"),
+    // 和 core::costume::COSTUMES 一一对应（table_integrity 会检查）
+    Check("costume:sailor", "🌈 奶白水手服（默认）"),
+    Check("costume:hoodie", "🤍 原装卫衣"),
+    Check("costume:pajama", "🌙 猫耳睡衣"),
+    Check("costume:idol", "🎤 偶像演出服"),
+    Check("costume:swim", "🏖️ 泳装"),
     Check("costume:xmas", "🎄 圣诞小红裙"),
     Check("costume:maid", "🎀 女仆装"),
     Check("costume:jk", "🏫 JK 水手服"),
@@ -114,8 +118,7 @@ pub struct Ctx {
 /// 勾选项现在该不该勾
 pub fn checked(id: &str, c: &Ctx) -> bool {
     if let Some(k) = id.strip_prefix("costume:") {
-        let cur = if COSTUMES.iter().any(|(i, _)| *i == c.costume) { c.costume.as_str() } else { "" };
-        return k == cur;
+        return crate::core::costume::normalize(k) == crate::core::costume::normalize(&c.costume);
     }
     if let Some(o) = id.strip_prefix("outfit:") {
         return c.outfits.iter().any(|x| x == o);
@@ -558,6 +561,11 @@ mod tests {
         assert!(!checked("outfit:scarf", &c));
         c.costume = "bogus".into();
         assert!(checked("costume:", &c));
+        // 老配置的 "" = 默认水手服；卫衣要单独选
+        c.costume = String::new();
+        assert!(checked("costume:sailor", &c) && !checked("costume:hoodie", &c));
+        c.costume = "hoodie".into();
+        assert!(checked("costume:hoodie", &c) && !checked("costume:sailor", &c));
         assert_eq!(label("visible", &c).unwrap(), "🙈 先藏起来");
         assert!(enabled("pomo:25", &c) && !enabled("pomo:stop", &c));
         c.pomo_left = Some(12);

@@ -233,7 +233,11 @@ fn costume_and_outfits_change_scene() {
     ev(&mut b, AppEvent::Menu(MenuAction::ClearOutfit), 3400);
     assert!(b.scene.outfits.is_empty());
     ev(&mut b, AppEvent::Menu(MenuAction::Costume("bogus".into())), 3500);
-    assert_eq!(b.scene.costume, "");
+    assert_eq!(b.scene.costume, "sailor");
+    ev(&mut b, AppEvent::Menu(MenuAction::Costume("hoodie".into())), 6500);
+    assert_eq!(b.scene.costume, "hoodie");
+    ev(&mut b, AppEvent::Menu(MenuAction::Costume("swim".into())), 9500);
+    assert_eq!(b.scene.costume, "swim");
 }
 
 #[test]

@@ -138,7 +138,11 @@ pub fn costume_line(c: &str) -> &'static [&'static str] {
         "xmas" => &["圣诞快乐喵！哈基米是今年最可爱的圣诞礼物～", "穿上小红裙啦，铃铛叮叮当～"],
         "maid" => &["欢迎回来，主人喵～", "女仆哈基米为您服务！要喝茶还是要小鱼干喵？"],
         "jk" => &["今天也要好好上学喵！", "水手服！哈基米是不是很像优等生～"],
-        _ => &["换回卫衣啦，还是这件最舒服喵", "原装哈基米回来了！"],
+        "hoodie" => &["换回卫衣啦，还是这件最舒服喵", "原装哈基米回来了！"],
+        "pajama" => &["换上睡衣啦……哈基米要变成懒猫了喵～", "软乎乎的猫耳睡衣！想钻被窝喵"],
+        "idol" => &["偶像哈基米登场！今天的应援色是彩虹喵～", "大家好～我是哈基米！要给我打 call 哦喵"],
+        "swim" => &["夏天到啦！带着游泳圈去玩水喵～", "泳装哈基米！虽然……其实有点怕水喵"],
+        _ => &["换上水手服啦，彩虹领结是不是很好看喵～", "奶白水手服！哈基米今天也很精神～"],
     }
 }
 
@@ -168,7 +172,7 @@ pub fn prewarm_items() -> Vec<(String, Option<VoiceMood>)> {
     for (arr, m) in PREWARM {
         for t in arr.iter() { v.push((t.to_string(), Some(*m))); }
     }
-    for c in ["xmas", "maid", "jk", ""] {
+    for (c, _) in crate::core::costume::COSTUMES {
         for t in costume_line(c) { v.push((t.to_string(), Some(VoiceMood::Happy))); }
     }
     v.truncate(300);
