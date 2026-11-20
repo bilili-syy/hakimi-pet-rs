@@ -76,7 +76,7 @@ pub struct StatusView {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scene {
     pub face: Face,
-    /// "" / xmas / maid / jk
+    /// core::costume 的 id（"" / "hoodie" = 原装卫衣立绘，"sailor" = 默认水手服）
     pub costume: String,
     /// santa / glasses / scarf（按配置里的顺序叠）
     pub outfits: Vec<String>,
