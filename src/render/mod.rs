@@ -2,6 +2,7 @@
 //! tiny-skia 软渲染：立绘 + 尾巴/星星分层动画 + 换装 + 特效 + 气泡 + 状态卡 + zzZ
 //! 布局全部按原版 index.html/style.css 的逻辑像素（240×360）算，再整体乘 DPI 缩放。
 pub mod anim;
+pub mod dance;
 pub mod shapes;
 pub mod sprites;
 pub mod text;
