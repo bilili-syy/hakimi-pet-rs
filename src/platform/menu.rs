@@ -1,33 +1,200 @@
-//! 托盘图标 + 右键菜单（右键 & 托盘共用一份菜单，和 main.js menuTemplate 一致）。
+//! 托盘图标 + 右键菜单（右键 & 托盘共用一份菜单）。
+//!
+//! 菜单结构全在下面的 `MENU` 表里（数据驱动）：顶层只放常用的几项，其余按用途分组成子菜单。
+//! 以后加功能：在对应分组里加一行 `Item("id", "文字")`，再在 `parse_id` 里把 id 映射成 MenuAction。
+//! 勾选状态 / 动态文字 / 能不能点，由 `checked` / `label` / `enabled` 三个纯函数按当前状态给出（可测试）。
+//! 原来菜单里的那些配置开关（出声、只念聊天、摸鱼监督、开机自启…）都搬进了设置窗口（platform/settings.rs）。
+//!
 //! 菜单对象只在 UI 线程（thread_local）；点击经 MenuEvent 回调放进队列再 PostMessage 给主窗口。
 use super::{MENU_QUEUE, POMO_END, WM_APP_MENU, main_hwnd, now_ms, timers};
 use crate::types::MenuAction;
 use std::cell::{Cell, RefCell};
-use tray_icon::menu::{CheckMenuItem, ContextMenu, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{CheckMenuItem, ContextMenu, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, PostMessageW};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, KillTimer, PostMessageW, SetTimer};
 
 pub const COSTUMES: [(&str, &str); 4] =
     [("", "🤍 原装卫衣"), ("xmas", "🎄 圣诞小红裙"), ("maid", "🎀 女仆装"), ("jk", "🏫 JK 水手服")];
 pub const OUTFITS: [(&str, &str); 3] = [("santa", "🎅 圣诞帽"), ("glasses", "👓 圆眼镜"), ("scarf", "🧣 四色围巾")];
-/// 番茄钟项在顶层菜单里的位置
-const POMO_POS: usize = 15;
 /// 托盘左键单击的伪菜单 id
 pub const TRAY_LEFT: &str = "tray:left";
+/// 托盘左键单击要等双击时间过了才算（双击 = 打开设置），用主窗口上的这个定时器
+pub(crate) const TRAY_CLICK_TIMER: usize = 7;
+
+// ================================================================ 菜单表
+
+/// 菜单表的一行
+pub enum Node {
+    /// 普通项 (id, 文字)
+    Item(&'static str, &'static str),
+    /// 勾选项 (id, 文字)，勾没勾由 `checked` 决定
+    Check(&'static str, &'static str),
+    Sep,
+    /// 子菜单 (文字, 内容)
+    Sub(&'static str, &'static [Node]),
+    /// 运行时生成的子菜单："dance"（舞谱表）/ "memo"（备忘录，平台层 memo_menu 管）
+    Gen(&'static str),
+}
+use Node::{Check, Gen, Item, Sep, Sub};
+
+const FEED: &[Node] = &[
+    Item("feed", "🐟 扔小鱼干（拖到她嘴边也行）"),
+    Item("feednow", "🍽️ 直接喂到嘴里"),
+    Item("honey", "🍯 喂蜂蜜水（喝完跑得飞快）"),
+];
+const PLAY: &[Node] = &[
+    Item("pat", "✋ 摸摸头（滚轮也能撸）"),
+    Item("climb", "🧗 爬到当前窗口上"),
+    Item("walk", "🚶 去溜达"),
+    Item("sleep", "💤 去睡觉"),
+    Sep,
+    Item("center", "📍 叫她到屏幕中间"),
+];
+const FUN: &[Node] = &[
+    Gen("dance"),
+    Item("song", "🎵 哈基米之歌"),
+    Item("game", "🪶 小游戏：逗猫棒"),
+    Sep,
+    Item("songdir", "📂 放歌的文件夹（把歌拖进去）"),
+];
+pub const POMO_TITLE: &str = "🍅 番茄钟";
+const POMO: &[Node] = &[
+    Item("pomo:25", "25 分钟"),
+    Item("pomo:45", "45 分钟"),
+    Item("pomo:15", "15 分钟"),
+    Sep,
+    Item("pomo:stop", "结束番茄钟"),
+];
+const TOOLS: &[Node] = &[
+    Gen("memo"),
+    Sub(POMO_TITLE, POMO),
+    Item("checkin", "📅 今日签到"),
+    Item("weather", "🌦️ 天气播报"),
+];
+const COSTUME: &[Node] = &[
+    Check("costume:", "🤍 原装卫衣"),
+    Check("costume:xmas", "🎄 圣诞小红裙"),
+    Check("costume:maid", "🎀 女仆装"),
+    Check("costume:jk", "🏫 JK 水手服"),
+    Sep,
+    Check("outfit:santa", "🎅 圣诞帽"),
+    Check("outfit:glasses", "👓 圆眼镜"),
+    Check("outfit:scarf", "🧣 四色围巾"),
+    Sep,
+    Item("outfit:clear", "摘掉配件"),
+];
+
+/// 整个右键 / 托盘菜单
+pub const MENU: &[Node] = &[
+    Item("chat", "💬 和哈基米聊天"),
+    Sub("🍽️ 喂养", FEED),
+    Sub("🤲 互动", PLAY),
+    Sub("🎮 娱乐", FUN),
+    Sub("🧰 工具", TOOLS),
+    Sub("👗 换装", COSTUME),
+    Item("status", "📊 看看状态"),
+    Sep,
+    Item("settings", "⚙️ 设置…"),
+    Item("visible", "🙈 先藏起来"),
+    Item("quit", "退出"),
+];
+
+/// 菜单上看得到的动态状态
+#[derive(Clone, Debug, Default)]
+pub struct Ctx {
+    pub costume: String,
+    pub outfits: Vec<String>,
+    pub visible: bool,
+    /// 番茄钟还剩几分钟（没开 = None）
+    pub pomo_left: Option<u32>,
+}
+
+/// 勾选项现在该不该勾
+pub fn checked(id: &str, c: &Ctx) -> bool {
+    if let Some(k) = id.strip_prefix("costume:") {
+        let cur = if COSTUMES.iter().any(|(i, _)| *i == c.costume) { c.costume.as_str() } else { "" };
+        return k == cur;
+    }
+    if let Some(o) = id.strip_prefix("outfit:") {
+        return c.outfits.iter().any(|x| x == o);
+    }
+    false
+}
+
+/// 要换文字的项（None = 用表里的）
+pub fn label(id: &str, c: &Ctx) -> Option<String> {
+    match id {
+        "visible" => Some(if c.visible { "🙈 先藏起来" } else { "👀 叫她出来" }.into()),
+        "pomo:stop" => Some(match c.pomo_left {
+            Some(m) => format!("结束番茄钟（还剩 {m} 分钟）"),
+            None => "结束番茄钟".into(),
+        }),
+        POMO_TITLE => Some(match c.pomo_left {
+            Some(m) => format!("🍅 番茄钟（还剩 {m} 分钟）"),
+            None => POMO_TITLE.into(),
+        }),
+        _ => None,
+    }
+}
+
+/// 能不能点（番茄钟开着时只能结束，没开时只能开始）
+pub fn enabled(id: &str, c: &Ctx) -> bool {
+    if id == "pomo:stop" {
+        return c.pomo_left.is_some();
+    }
+    if id.starts_with("pomo:") {
+        return c.pomo_left.is_none();
+    }
+    true
+}
+
+/// 运行时生成的子菜单里的 (id, 文字)
+fn gen_items(kind: &str) -> (String, Vec<(String, String)>) {
+    match kind {
+        "dance" => {
+            let mut v: Vec<(String, String)> = crate::behavior::dance::SCORES
+                .iter()
+                .map(|s| (format!("dance:{}", s.id), format!("{} {}（{} 秒）", s.icon, s.name, s.secs as u32)))
+                .collect();
+            v.push((String::new(), String::new())); // 分隔线
+            v.push(("dance:".into(), "🎲 随便跳一支".into()));
+            ("💃 跳个舞".into(), v)
+        }
+        _ => (String::new(), Vec::new()),
+    }
+}
+
+/// 表里所有能点的 id（含运行时生成的舞谱项；备忘录条目是动态的，不在内）
+pub fn all_ids() -> Vec<String> {
+    fn walk(nodes: &[Node], out: &mut Vec<String>) {
+        for n in nodes {
+            match n {
+                Item(id, _) | Check(id, _) => out.push(id.to_string()),
+                Sub(_, kids) => walk(kids, out),
+                Gen(k) => out.extend(gen_items(k).1.into_iter().map(|x| x.0).filter(|id| !id.is_empty())),
+                Sep => {}
+            }
+        }
+    }
+    let mut v = Vec::new();
+    walk(MENU, &mut v);
+    v
+}
+
+// ================================================================ 建菜单 / 刷新
+
+enum Handle {
+    Item(MenuItem),
+    Check(CheckMenuItem),
+    Sub(Submenu),
+}
 
 struct Menus {
     root: Menu,
-    pomo_sub: Submenu,
-    pomo_stop: MenuItem,
-    pomo_running_shown: bool,
-    costumes: Vec<(&'static str, CheckMenuItem)>,
-    outfits: Vec<(&'static str, CheckMenuItem)>,
-    tts: CheckMenuItem,
-    tts_chat: CheckMenuItem,
-    moyu: CheckMenuItem,
-    autostart: CheckMenuItem,
-    visible: MenuItem,
+    /// (id 或子菜单标题, 句柄)
+    items: Vec<(String, Handle)>,
     tray: Option<TrayIcon>,
 }
 
@@ -37,7 +204,7 @@ thread_local! {
     static POPUP_OPEN: Cell<bool> = const { Cell::new(false) };
 }
 
-fn push_id(id: String) {
+pub(crate) fn push_id(id: String) {
     MENU_QUEUE.lock().unwrap().push_back(id);
     if let Some(h) = main_hwnd() {
         unsafe {
@@ -58,102 +225,97 @@ fn tray_icon() -> Option<Icon> {
     Icon::from_rgba(rgba, pm.width(), pm.height()).ok()
 }
 
+/// 往 Menu 或 Submenu 里加一项
+trait Container {
+    fn add(&self, item: &dyn IsMenuItem);
+}
+impl Container for Menu {
+    fn add(&self, item: &dyn IsMenuItem) {
+        let _ = self.append(item);
+    }
+}
+impl Container for Submenu {
+    fn add(&self, item: &dyn IsMenuItem) {
+        let _ = self.append(item);
+    }
+}
+
+fn build(nodes: &[Node], into: &dyn Container, items: &mut Vec<(String, Handle)>) {
+    for n in nodes {
+        match n {
+            Item(id, text) => {
+                let it = MenuItem::with_id(*id, *text, true, None);
+                into.add(&it);
+                items.push((id.to_string(), Handle::Item(it)));
+            }
+            Check(id, text) => {
+                let it = CheckMenuItem::with_id(*id, *text, true, false, None);
+                into.add(&it);
+                items.push((id.to_string(), Handle::Check(it)));
+            }
+            Sep => into.add(&PredefinedMenuItem::separator()),
+            Sub(title, kids) => {
+                let s = Submenu::new(*title, true);
+                build(kids, &s, items);
+                into.add(&s);
+                items.push((title.to_string(), Handle::Sub(s)));
+            }
+            Gen("memo") => into.add(&super::memo_menu::init()),
+            Gen(kind) => {
+                let (title, list) = gen_items(kind);
+                let s = Submenu::new(title, true);
+                for (id, text) in list {
+                    if id.is_empty() {
+                        let _ = s.append(&PredefinedMenuItem::separator());
+                    } else {
+                        let it = MenuItem::with_id(id.clone(), text, true, None);
+                        let _ = s.append(&it);
+                        items.push((id, Handle::Item(it)));
+                    }
+                }
+                into.add(&s);
+            }
+        }
+    }
+}
+
 /// 建菜单和托盘。必须在 UI 线程、主窗口建好之后调用
 pub fn init() {
     MenuEvent::set_event_handler(Some(|e: MenuEvent| push_id(e.id.0)));
-    TrayIconEvent::set_event_handler(Some(|e: TrayIconEvent| {
-        if let TrayIconEvent::Click { button, button_state, .. } = e {
-            match (button, button_state) {
-                // 左键单击托盘：藏起来 / 叫出来
-                (MouseButton::Left, MouseButtonState::Up) => push_id(TRAY_LEFT.into()),
-                // 右键按下：菜单马上要弹出来了，先同步勾选状态（回调就在 UI 线程上）
-                (MouseButton::Right, MouseButtonState::Down) => refresh(),
-                _ => {}
+    TrayIconEvent::set_event_handler(Some(|e: TrayIconEvent| match e {
+        TrayIconEvent::Click { button, button_state, .. } => match (button, button_state) {
+            // 左键单击托盘：藏起来 / 叫出来。等双击时间过了才执行，免得双击时先藏再出
+            (MouseButton::Left, MouseButtonState::Up) => {
+                if let Some(h) = main_hwnd() {
+                    unsafe {
+                        SetTimer(Some(h), TRAY_CLICK_TIMER, GetDoubleClickTime(), None);
+                    }
+                }
             }
+            // 右键按下：菜单马上要弹出来了，先同步勾选状态（回调就在 UI 线程上）
+            (MouseButton::Right, MouseButtonState::Down) => refresh(),
+            _ => {}
+        },
+        // 双击托盘 = 打开设置
+        TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
+            if let Some(h) = main_hwnd() {
+                unsafe {
+                    let _ = KillTimer(Some(h), TRAY_CLICK_TIMER);
+                }
+            }
+            push_id("settings".into());
         }
+        _ => {}
     }));
 
-    let item = |id: &str, text: &str| MenuItem::with_id(id, text, true, None);
-    let check = |id: &str, text: &str| CheckMenuItem::with_id(id, text, true, false, None);
-    let sep = PredefinedMenuItem::separator;
-
     let root = Menu::new();
-    let pomo_sub = Submenu::new("🍅 番茄钟", true);
-    for m in [25, 45, 15] {
-        let _ = pomo_sub.append(&item(&format!("pomo:{m}"), &format!("{m} 分钟")));
-    }
-    let pomo_stop = item("pomo:stop", "🍅 结束番茄钟");
-
-    let costume_sub = Submenu::new("👗 换装", true);
-    let costumes: Vec<_> = COSTUMES.iter().map(|(id, name)| (*id, check(&format!("costume:{id}"), name))).collect();
-    let outfits: Vec<_> = OUTFITS.iter().map(|(id, name)| (*id, check(&format!("outfit:{id}"), name))).collect();
-    for (_, c) in &costumes {
-        let _ = costume_sub.append(c);
-    }
-    let _ = costume_sub.append(&sep());
-    for (_, c) in &outfits {
-        let _ = costume_sub.append(c);
-    }
-    let _ = costume_sub.append(&sep());
-    let _ = costume_sub.append(&item("outfit:clear", "摘掉配件"));
-
-    let dance_sub = Submenu::new("💃 跳个舞", true);
-    for s in &crate::behavior::dance::SCORES {
-        let _ = dance_sub.append(&item(&format!("dance:{}", s.id), &format!("{} {}（{} 秒）", s.icon, s.name, s.secs as u32)));
-    }
-    let _ = dance_sub.append(&sep());
-    let _ = dance_sub.append(&item("dance:", "🎲 随便跳一支"));
-
-    let tts = check("tts", "🔊 让哈基米出声");
-    let tts_chat = check("ttschat", "🎙️ 只念聊天回复");
-    let moyu = check("moyu", "👀 摸鱼监督");
-    let autostart = check("autostart", "开机自动启动");
-    let settings = Submenu::new("⚙️ 设置", true);
-    let _ = settings.append_items(&[
-        &item("settings:open", "打开设置文件（API Key、语音、提醒）"),
-        &item("settings:reload", "重新加载设置"),
-        &tts,
-        &tts_chat,
-        &moyu,
-        &item("forget", "忘掉聊天记录"),
-        &item("datadir", "打开数据文件夹"),
-        &sep(),
-        &autostart,
-    ]);
-    let visible = item("visible", "🙈 先藏起来");
-
-    let _ = root.append_items(&[
-        &item("chat", "💬 和哈基米聊天"),
-        &item("feed", "🐟 扔小鱼干（拖到她嘴边也行）"),
-        &item("feednow", "🍽️ 直接喂到嘴里"),
-        &item("pat", "✋ 摸摸头（滚轮也能撸）"),
-        &item("honey", "🍯 喂蜂蜜水（喝完跑得飞快）"),
-        &item("game", "🪶 小游戏：逗猫棒"),
-        &item("song", "🎵 哈基米之歌"),
-        &item("songdir", "📂 放歌的文件夹（把歌拖进去）"),
-        &item("status", "📊 看看状态"),
-        &item("checkin", "📅 今日签到"),
-        &item("weather", "🌦️ 天气播报"),
-        &sep(),
-        &item("sleep", "💤 去睡觉"),
-        &item("walk", "🚶 去溜达"),
-        &item("climb", "🧗 爬到当前窗口上"),
-        &pomo_sub, // POMO_POS
-        &costume_sub,
-        &dance_sub,
-        &sep(),
-        &settings,
-        &visible,
-        &item("center", "📍 叫她到屏幕中间"),
-        &item("quit", "退出"),
-    ]);
-    // 「📝 备忘录」子菜单插在换装后面
-    super::memo_menu::init(&root, costume_sub.id());
+    let mut items = Vec::new();
+    build(MENU, &root, &mut items);
 
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(root.clone()))
         .with_menu_on_left_click(false)
-        .with_tooltip("哈基米");
+        .with_tooltip("哈基米（双击打开设置）");
     if let Some(icon) = tray_icon() {
         builder = builder.with_icon(icon);
     }
@@ -165,64 +327,55 @@ pub fn init() {
         }
     };
 
-    MENUS.with(|m| {
-        *m.borrow_mut() = Some(Menus {
-            root,
-            pomo_sub,
-            pomo_stop,
-            pomo_running_shown: false,
-            costumes,
-            outfits,
-            tts,
-            tts_chat,
-            moyu,
-            autostart,
-            visible,
-            tray,
-        })
-    });
+    MENUS.with(|m| *m.borrow_mut() = Some(Menus { root, items, tray }));
     refresh();
 }
 
-/// 按当前配置/状态同步勾选、文字、番茄钟项、托盘提示
-pub fn refresh() {
-    let cfg = crate::core::config::get();
-    let visible = main_hwnd().is_some_and(|h| unsafe { IsWindowVisible(h).as_bool() });
-    let pomo_end = POMO_END.load(std::sync::atomic::Ordering::Relaxed);
-    let autostart = super::sys::is_autostart();
-    MENUS.with(|m| {
-        let Ok(mut guard) = m.try_borrow_mut() else { return };
-        let Some(m) = guard.as_mut() else { return };
-        let costume = if COSTUMES.iter().any(|(id, _)| *id == cfg.costume) { cfg.costume.as_str() } else { "" };
-        for (id, c) in &m.costumes {
-            c.set_checked(*id == costume);
+/// 托盘单击的定时器到了（主窗口 WM_TIMER 调）
+pub(crate) fn tray_click_timer() {
+    if let Some(h) = main_hwnd() {
+        unsafe {
+            let _ = KillTimer(Some(h), TRAY_CLICK_TIMER);
         }
-        for (id, c) in &m.outfits {
-            c.set_checked(cfg.outfit.iter().any(|o| o == id));
-        }
-        m.tts.set_checked(cfg.tts.enabled);
-        m.tts_chat.set_checked(cfg.tts.speak == "chat");
-        m.moyu.set_checked(cfg.moyu.enabled);
-        m.autostart.set_checked(autostart);
-        m.visible.set_text(if visible { "🙈 先藏起来" } else { "👀 叫她出来" });
+    }
+    push_id(TRAY_LEFT.into());
+}
 
-        let running = pomo_end != 0;
-        if running {
-            let left = timers::minutes_left(pomo_end, now_ms());
-            m.pomo_stop.set_text(format!("🍅 结束番茄钟（还剩 {left} 分钟）"));
-        }
-        if running != m.pomo_running_shown && !POPUP_OPEN.with(|p| p.get()) {
-            if running {
-                let _ = m.root.remove(&m.pomo_sub);
-                let _ = m.root.insert(&m.pomo_stop, POMO_POS);
-            } else {
-                let _ = m.root.remove(&m.pomo_stop);
-                let _ = m.root.insert(&m.pomo_sub, POMO_POS);
+fn ctx_now() -> Ctx {
+    let cfg = crate::core::config::get();
+    let pomo_end = POMO_END.load(std::sync::atomic::Ordering::Relaxed);
+    Ctx {
+        costume: cfg.costume,
+        outfits: cfg.outfit,
+        visible: main_hwnd().is_some_and(|h| unsafe { IsWindowVisible(h).as_bool() }),
+        pomo_left: (pomo_end != 0).then(|| timers::minutes_left(pomo_end, now_ms())),
+    }
+}
+
+/// 按当前配置/状态同步勾选、文字、能不能点、托盘提示
+pub fn refresh() {
+    let c = ctx_now();
+    MENUS.with(|m| {
+        let Ok(guard) = m.try_borrow() else { return };
+        let Some(m) = guard.as_ref() else { return };
+        for (id, h) in &m.items {
+            match h {
+                Handle::Check(it) => it.set_checked(checked(id, &c)),
+                Handle::Item(it) => {
+                    if let Some(t) = label(id, &c) {
+                        it.set_text(t);
+                    }
+                    it.set_enabled(enabled(id, &c));
+                }
+                Handle::Sub(s) => {
+                    if let Some(t) = label(id, &c) {
+                        s.set_text(t);
+                    }
+                }
             }
-            m.pomo_running_shown = running;
         }
         if let Some(t) = &m.tray {
-            let _ = t.set_tooltip(Some(if running { "哈基米 · 番茄钟进行中" } else { "哈基米" }));
+            let _ = t.set_tooltip(Some(if c.pomo_left.is_some() { "哈基米 · 番茄钟进行中" } else { "哈基米（双击打开设置）" }));
         }
     });
     super::memo_menu::refresh(POPUP_OPEN.with(|p| p.get()));
@@ -254,25 +407,24 @@ pub fn shutdown() {
 
 /// 菜单 id → MenuAction。checked = 勾选项点击后的新状态（muda 已经自己翻转过）
 pub fn action_for(id: &str) -> Option<MenuAction> {
-    let checked = |f: fn(&Menus) -> &CheckMenuItem| {
-        MENUS.with(|m| m.borrow().as_ref().map(|m| f(m).is_checked())).unwrap_or(false)
+    let now_checked = |id: &str| {
+        MENUS
+            .with(|m| {
+                m.borrow().as_ref().and_then(|m| {
+                    m.items.iter().find(|(i, _)| i == id).and_then(|(_, h)| match h {
+                        Handle::Check(c) => Some(c.is_checked()),
+                        _ => None,
+                    })
+                })
+            })
+            .unwrap_or(false)
     };
-    let outfit_checked = |oid: &str| {
-        MENUS.with(|m| {
-            m.borrow().as_ref().and_then(|m| m.outfits.iter().find(|(i, _)| *i == oid).map(|(_, c)| c.is_checked()))
-        })
-        .unwrap_or(false)
-    };
-    parse_id(id, |name| match name {
-        "tts" => checked(|m| &m.tts),
-        "ttschat" => checked(|m| &m.tts_chat),
-        "moyu" => checked(|m| &m.moyu),
-        "autostart" => checked(|m| &m.autostart),
-        other => other.strip_prefix("outfit:").is_some_and(outfit_checked),
-    })
+    parse_id(id, now_checked)
 }
 
-/// 纯映射（可测试）。checked(id) 给出勾选项的新状态
+/// 纯映射（可测试）。checked(id) 给出勾选项的新状态。
+/// 除了菜单表里的 id，还认设置窗口按钮用的几个（settings:file / settings:reload / forget / datadir）
+/// 和老的开关 id（tts / ttschat / moyu / autostart，菜单里已经没有了，留着兼容）。
 pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> {
     use MenuAction as A;
     Some(match id {
@@ -292,7 +444,8 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
         "walk" => A::Walk,
         "pomo:stop" => A::PomodoroStop,
         "outfit:clear" => A::ClearOutfit,
-        "settings:open" => A::OpenSettings,
+        "settings" | "settings:open" => A::OpenSettings,
+        "settings:file" => A::OpenConfigFile,
         "settings:reload" => A::ReloadSettings,
         "tts" => A::Tts(checked(id)),
         "ttschat" => A::TtsChatOnly(checked(id)),
@@ -350,5 +503,69 @@ mod tests {
         assert_eq!(parse_id("checkin", off), Some(A::CheckIn));
         assert_eq!(parse_id("weather", off), Some(A::WeatherReport));
         assert_eq!(parse_id("climb", off), Some(A::Climb));
+        assert_eq!(parse_id("settings", off), Some(A::OpenSettings));
+        assert_eq!(parse_id("settings:file", off), Some(A::OpenConfigFile));
+        assert_eq!(parse_id("settings:reload", off), Some(A::ReloadSettings));
+    }
+
+    /// 菜单表完整性：id 不重复、都能映射成动作、顶层够短、每个动作都还点得到
+    #[test]
+    fn table_integrity() {
+        let ids = all_ids();
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            assert!(seen.insert(id.clone()), "duplicate menu id {id}");
+            assert!(parse_id(id, |_| false).is_some(), "menu id {id} has no action");
+        }
+        // 顶层（不算分隔线）不超过 10 项
+        let top = MENU.iter().filter(|n| !matches!(n, Sep)).count();
+        assert!(top <= 10, "top level has {top} entries");
+        // 换装表和 COSTUMES / OUTFITS 一致
+        for (c, _) in COSTUMES {
+            assert!(ids.contains(&format!("costume:{c}")));
+        }
+        for (o, _) in OUTFITS {
+            assert!(ids.contains(&format!("outfit:{o}")));
+        }
+        // 舞谱都在
+        for s in crate::behavior::dance::SCORES.iter() {
+            assert!(ids.contains(&format!("dance:{}", s.id)));
+        }
+        // 菜单里能直接点到的动作
+        let actions: Vec<A> = ids.iter().filter_map(|id| parse_id(id, |_| false)).collect();
+        let must = [
+            A::Chat, A::Feed, A::FeedNow, A::Honey, A::Pat, A::Climb, A::Walk, A::Sleep, A::CallToCenter,
+            A::Song, A::Game, A::OpenSongDir, A::Dance(String::new()), A::PomodoroStart(25), A::PomodoroStop,
+            A::CheckIn, A::WeatherReport, A::ClearOutfit, A::Status, A::OpenSettings, A::ToggleVisible, A::Quit,
+        ];
+        for a in must {
+            assert!(actions.contains(&a), "{a:?} not reachable from the menu");
+        }
+        // 搬进设置窗口的那些（设置窗口按钮发这些 id）
+        for id in ["settings:file", "settings:reload", "forget", "datadir"] {
+            assert!(parse_id(id, |_| false).is_some());
+        }
+        // 番茄钟子菜单标题能被 label 改写
+        assert!(MENU.iter().any(|n| matches!(n, Sub(_, k) if k.iter().any(|x| matches!(x, Sub(t, _) if *t == POMO_TITLE)))));
+    }
+
+    #[test]
+    fn dynamic_state() {
+        let mut c = Ctx { costume: "maid".into(), outfits: vec!["santa".into()], visible: true, pomo_left: None };
+        assert!(checked("costume:maid", &c));
+        assert!(!checked("costume:", &c));
+        assert!(checked("outfit:santa", &c));
+        assert!(!checked("outfit:scarf", &c));
+        c.costume = "bogus".into();
+        assert!(checked("costume:", &c));
+        assert_eq!(label("visible", &c).unwrap(), "🙈 先藏起来");
+        assert!(enabled("pomo:25", &c) && !enabled("pomo:stop", &c));
+        c.pomo_left = Some(12);
+        c.visible = false;
+        assert_eq!(label("visible", &c).unwrap(), "👀 叫她出来");
+        assert_eq!(label("pomo:stop", &c).unwrap(), "结束番茄钟（还剩 12 分钟）");
+        assert_eq!(label(POMO_TITLE, &c).unwrap(), "🍅 番茄钟（还剩 12 分钟）");
+        assert!(!enabled("pomo:25", &c) && enabled("pomo:stop", &c));
+        assert_eq!(label("chat", &c), None);
     }
 }

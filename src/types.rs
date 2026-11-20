@@ -91,7 +91,11 @@ pub enum MenuAction {
     /// 配件开关：("santa"|"glasses"|"scarf", on)
     Outfit(String, bool),
     ClearOutfit,
-    OpenSettings, ReloadSettings,
+    /// 打开设置窗口
+    OpenSettings,
+    /// 用记事本等打开 config.json（设置窗口「编辑设置文件（高级）」）
+    OpenConfigFile,
+    ReloadSettings,
     Tts(bool), TtsChatOnly(bool), Moyu(bool),
     ForgetChat, OpenDataDir, AutoStart(bool),
     ToggleVisible, CallToCenter, Quit,

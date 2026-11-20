@@ -625,8 +625,9 @@ mod tests {
             assert_eq!(find(s.id).id, s.id);
         }
         assert!(SCORES.len() >= 3);
-        let any = find("");
-        assert!(SCORES.iter().any(|s| s.id == any.id));
+        // 随机挑一次再比（原来在闭包里每次重新随机，约 30% 概率误报）
+        let picked = find("").id;
+        assert!(SCORES.iter().any(|s| s.id == picked));
     }
 
     #[test]

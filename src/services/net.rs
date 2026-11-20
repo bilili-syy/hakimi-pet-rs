@@ -51,6 +51,13 @@ fn build(proxy: &str, timeout_secs: u64) -> ureq::Agent {
         .into()
 }
 
+/// 按「设置窗口里还没保存的代理设置」建 Agent（测试连接用）。setting 为空 = 跟随系统代理
+pub fn agent_with_proxy(setting: &str, timeout_secs: u64) -> ureq::Agent {
+    let s = setting.trim();
+    let proxy = if s.is_empty() { system_proxy().and_then(|p| normalize(&p)) } else { normalize(s) };
+    build(&proxy.unwrap_or_default(), timeout_secs)
+}
+
 /// 现在该用的代理地址（"" = 直连）
 pub fn current_proxy() -> String {
     let cfg = crate::core::config::get().proxy;
