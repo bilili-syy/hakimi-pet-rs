@@ -4,6 +4,8 @@ pub mod fx;
 pub mod lines;
 pub mod play;
 mod memo;
+pub mod beat;
+pub mod dance;
 
 use crate::core::stats::{Act, ActResult, MoodLevel, Stats};
 use crate::render::{BubbleView, Rect, Scene, StatusView, Xf, ZGlyph, anim};
@@ -202,6 +204,8 @@ pub struct Behavior {
     fast_until: u64,
     glow: bool,
     dance: Option<Dance>,
+    /// 右键「跳个舞」的整支舞（behavior/dance.rs）
+    routine: Option<dance::Routine>,
 
     bubble: Option<Bubble>,
     bubble_fade: Fade,
@@ -285,6 +289,7 @@ impl Behavior {
             fast_until: 0,
             glow: false,
             dance: None,
+            routine: None,
             bubble: None,
             bubble_fade: Fade::OFF,
             status: None,
@@ -374,6 +379,11 @@ impl Behavior {
                         b.hide_at = Some(now + tail);
                     }
                 }
+                // 跳个舞：音乐提前停了就换内置鼓点接着跳
+                if self.song == Some(token) && self.routine.is_some() {
+                    self.song = None;
+                    self.dance_music_done();
+                }
                 if self.song == Some(token) {
                     self.song = None;
                     if self.state == St::Dance { self.end_dance(); }
@@ -410,6 +420,7 @@ impl Behavior {
     pub fn frame_at(&mut self, now: u64, out: &mut Vec<WinCmd>) -> u32 {
         self.now = now;
         self.run_timers();
+        self.dance_tick();
         self.sync_play();
         self.build_scene();
         self.flush(out);
@@ -511,6 +522,7 @@ impl Behavior {
     }
 
     fn next_interval(&self) -> u32 {
+        if self.routine.is_some() { return dance::FRAME_MS; }
         let base = if self.dragging_cls { DRAG_FRAME_MS }
             else if self.animating() { ANIM_FRAME_MS }
             else if self.state == St::Sleep { SLEEP_FRAME_MS }
@@ -618,6 +630,7 @@ impl Behavior {
     fn show(&mut self, f: Face) { self.face = f; }
 
     fn set_state(&mut self, next: St, hold: Option<(f64, f64)>) {
+        if next != St::Dance { self.cancel_routine(); }
         if self.state == St::Walk && next != St::Walk { self.cmds.push(WinCmd::WalkStop); }
         let prev = self.state;
         self.state = next;
@@ -969,6 +982,7 @@ impl Behavior {
     fn on_poke(&mut self) {
         self.yield_chat();
         if self.memo_poke() { return; }
+        if self.routine.is_some() { return self.finish_routine(true); }
         if self.state == St::Sleep {
             self.act(Act::Wake);
             self.play(Shot::Shake);
@@ -1062,6 +1076,7 @@ impl Behavior {
             a,
             MenuAction::Feed | MenuAction::Pat | MenuAction::Honey | MenuAction::Song | MenuAction::Sleep
                 | MenuAction::Walk | MenuAction::Costume(_) | MenuAction::Outfit(..) | MenuAction::ClearOutfit
+                | MenuAction::Dance(_)
         ) {
             self.yield_chat();
         }
@@ -1099,6 +1114,7 @@ impl Behavior {
             }
             MenuAction::Honey => self.drink_honey(),
             MenuAction::Song => self.play_song(),
+            MenuAction::Dance(id) => self.start_routine(&id),
             MenuAction::Sleep => self.go_sleep(),
             MenuAction::Walk => self.go_walk(),
             MenuAction::Status => self.show_status(),
@@ -1429,6 +1445,7 @@ impl Behavior {
             zzz,
             fx: self.fx.sprites(now),
         };
+        self.apply_dance_scene();
     }
 }
 

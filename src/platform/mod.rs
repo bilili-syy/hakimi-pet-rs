@@ -49,7 +49,7 @@ pub(crate) const WM_APP_SECOND: u32 = WM_APP + 3;
 const WM_APP_DPI: u32 = WM_APP + 4;
 /// 自动化/自测用：PostMessage(hwnd, WM_APP+9, i, 0) 等于点了 DEBUG_MENU[i] 那个菜单项
 const WM_APP_DEBUG_MENU: u32 = WM_APP + 9;
-const DEBUG_MENU: [&str; 9] = ["feed", "feednow", "game", "climb", "weather", "checkin", "status", "walk", "pat"];
+const DEBUG_MENU: [&str; 10] = ["feed", "feednow", "game", "climb", "weather", "checkin", "status", "walk", "pat", "dance:"];
 const TIMER_ID: usize = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_POWERBROADCAST: u32 = 0x0218;

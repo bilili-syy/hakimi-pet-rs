@@ -107,6 +107,8 @@ pub enum MenuAction {
     Climb,
     /// 右键「备忘录」子菜单
     Memo(MemoAct),
+    /// 跳个舞：舞谱 id（behavior::dance::SCORES），"" = 随机挑一支
+    Dance(String),
 }
 
 // ---------------------------------------------------------------- 事件

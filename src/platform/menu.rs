@@ -97,6 +97,13 @@ pub fn init() {
     let _ = costume_sub.append(&sep());
     let _ = costume_sub.append(&item("outfit:clear", "摘掉配件"));
 
+    let dance_sub = Submenu::new("💃 跳个舞", true);
+    for s in &crate::behavior::dance::SCORES {
+        let _ = dance_sub.append(&item(&format!("dance:{}", s.id), &format!("{} {}（{} 秒）", s.icon, s.name, s.secs as u32)));
+    }
+    let _ = dance_sub.append(&sep());
+    let _ = dance_sub.append(&item("dance:", "🎲 随便跳一支"));
+
     let tts = check("tts", "🔊 让哈基米出声");
     let tts_chat = check("ttschat", "🎙️ 只念聊天回复");
     let moyu = check("moyu", "👀 摸鱼监督");
@@ -133,6 +140,7 @@ pub fn init() {
         &item("climb", "🧗 爬到当前窗口上"),
         &pomo_sub, // POMO_POS
         &costume_sub,
+        &dance_sub,
         &sep(),
         &settings,
         &visible,
@@ -300,6 +308,8 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
                 a
             } else if let Some(m) = id.strip_prefix("pomo:") {
                 A::PomodoroStart(m.parse().ok()?)
+            } else if let Some(d) = id.strip_prefix("dance:") {
+                A::Dance(d.to_string())
             } else if let Some(c) = id.strip_prefix("costume:") {
                 A::Costume(c.to_string())
             } else {
@@ -332,6 +342,8 @@ mod tests {
         assert_eq!(parse_id("autostart", off), Some(A::AutoStart(false)));
         assert_eq!(parse_id(TRAY_LEFT, off), Some(A::ToggleVisible));
         assert_eq!(parse_id("quit", off), Some(A::Quit));
+        assert_eq!(parse_id("dance:disco", off), Some(A::Dance("disco".into())));
+        assert_eq!(parse_id("dance:", off), Some(A::Dance(String::new())));
         assert_eq!(parse_id("nope", off), None);
         assert_eq!(parse_id("game", off), Some(A::Game));
         assert_eq!(parse_id("feednow", off), Some(A::FeedNow));
