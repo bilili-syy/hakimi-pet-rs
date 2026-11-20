@@ -15,7 +15,6 @@ use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, KillTimer, PostMessageW, SetTimer};
 
-use crate::core::costume::COSTUMES;
 pub const OUTFITS: [(&str, &str); 3] = [("santa", "🎅 圣诞帽"), ("glasses", "👓 圆眼镜"), ("scarf", "🧣 四色围巾")];
 /// 托盘左键单击的伪菜单 id
 pub const TRAY_LEFT: &str = "tray:left";
@@ -524,7 +523,7 @@ mod tests {
         let top = MENU.iter().filter(|n| !matches!(n, Sep)).count();
         assert!(top <= 10, "top level has {top} entries");
         // 换装表和 COSTUMES / OUTFITS 一致
-        for (c, _) in COSTUMES {
+        for (c, _) in crate::core::costume::COSTUMES {
             assert!(ids.contains(&format!("costume:{c}")));
         }
         for (o, _) in OUTFITS {
