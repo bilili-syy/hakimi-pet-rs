@@ -44,7 +44,7 @@ pub const STATES: [&str; 21] = [
 ];
 /// 支持的叠加层
 pub const OVERLAYS: [&str; 2] = ["blink", "mouthOpen"];
-/// 语音文件可以是这些格式（内置台词是 Ogg Opus，rodio 放不了；角色包请用 Vorbis ogg / wav / mp3 / flac）
+/// 语音文件可以是这些格式（rodio 解不了 Ogg Opus，角色包请用 Vorbis ogg / wav / mp3 / flac）
 pub const VOICE_EXTS: [&str; 4] = ["ogg", "wav", "mp3", "flac"];
 
 /// skin.json 最大多大（再大肯定不是正常的清单）

@@ -1,7 +1,7 @@
 //! 语音：移植 Electron 版 src/main/tts.js
 //! - 小米 MiMo TTS（OpenAI 兼容 /v1/chat/completions，返回 base64 wav），三种模式 clone / preset / design
 //! - 内置台词：assets/voice/lines/<sha1(text) 前16位>.ogg（只在 clone 模式用，crate::assets::get 读）
-//! - tts-cache：每句存两份（台词+情绪、只按台词），最多 800 个文件，按修改时间淘汰
+//! - tts-cache：每句存一份，两个键（台词+情绪、只按台词）用硬链接指向同一个文件；按修改时间淘汰，最多 400 句 / 40MB
 //! - 同一时间只发一个请求；新台词来了旧的立刻回 None；429 冷却 10 秒；5xx/网络错误重试一次
 //! - 预热：后台慢慢合成固定台词，前台说话时让路
 //!
@@ -19,7 +19,14 @@ use std::time::{Duration, Instant};
 
 pub const API: &str = "https://api.xiaomimimo.com/v1/chat/completions";
 /// 每句存两份：按「台词+情绪」和只按台词（换了情绪也能秒播）
-pub const MAX_CACHE: usize = 800;
+/// tts-cache 最多存多少句（每句两个键、一份文件）
+pub const MAX_CACHE: usize = 400;
+/// 让 MiMo 直接回 mp3：同一句 wav ~250KB → mp3 ~30–40KB，下载和缓存都小 6–8 倍，rodio 能直接解
+const AUDIO_FORMAT: &str = "mp3";
+/// tts-cache 总大小上限（字节）
+pub const MAX_CACHE_BYTES: u64 = 40 * 1024 * 1024;
+/// 缓存文件扩展名：新写的按内容判断（mp3 / wav），读的时候两种都认
+const CACHE_EXTS: [&str; 2] = ["mp3", "wav"];
 /// 预热最多多少条（main.js 里 items.slice(0, 300)）
 pub const MAX_PREWARM: usize = 300;
 const COOLDOWN: Duration = Duration::from_secs(10);
@@ -85,9 +92,8 @@ pub fn text_key(t: &TtsConfig, text: &str) -> String {
     format!("T{}", sha1_hex(&[t.mode.as_str(), t.voice.as_str(), text].join("|")))
 }
 
-/// 内置台词能不能播：它们是 Ogg **Opus**，而 rodio 0.23 / symphonia 0.5 只有 Vorbis 解码器。
-/// 启动后第一次用到时拿一个文件试解一次；不能播就跳过内置台词，走 tts-cache / 在线合成，
-/// 免得命中内置台词却放不出声。等集成方加上 Opus 解码（或把台词转成 Vorbis）后自动生效。
+/// 内置台词能不能播（它们是 Ogg Vorbis，rodio 能解；Opus 不行）。
+/// 保险：启动后第一次用到时拿一个文件试解一次，万一换进了解不了的格式就跳过内置台词，走 tts-cache / 在线合成。
 pub fn bundled_playable() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
@@ -98,7 +104,7 @@ pub fn bundled_playable() -> bool {
                 v.as_object()?.keys().find_map(|k| bundled(&t, k))
             })
             .is_some_and(super::audio::can_decode);
-        if !ok && !cfg!(test) { crate::core::log::log("bundled voice lines not decodable (Ogg Opus), using tts-cache / MiMo"); }
+        if !ok && !cfg!(test) { crate::core::log::log("bundled voice lines not decodable, using tts-cache / MiMo"); }
         ok
     })
 }
@@ -117,7 +123,7 @@ pub fn read_cache(t: &TtsConfig, text: &str, mood: Option<VoiceMood>) -> Option<
     if let Some(b) = crate::core::skin::voice_line(text).filter(|b| super::audio::can_decode(b)) { return Some(b); }
     if let Some(b) = bundled(t, text).filter(|_| bundled_playable()) { return Some(b.to_vec()); }
     for k in [cache_key(t, text, mood), text_key(t, text)] {
-        let file = cache_dir().join(format!("{k}.wav"));
+        let Some(file) = CACHE_EXTS.iter().map(|e| cache_dir().join(format!("{k}.{e}"))).find(|f| f.is_file()) else { continue };
         if let Ok(buf) = std::fs::read(&file) {
             if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&file) {
                 let _ = f.set_modified(std::time::SystemTime::now());
@@ -128,31 +134,61 @@ pub fn read_cache(t: &TtsConfig, text: &str, mood: Option<VoiceMood>) -> Option<
     None
 }
 
-fn write_cache(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, wav: &[u8]) {
-    let dir = cache_dir();
-    if std::fs::create_dir_all(&dir).is_err() { return; }
-    let _ = std::fs::write(dir.join(format!("{}.wav", cache_key(t, text, mood))), wav);
-    let _ = std::fs::write(dir.join(format!("{}.wav", text_key(t, text))), wav);
-    trim_cache();
+/// 音频内容 → 缓存扩展名
+fn audio_ext(b: &[u8]) -> &'static str {
+    if b.starts_with(b"RIFF") { "wav" } else if b.starts_with(b"ID3") || (b.len() > 1 && b[0] == 0xFF && b[1] & 0xE0 == 0xE0) { "mp3" } else { "wav" }
 }
 
-fn trim_cache() {
-    let Ok(rd) = std::fs::read_dir(cache_dir()) else { return };
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
-        .flatten()
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
-    if files.len() <= MAX_CACHE { return; }
-    files.sort_by_key(|f| std::cmp::Reverse(f.0));
-    for (_, p) in files.into_iter().skip(MAX_CACHE) { let _ = std::fs::remove_file(p); }
+fn write_cache(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, audio: &[u8]) {
+    write_cache_in(&cache_dir(), &cache_key(t, text, mood), &text_key(t, text), audio);
+    trim_cache_in(&cache_dir(), MAX_CACHE, MAX_CACHE_BYTES);
+}
+
+/// 存一份；第二个键用硬链接指过去（不占第二份空间），硬链接失败再复制
+fn write_cache_in(dir: &std::path::Path, key: &str, text_key: &str, audio: &[u8]) {
+    if std::fs::create_dir_all(dir).is_err() { return; }
+    let ext = audio_ext(audio);
+    // 同一个键的旧格式文件先删，免得读到旧的
+    for k in [key, text_key] {
+        for e in CACHE_EXTS { let _ = std::fs::remove_file(dir.join(format!("{k}.{e}"))); }
+    }
+    let main = dir.join(format!("{key}.{ext}"));
+    if std::fs::write(&main, audio).is_err() { return; }
+    if key == text_key { return; }
+    let alias = dir.join(format!("{text_key}.{ext}"));
+    if std::fs::hard_link(&main, &alias).is_err() { let _ = std::fs::write(&alias, audio); }
+}
+
+/// 按修改时间淘汰，直到句数和总大小都在上限内。
+/// 同一句的两个硬链接修改时间和大小都一样，按 (修改时间, 大小) 归成一组，整组留或整组删
+fn trim_cache_in(dir: &std::path::Path, max_entries: usize, max_bytes: u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut groups: std::collections::HashMap<(std::time::SystemTime, u64), Vec<PathBuf>> = std::collections::HashMap::new();
+    for e in rd.flatten() {
+        let Ok(m) = e.metadata() else { continue };
+        let Ok(t) = m.modified() else { continue };
+        groups.entry((t, m.len())).or_default().push(e.path());
+    }
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by_key(|g| std::cmp::Reverse(g.0.0));
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for ((_, len), paths) in groups {
+        if n < max_entries && bytes + len <= max_bytes {
+            n += 1;
+            bytes += len;
+        } else {
+            for p in paths { let _ = std::fs::remove_file(p); }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ 请求体
 
 fn ref_voice() -> Option<String> {
-    // 参考音频约 350KB，只在发 clone 请求时临时转 base64，用完即丢
-    crate::assets::get("voice/hakimi-voice.wav")
-        .map(|b| format!("data:audio/wav;base64,{}", base64::engine::general_purpose::STANDARD.encode(b)))
+    // 参考音频：7.4 秒 64kbps mp3（约 58KB，原来是 345KB 的 wav，请求体 ~460KB → ~77KB）。
+    // 只在发 clone 请求时临时转 base64，用完即丢
+    crate::assets::get("voice/hakimi-voice.mp3")
+        .map(|b| format!("data:audio/mpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(b)))
 }
 
 pub fn build_body(t: &TtsConfig, text: &str, mood: Option<VoiceMood>) -> Value {
@@ -169,13 +205,13 @@ fn build_body_with(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, refv: imp
         "design" => json!({
             "model": "mimo-v2.5-tts-voicedesign",
             "messages": [{ "role": "user", "content": t.style }, { "role": "assistant", "content": content }],
-            "audio": { "format": "wav" },
+            "audio": { "format": AUDIO_FORMAT },
         }),
         _ => match refv() {
             Some(r) => json!({
                 "model": "mimo-v2.5-tts-voiceclone",
                 "messages": [{ "role": "user", "content": "" }, { "role": "assistant", "content": content }],
-                "audio": { "format": "wav", "voice": r },
+                "audio": { "format": AUDIO_FORMAT, "voice": r },
             }),
             // 参考音频丢了就退回预置音色
             None => preset_body(t, &content),
@@ -188,7 +224,7 @@ fn preset_body(t: &TtsConfig, content: &str) -> Value {
     json!({
         "model": "mimo-v2.5-tts",
         "messages": [{ "role": "user", "content": t.style }, { "role": "assistant", "content": content }],
-        "audio": { "format": "wav", "voice": voice },
+        "audio": { "format": AUDIO_FORMAT, "voice": voice },
     })
 }
 
@@ -495,6 +531,76 @@ mod tests {
         assert_eq!(b["model"], "mimo-v2.5-tts-voicedesign");
         assert_eq!(b["messages"][0]["content"], t.style.as_str());
         assert!(b["audio"].get("voice").is_none());
-        assert!(ref_voice().is_some_and(|s| s.starts_with("data:audio/wav;base64,UklG")));
+        assert!(ref_voice().is_some_and(|s| s.starts_with("data:audio/mpeg;base64,") && s.len() < 100_000));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// 0.1 秒 24kHz 单声道静音 wav（MiMo 默认返回的格式）
+    pub fn tiny_wav() -> Vec<u8> {
+        let n: u32 = 2400;
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + n * 2).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&24_000u32.to_le_bytes());
+        v.extend_from_slice(&48_000u32.to_le_bytes());
+        v.extend_from_slice(&2u16.to_le_bytes());
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&(n * 2).to_le_bytes());
+        v.resize(v.len() + n as usize * 2, 0);
+        v
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hk-tts-cache-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn one_copy_two_keys() {
+        let d = tmp("dedupe");
+        let wav = tests_support::tiny_wav();
+        write_cache_in(&d, "k1", "Tk1", &wav);
+        assert_eq!(std::fs::read(d.join("k1.wav")).unwrap(), wav);
+        assert_eq!(std::fs::read(d.join("Tk1.wav")).unwrap(), wav);
+        // mp3 内容存成 .mp3，并替掉同键的旧 wav
+        let mp3 = crate::assets::get("voice/hakimi-voice.mp3").unwrap();
+        assert_eq!(audio_ext(mp3), "mp3");
+        write_cache_in(&d, "k1", "Tk1", mp3);
+        assert!(!d.join("k1.wav").exists() && !d.join("Tk1.wav").exists());
+        assert_eq!(std::fs::read(d.join("Tk1.mp3")).unwrap(), mp3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn trim_by_count_and_bytes() {
+        let d = tmp("trim");
+        for i in 0..6 {
+            write_cache_in(&d, &format!("k{i}"), &format!("T{i}"), &vec![i as u8; 1000 + i]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // 12 个文件、6 份内容；按大小只留得下最新的 3 句（硬链接不重复计）
+        trim_cache_in(&d, 100, 3100);
+        let left: Vec<_> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
+        assert_eq!(left.len(), 6, "{left:?}");
+        assert!(left.iter().any(|f| f == "T3.wav") && !left.iter().any(|f| f.starts_with("k2") || f.starts_with("T2")));
+        assert!(left.iter().any(|f| f.starts_with("k5")));
+        trim_cache_in(&d, 1, u64::MAX);
+        // 按句数：留最新一句的两个键
+        assert!(d.join("k5.wav").exists() && d.join("T5.wav").exists());
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
