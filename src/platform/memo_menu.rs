@@ -53,6 +53,8 @@ pub fn refresh(popup_open: bool) {
 
         let item = |id: String, text: &str| MenuItem::with_id(id, text, true, None);
         let pending = store::pending();
+        let _ = m.sub.append(&item("memo:window".into(), "📝 打开备忘录…（新建 / 编辑）"));
+        let _ = m.sub.append(&PredefinedMenuItem::separator());
         if !store::ringing().is_empty() {
             let _ = m.sub.append(&item("memo:snooze".into(), "⏰ 稍后 10 分钟再提醒"));
             let _ = m.sub.append(&PredefinedMenuItem::separator());
@@ -83,6 +85,7 @@ pub fn parse(id: &str) -> Option<MenuAction> {
     let a = match rest {
         "snooze" => MemoAct::Snooze,
         "open" => MemoAct::OpenFile,
+        "window" => MemoAct::OpenWindow,
         "clear" => MemoAct::ClearDone,
         _ => {
             if let Some(n) = rest.strip_prefix("done:") {
@@ -114,6 +117,7 @@ mod tests {
         assert_eq!(parse("memo:snooze"), Some(MenuAction::Memo(MemoAct::Snooze)));
         assert_eq!(parse("memo:open"), Some(MenuAction::Memo(MemoAct::OpenFile)));
         assert_eq!(parse("memo:clear"), Some(MenuAction::Memo(MemoAct::ClearDone)));
+        assert_eq!(parse("memo:window"), Some(MenuAction::Memo(MemoAct::OpenWindow)));
         assert_eq!(parse("memo:done:x"), None);
         assert_eq!(parse("chat"), None);
         assert_eq!(label("a&b", 24), "a&&b");

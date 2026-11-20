@@ -1,6 +1,7 @@
 //! 设置窗口：原生 Win32 控件（不用 webview / GUI 库）。点「⚙️ 设置…」时才创建，关掉就整个销毁，不常驻。
 //!
-//! - 左边分类列表（AI 聊天 / 语音 / 常规），右边是对应的一页控件；底部「恢复默认」「保存」「取消」。
+//! - 左边分类列表（AI 聊天 / 语音 / 常规 / 备忘录），右边是对应的一页控件；底部「恢复默认」「保存」「取消」。
+//! - 「备忘录」页例外：增删改直接写 memo.json（core::memo），不等底部「保存」。
 //! - 只在保存时写 config.json：拿 `config::get()` 的副本改已知字段（未知字段原样留着），原子写回，
 //!   然后走和菜单「重新加载设置」同一条路（`settings:reload`）让改动马上生效。
 //! - 「测试连接」「试听」在后台线程跑，结果 PostMessage 回窗口。Key 不进日志。
@@ -8,6 +9,7 @@
 //! - 纯逻辑（服务商预设、识别、校验）放在文件末尾，有单元测试。
 use super::sys::wide;
 use crate::core::config::{self, Config};
+use crate::core::memo::{Dt, Repeat};
 use std::cell::{Cell, RefCell};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
@@ -79,6 +81,8 @@ const CB_RESETCONTENT: u32 = 0x14B;
 const CB_SETCURSEL: u32 = 0x14E;
 const CBN_SELCHANGE: u32 = 1;
 const LB_ADDSTRING: u32 = 0x180;
+const LB_RESETCONTENT: u32 = 0x184;
+const WM_TIMER: u32 = 0x113;
 const LB_SETCURSEL: u32 = 0x186;
 const LB_GETCURSEL: u32 = 0x188;
 const LB_SETITEMHEIGHT: u32 = 0x1A0;
@@ -130,6 +134,7 @@ const ID_PLAY_RESULT: i32 = 142;
 const ID_AUTOSTART: i32 = 150;
 const ID_SCALE: i32 = 151;
 const ID_FPS: i32 = 164;
+const ID_BIRTHDAY: i32 = 165;
 const ID_CITY: i32 = 152;
 const ID_MOYU: i32 = 153;
 const ID_MOYU_MIN: i32 = 154;
@@ -142,6 +147,17 @@ const ID_FORGET: i32 = 161;
 const ID_RAWFILE: i32 = 162;
 const ID_RELOAD: i32 = 163;
 const ID_DEFAULTS: i32 = 170;
+const ID_MEMO_LIST: i32 = 180;
+const ID_MEMO_TEXT: i32 = 181;
+const ID_MEMO_DATE: i32 = 182;
+const ID_MEMO_TIME: i32 = 183;
+const ID_MEMO_REPEAT: i32 = 184;
+const ID_MEMO_NEW: i32 = 185;
+const ID_MEMO_SAVE: i32 = 186;
+const ID_MEMO_DONE: i32 = 187;
+const ID_MEMO_DEL: i32 = 188;
+const ID_MEMO_CLEAR: i32 = 189;
+const ID_MEMO_MSG: i32 = 190;
 /// 灰色说明文字
 const ID_HINT0: i32 = 200;
 /// 粗体标题
@@ -149,7 +165,8 @@ const ID_TITLE0: i32 = 300;
 /// 普通标签
 const ID_LABEL0: i32 = 400;
 
-const PAGES: [&str; 3] = ["AI 聊天", "语音", "常规"];
+const PAGES: [&str; 4] = ["AI 聊天", "语音", "常规", "备忘录"];
+const REPEATS: [(Repeat, &str); 4] = [(Repeat::None, "不重复"), (Repeat::Daily, "每天"), (Repeat::Workday, "工作日"), (Repeat::Weekly, "每周")];
 const SPEAK: [(&str, &str); 3] = [("all", "所有气泡都念"), ("chat", "只念聊天回复"), ("off", "都不念")];
 const MODES: [(&str, &str); 3] =
     [("clone", "哈基米本人的声音（推荐）"), ("preset", "MiMo 预置音色"), ("design", "按下面的文字描述现设计")];
@@ -218,6 +235,10 @@ struct Dlg {
     /// 后台任务代号：窗口关掉/再点一次后旧结果作废
     test_gen: u64,
     play_gen: u64,
+    /// 备忘录页：列表第 i 行是哪条、选中的那条、上次刷新时的数据版本
+    memo_ids: Vec<u64>,
+    memo_sel: Option<u64>,
+    memo_ver: u64,
 }
 
 thread_local! {
@@ -384,6 +405,9 @@ fn create_inner(page: u8) -> windows::core::Result<()> {
             preset: 0,
             test_gen: 0,
             play_gen: 0,
+            memo_ids: Vec::new(),
+            memo_sel: None,
+            memo_ver: 0,
         };
         d.make_fonts();
         if let Some(i) = d.icon {
@@ -392,8 +416,10 @@ fn create_inner(page: u8) -> windows::core::Result<()> {
         }
         d.build();
         d.fill(&cfg, d.orig_autostart);
-        d.show_page(page.min(2));
+        d.show_page(page.min(3));
         DLG.with(|c| *c.borrow_mut() = Some(d));
+        // 备忘录页：聊天里加了/到点响了，列表每秒跟一下
+        windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 1000, None);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         Ok(())
@@ -693,7 +719,9 @@ impl Dlg {
         self.label(p, "天气城市", [X0, 118.0, LW, 26.0]);
         let city = self.edit(p, ID_CITY, 0, [FX, 118.0, 170.0, 26.0]);
         cue(city, "留空 = 自动定位");
-        self.hint(p, "如：北京、上海", [FX + 178.0, 118.0, FW - 178.0, 26.0]);
+        self.label(p, "主人生日", [FX + 184.0, 118.0, 64.0, 26.0]);
+        let bd = self.edit(p, ID_BIRTHDAY, 0, [FX + 250.0, 118.0, FW - 250.0, 26.0]);
+        cue(bd, "如 4-3");
         self.button(p, ID_MOYU, "摸鱼监督（看视频/刷社交太久会来催你）", BS_AUTOCHECKBOX, [X0, 156.0, 360.0, 24.0]);
         self.label(p, "连续摸鱼", [X0 + 18.0, 186.0, 70.0, 26.0]);
         self.edit(p, ID_MOYU_MIN, ES_NUMBER, [X0 + 88.0, 186.0, 46.0, 26.0]);
@@ -714,6 +742,35 @@ impl Dlg {
         self.button(p, ID_RAWFILE, "编辑设置文件（高级）", 0, [X0, 356.0, 170.0, 30.0]);
         self.button(p, ID_RELOAD, "重新读取设置文件", 0, [X0 + 182.0, 356.0, 170.0, 30.0]);
         self.hint(p, "高级：摸鱼关键词、进程名等在设置文件里改，改完点「重新读取设置文件」。", [X0, 394.0, W - X0 - 16.0, 40.0]);
+
+        // ---------------- 备忘录（改动马上写进 memo.json，不用点「保存」）
+        let p = 4;
+        self.title(p, "备忘录");
+        self.hint(p, "这一页改动马上生效。聊天里说「提醒我…」也能加。", [X0, 44.0, W - X0 - 16.0, 20.0]);
+        let mw = W - X0 - 16.0;
+        let list = self.add(p, w!("LISTBOX"), "", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, 0, ID_MEMO_LIST, [X0 + 6.0, 72.0, mw - 10.0, 164.0]);
+        self.frames.push(([X0, 68.0, mw, 172.0], list, p));
+        self.label(p, "内容", [X0, 252.0, LW, 26.0]);
+        let t = self.edit(p, ID_MEMO_TEXT, 0, [FX, 252.0, FW, 26.0]);
+        send(t, EM_LIMITTEXT, 200, 0);
+        cue(t, "比如：喝水、开会、给妈妈打电话");
+        self.label(p, "日期", [X0, 288.0, LW, 26.0]);
+        let d = self.edit(p, ID_MEMO_DATE, 0, [FX, 288.0, 120.0, 26.0]);
+        cue(d, "今天 / 11-21");
+        self.label(p, "时间", [FX + 132.0, 288.0, 40.0, 26.0]);
+        let tm = self.edit(p, ID_MEMO_TIME, 0, [FX + 172.0, 288.0, FW - 172.0, 26.0]);
+        cue(tm, "18:00");
+        self.label(p, "重复", [X0, 324.0, LW, 26.0]);
+        let rp = self.combo(p, ID_MEMO_REPEAT, false, [FX, 324.0, 120.0, 0.0]);
+        combo_fill(rp, &REPEATS.map(|x| x.1));
+        combo_set(rp, 0);
+        self.hint(p, "时间空着 = 不提醒", [FX + 132.0, 328.0, FW - 132.0, 22.0]);
+        let bw = (mw - 30.0) / 4.0;
+        for (i, (id, s)) in [(ID_MEMO_NEW, "新建"), (ID_MEMO_SAVE, "添加这条"), (ID_MEMO_DONE, "完成"), (ID_MEMO_DEL, "删除")].into_iter().enumerate() {
+            self.button(p, id, s, 0, [X0 + i as f32 * (bw + 10.0), 366.0, bw, 30.0]);
+        }
+        self.button(p, ID_MEMO_CLEAR, "清空已完成", 0, [X0, 406.0, 110.0, 30.0]);
+        self.add(p, w!("STATIC"), "", SS_CENTERIMAGE, 0, ID_MEMO_MSG, [X0 + 122.0, 406.0, mw - 122.0, 30.0]);
 
         // ---------------- 底部按钮（每页都有）
         let y = H - 50.0;
@@ -753,6 +810,7 @@ impl Dlg {
         combo_set(self.c(ID_SCALE), nearest_scale(c.scale));
         combo_set(self.c(ID_FPS), FPS.iter().position(|x| x.0 == crate::core::config::clamp_fps(c.fps)).unwrap_or(1));
         set_text(self.c(ID_CITY), &c.weather_city);
+        set_text(self.c(ID_BIRTHDAY), &c.birthday);
         set_checked(self.c(ID_MOYU), c.moyu.enabled);
         set_text(self.c(ID_MOYU_MIN), &c.moyu.minutes.to_string());
         set_text(self.c(ID_MOYU_POMO), &c.moyu.pomodoro_minutes.to_string());
@@ -815,9 +873,111 @@ impl Dlg {
                 let _ = ShowWindow(c.h, if show { SW_SHOW } else { SW_HIDE });
             }
         }
+        // 备忘录页不走「保存」，「恢复默认」藏起来免得误会
+        unsafe {
+            let _ = ShowWindow(self.c(ID_DEFAULTS), if self.page == 4 { SW_HIDE } else { SW_SHOW });
+        }
+        if self.page == 4 {
+            self.memo_refresh();
+        }
         // 自定义服务商没有官网链接
         self.update_ai_hints();
         repaint(self.hwnd);
+    }
+
+    // ---------------- 备忘录页
+    fn memo_refresh(&mut self) {
+        use crate::core::memo as store;
+        self.memo_ver = store::version();
+        let today = store::Now::get().dt;
+        let ringing = store::ringing();
+        let items = store::pending();
+        let list = self.c(ID_MEMO_LIST);
+        send(list, LB_RESETCONTENT, 0, 0);
+        self.memo_ids.clear();
+        for it in &items {
+            let bell = if ringing.contains(&it.id) { "⏰ " } else { "" };
+            let w = wide(&format!("{bell}{}　　{}", it.when_label(today), it.text));
+            send(list, LB_ADDSTRING, 0, w.as_ptr() as isize);
+            self.memo_ids.push(it.id);
+        }
+        if items.is_empty() {
+            let w = wide("（还没有待办：在下面写一条，点「添加这条」）");
+            send(list, LB_ADDSTRING, 0, w.as_ptr() as isize);
+        }
+        match self.memo_sel.and_then(|id| self.memo_ids.iter().position(|x| *x == id)) {
+            Some(i) => {
+                send(list, LB_SETCURSEL, i, 0);
+            }
+            None => {
+                self.memo_sel = None;
+                send(list, LB_SETCURSEL, usize::MAX, 0);
+            }
+        }
+        self.memo_buttons();
+    }
+
+    fn memo_buttons(&self) {
+        let sel = self.memo_sel.is_some();
+        enable(self.c(ID_MEMO_DONE), sel);
+        enable(self.c(ID_MEMO_DEL), sel);
+        set_text(self.c(ID_MEMO_SAVE), if sel { "保存修改" } else { "添加这条" });
+        repaint(self.c(ID_MEMO_SAVE));
+    }
+
+    fn memo_msg(&self, s: &str) {
+        set_text(self.c(ID_MEMO_MSG), s);
+    }
+
+    /// 点列表里一条：填进下面的表单
+    fn memo_pick(&mut self) {
+        let i = send(self.c(ID_MEMO_LIST), LB_GETCURSEL, 0, 0);
+        let Some(&id) = usize::try_from(i).ok().and_then(|i| self.memo_ids.get(i)) else { return self.memo_clear_form() };
+        let Some(it) = crate::core::memo::get(id) else { return };
+        self.memo_sel = Some(id);
+        set_text(self.c(ID_MEMO_TEXT), &it.text);
+        let (d, t) = match it.time_dt() {
+            Some(t) => (format!("{:04}-{:02}-{:02}", t.y, t.mo, t.d), format!("{:02}:{:02}", t.h, t.mi)),
+            None => (String::new(), String::new()),
+        };
+        set_text(self.c(ID_MEMO_DATE), &d);
+        set_text(self.c(ID_MEMO_TIME), &t);
+        combo_set(self.c(ID_MEMO_REPEAT), REPEATS.iter().position(|r| r.0 == it.repeat).unwrap_or(0));
+        self.memo_msg("");
+        self.memo_buttons();
+    }
+
+    fn memo_clear_form(&mut self) {
+        self.memo_sel = None;
+        send(self.c(ID_MEMO_LIST), LB_SETCURSEL, usize::MAX, 0);
+        for id in [ID_MEMO_TEXT, ID_MEMO_DATE, ID_MEMO_TIME] {
+            set_text(self.c(id), "");
+        }
+        combo_set(self.c(ID_MEMO_REPEAT), 0);
+        self.memo_buttons();
+    }
+
+    /// 「添加这条」/「保存修改」
+    fn memo_save(&mut self) -> Result<(), String> {
+        use crate::core::memo as store;
+        let text = get_text(self.c(ID_MEMO_TEXT)).trim().to_string();
+        if text.is_empty() {
+            return Err("先写上要提醒什么喵".into());
+        }
+        let repeat = REPEATS[combo_sel(self.c(ID_MEMO_REPEAT)).min(REPEATS.len() - 1)].0;
+        let now = store::Now::get().dt;
+        let when = parse_when(&get_text(self.c(ID_MEMO_DATE)), &get_text(self.c(ID_MEMO_TIME)), repeat, now)?;
+        let (id, verb) = match self.memo_sel {
+            Some(id) if store::update(id, &text, when, repeat) => (id, "改好了"),
+            _ => (store::add(&text, when, repeat).id, "记下啦"),
+        };
+        let label = store::get(id).map(|i| i.when_label(now)).unwrap_or_default();
+        if verb == "记下啦" {
+            self.memo_clear_form();
+        }
+        self.memo_refresh();
+        self.memo_msg(&if when.is_some() { format!("✔ {verb}，{label} 叫你") } else { format!("✔ {verb}（随手记，不提醒）") });
+        Ok(())
     }
 
     /// 从控件读回配置（在打开时的副本上改，未知字段都还在）。校验失败返回 (页, 提示)
@@ -852,6 +1012,8 @@ impl Dlg {
         c.scale = SCALES[combo_sel(self.c(ID_SCALE)).min(SCALES.len() - 1)].0;
         c.fps = FPS[combo_sel(self.c(ID_FPS)).min(FPS.len() - 1)].0;
         c.weather_city = get_text(self.c(ID_CITY)).trim().to_string();
+        let bd = get_text(self.c(ID_BIRTHDAY));
+        c.birthday = crate::behavior::norm_birthday(&bd).unwrap_or_default();
         c.moyu.enabled = checked(self.c(ID_MOYU));
         let num = |id: i32, name: &str, max: u32| -> Result<u32, (u8, String)> {
             parse_minutes(&get_text(self.c(id)), max).ok_or((2, format!("「{name}」要填 0~{max} 的整数")))
@@ -907,7 +1069,7 @@ fn differs(a: &Config, b: &Config) -> bool {
             c.user_name.clone(),
             format!("{:?}{:?}{:?}{:?}{:?}{:?}{}", c.tts.enabled, c.tts.chat_voice_reply, c.tts.speak, c.tts.api_key, c.tts.mode, c.tts.voice, c.tts.style),
             ((c.tts.volume * 100.0).round() as i32, (c.scale * 100.0).round() as i32),
-            c.weather_city.clone(),
+            (c.weather_city.clone(), c.birthday.clone()),
             (c.moyu.enabled, c.moyu.minutes, c.moyu.pomodoro_minutes, c.reminders.water, c.reminders.stand_up),
             c.reminders.off_work.clone(),
         )
@@ -936,7 +1098,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
     match (id, code) {
         (ID_LIST, LBN_SELCHANGE) => {
             with(|d| {
-                let i = send(d.c(ID_LIST), LB_GETCURSEL, 0, 0).clamp(0, 2) as u8;
+                let i = send(d.c(ID_LIST), LB_GETCURSEL, 0, 0).clamp(0, 3) as u8;
                 d.show_page(i);
             });
         }
@@ -1013,9 +1175,61 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 });
             }
         }
-        (IDOK, _) => save(hwnd),
+        (ID_MEMO_LIST, LBN_SELCHANGE) => {
+            with(|d| d.memo_pick());
+        }
+        (ID_MEMO_NEW, _) => {
+            with(|d| {
+                d.memo_clear_form();
+                d.memo_msg("");
+                unsafe {
+                    let _ = SetFocus(Some(d.c(ID_MEMO_TEXT)));
+                }
+            });
+        }
+        (ID_MEMO_SAVE, _) => memo_save_ui(hwnd),
+        (ID_MEMO_DONE, _) => {
+            if let Some(Some(id)) = with(|d| d.memo_sel) {
+                // 走菜单同一条路：她会说一句「划掉啦」
+                menu(&format!("memo:done:{id}"));
+                with(|d| {
+                    d.memo_clear_form();
+                    d.memo_msg("✔ 划掉啦");
+                });
+            }
+        }
+        (ID_MEMO_DEL, _) => {
+            if let Some(Some(id)) = with(|d| d.memo_sel)
+                && msgbox(hwnd, "删掉这条备忘吗？", MB_YESNO | MB_ICONQUESTION) == IDYES.0
+            {
+                menu(&format!("memo:del:{id}"));
+                with(|d| {
+                    d.memo_clear_form();
+                    d.memo_msg("已删除");
+                });
+            }
+        }
+        (ID_MEMO_CLEAR, _) => {
+            menu("memo:clear");
+            with(|d| d.memo_msg("已清掉做完的"));
+        }
+        (IDOK, _) => {
+            // 备忘录页在输入框里按回车 = 添加/保存这条，不是保存设置并关窗
+            let in_memo = with(|d| {
+                let f = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+                d.page == 4 && [ID_MEMO_TEXT, ID_MEMO_DATE, ID_MEMO_TIME].iter().any(|i| d.c(*i) == f)
+            })
+            .unwrap_or(false);
+            if in_memo { memo_save_ui(hwnd) } else { save(hwnd) }
+        }
         (IDCANCEL, _) => close(hwnd, false),
         _ => {}
+    }
+}
+
+fn memo_save_ui(hwnd: HWND) {
+    if let Some(Err(e)) = with(|d| d.memo_save()) {
+        msgbox(hwnd, &e, MB_OK | MB_ICONWARNING);
     }
 }
 
@@ -1183,6 +1397,7 @@ fn ctl_color(hdc: HDC, ctl: HWND) -> LRESULT {
     let color = match id {
         ID_KEY_LINK | ID_TTS_LINK => LINK,
         ID_NOTE => GREY,
+        ID_MEMO_MSG => OK_GREEN,
         ID_TEST_RESULT | ID_PLAY_RESULT => {
             let v = colors[if id == ID_TEST_RESULT { 0 } else { 1 }];
             if v > 0 { OK_GREEN } else if v < 0 { ERR_RED } else { GREY }
@@ -1442,6 +1657,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 on_results();
                 LRESULT(0)
             }
+            WM_TIMER => {
+                with(|d| {
+                    if d.page == 4 && crate::core::memo::version() != d.memo_ver {
+                        d.memo_refresh();
+                    }
+                });
+                LRESULT(0)
+            }
             WM_DPICHANGED => {
                 let dpi = (wp.0 & 0xffff) as f32;
                 let r = &*(lp.0 as *const RECT);
@@ -1618,6 +1841,63 @@ pub fn parse_clock(s: &str) -> Option<String> {
 }
 
 /// 最接近的大小档位
+/// 备忘录时间："18:00" "9:30" "18点" "9点半" "18：00"
+pub fn parse_hm(s: &str) -> Option<(u32, u32)> {
+    let s = s.trim().replace(['：', '点', '.'], ":");
+    let s = s.trim_end_matches(':');
+    let (h, m) = s.split_once(':').unwrap_or((s, "0"));
+    let m = m.trim().trim_end_matches('分');
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = match m {
+        "" => 0,
+        "半" => 30,
+        m => m.parse().ok()?,
+    };
+    (h < 24 && m < 60).then_some((h, m))
+}
+
+/// 备忘录日期："2026-11-21" "2026/11/21" "11-21" "11/21" "11月21日"（只写月日、已过了就算明年）
+fn parse_day(s: &str, now: Dt) -> Option<Dt> {
+    let s = s.replace(['/', '.', '年', '月'], "-").replace(['日', '号'], "");
+    let n: Vec<u32> = s.split('-').map(str::trim).filter(|x| !x.is_empty()).map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    let (y, mo, d) = match n[..] {
+        [y, mo, d] => (y as i32, mo, d),
+        [mo, d] => (now.y, mo, d),
+        _ => return None,
+    };
+    let t = Dt::new(y, mo, d, 0, 0)?;
+    if n.len() == 2 && t.date() < now.date() { Dt::new(y + 1, mo, d, 0, 0) } else { Some(t) }
+}
+
+/// 备忘录表单 → 提醒时刻。都空 = 随手记（None）；只填时间 = 今天（过了就明天）；重复的已过时刻排到下一次
+pub fn parse_when(date: &str, time: &str, repeat: Repeat, now: Dt) -> Result<Option<Dt>, String> {
+    let (date, time) = (date.trim(), time.trim());
+    if time.is_empty() {
+        if date.is_empty() {
+            return Ok(None);
+        }
+        return Err("填了日期，也要填几点（比如 18:00）".into());
+    }
+    let (h, mi) = parse_hm(time).ok_or_else(|| "「时间」要填 18:00 这样的".to_string())?;
+    let day = match date {
+        "" | "今天" => None,
+        "明天" => Some(now.add_days(1)),
+        "后天" => Some(now.add_days(2)),
+        d => Some(parse_day(d, now).ok_or_else(|| "「日期」要填 2026-11-21、11-21 或 明天".to_string())?),
+    };
+    let mut t = day.unwrap_or(now).at(h, mi);
+    if t <= now {
+        if repeat != Repeat::None {
+            t = repeat.next_after(t, now).unwrap_or(t);
+        } else if day.is_none() {
+            t = t.add_days(1);
+        } else {
+            return Err("这个时间已经过了".into());
+        }
+    }
+    Ok(Some(t))
+}
+
 pub fn nearest_scale(s: f32) -> usize {
     SCALES
         .iter()
@@ -1630,6 +1910,27 @@ pub fn nearest_scale(s: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memo_when() {
+        let now = Dt::new(2026, 11, 20, 21, 0).unwrap(); // 周五
+        let n = Repeat::None;
+        let at = |y, mo, d, h, mi| Ok(Some(Dt::new(y, mo, d, h, mi).unwrap()));
+        assert_eq!(parse_when("", "", n, now), Ok(None));
+        assert_eq!(parse_when("", "22:30", n, now), at(2026, 11, 20, 22, 30));
+        assert_eq!(parse_when("今天", "8:00", n, now), at(2026, 11, 21, 8, 0));
+        assert_eq!(parse_when("明天", "9点半", n, now), at(2026, 11, 21, 9, 30));
+        assert_eq!(parse_when("11-25", "18：00", n, now), at(2026, 11, 25, 18, 0));
+        assert_eq!(parse_when("1/3", "18点", n, now), at(2027, 1, 3, 18, 0));
+        assert_eq!(parse_when("2026年12月1日", "7:05", n, now), at(2026, 12, 1, 7, 5));
+        assert!(parse_when("2026-11-20", "20:00", n, now).is_err());
+        assert_eq!(parse_when("2026-11-20", "20:00", Repeat::Daily, now), at(2026, 11, 21, 20, 0));
+        assert_eq!(parse_when("", "9:00", Repeat::Workday, now), at(2026, 11, 23, 9, 0));
+        assert!(parse_when("明天", "", n, now).is_err());
+        assert!(parse_when("", "25:00", n, now).is_err());
+        assert!(parse_when("2-30", "10:00", n, now).is_err());
+        assert_eq!(parse_hm("18"), Some((18, 0)));
+    }
 
     #[test]
     fn presets_sane() {

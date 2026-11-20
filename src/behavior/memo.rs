@@ -3,11 +3,14 @@
 use super::{Behavior, Bubble, Later, Shot, St, StateAct, lines, pick};
 use crate::core::memo::{self as store, Dt, Now};
 use crate::services::memo_parse::{self as mp, Parsed};
-use crate::types::{ChatInputCmd, ChatReply, MemoAct, MemoEv, MemoHit, SpeakKind, WinCmd};
+use crate::types::{ChatInputCmd, ChatReply, MemoAct, MemoEv, MemoHit, SpeakKind, VoiceMood, WinCmd};
 use super::fx::FxKind;
 
 /// 提醒气泡留多久（没点她的话）
-const ALERT_MS: u64 = 60_000;
+const ALERT_MS: u64 = 90_000;
+/// 没点她的话隔多久再追一次（叮咚 + 再念一遍），追 NAGS 次
+const NAG_MS: u64 = 30_000;
+const NAGS: u8 = 2;
 /// 点一下之后等多久才算「知道了」（等等看是不是双击）
 const ACK_DELAY: u64 = 550;
 
@@ -17,6 +20,10 @@ pub struct MemoUi {
     alert: Vec<u64>,
     alert_until: u64,
     bubble_token: u64,
+    /// 叮咚放完再念的那句
+    after_chime: Option<String>,
+    /// 追问时念的
+    nag_voice: String,
     /// 测试用的「现在」（io=false 时用）
     pub test_now: Option<Dt>,
 }
@@ -61,7 +68,50 @@ pub fn alert_lines(hits: &[MemoHit]) -> (String, String) {
     }
 }
 
+/// 没点她时追问念的话
+pub fn nag_line(hits: &[MemoHit]) -> String {
+    let n = names(hits);
+    if hits.len() == 1 { format!("{}！还没去吗？快去快去喵", strip_should(&n)) } else { format!("{n}，还没弄吗？快去喵") }
+}
+
+/// 单条准点提醒要念的话和语气（平台层拿去提前合成，到点直接命中缓存；clone 现合成要好几秒）：到点那句 + 追问那句
+pub fn memo_voices(text: &str) -> Vec<(String, Option<VoiceMood>)> {
+    let hits = [MemoHit { id: 0, text: text.to_string(), late: false }];
+    let (_, v) = alert_lines(&hits);
+    // memo_due 先切到 Surprised 再念，语气跟着它
+    let m = St::Surprised.voice_mood();
+    vec![(v, m), (nag_line(&hits), m)]
+}
+
+/// 提醒提示音：两声「叮——咚」（正弦 + 一点泛音，指数衰减），24 kHz 单声道 wav
+pub fn chime_wav() -> Vec<u8> {
+    const RATE: u32 = 24_000;
+    let notes = [(1318.5_f32, 0.0_f32), (1046.5, 0.22)];
+    let len = (RATE as f32 * 0.95) as usize;
+    let mut pcm = Vec::with_capacity(len * 2);
+    for i in 0..len {
+        let t = i as f32 / RATE as f32;
+        let mut s = 0.0;
+        for (f, at) in notes {
+            let dt = t - at;
+            if dt < 0.0 { continue; }
+            let env = (dt / 0.004).min(1.0) * (-dt * 5.5).exp();
+            let w = std::f32::consts::TAU * f * dt;
+            s += env * (w.sin() + 0.3 * (2.0 * w).sin() + 0.12 * (3.0 * w).sin());
+        }
+        let v = (s * 0.33).clamp(-1.0, 1.0);
+        pcm.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes());
+    }
+    crate::services::tts::pcm16_wav(RATE, &pcm)
+}
+
 impl Behavior {
+    /// 提醒语音还在合成/在放：别的台词只换气泡，不掐它（之前被「不许拎哈基米」顶掉过）
+    pub(super) fn memo_voice_busy(&self, token: u64) -> bool {
+        let mt = self.memo.bubble_token;
+        mt != 0 && token != mt && self.memo.active(self.now) && (self.voice_req == mt || self.voice_playing == Some(mt))
+    }
+
     fn memo_now(&self) -> Dt {
         if self.io { Now::get().dt } else { self.memo.test_now.unwrap_or_else(|| Dt::new(2026, 1, 1, 12, 0).unwrap_or(Dt::from_min(0))) }
     }
@@ -74,6 +124,9 @@ impl Behavior {
         self.voice(voice, SpeakKind::Chat, token);
         token
     }
+
+    /// 这个 token 是提醒的（叮咚/提醒语音）
+    pub(super) fn memo_token(&self, t: u64) -> bool { t != 0 && t == self.memo.bubble_token }
 
     /// 提醒还响着（没点、没过 ALERT_MS）：发呆换动作/打招呼/天气这些闲事先别来盖掉提醒气泡
     pub(super) fn memo_ringing(&self) -> bool { self.memo.active(self.now) }
@@ -105,7 +158,60 @@ impl Behavior {
         self.fx(FxKind::Exclaim, 1);
         let (bubble, voice) = alert_lines(&hits);
         self.memo.alert_until = self.now + ALERT_MS;
-        self.memo.bubble_token = self.memo_say(&bubble, &voice, ALERT_MS);
+        self.memo.nag_voice = nag_line(&hits);
+        self.laters.retain(|l| !matches!(l.1, Later::MemoNag(_)));
+        for n in 1..=NAGS {
+            self.later(NAG_MS * n as u64, Later::MemoNag(n));
+        }
+        let token = self.next_token();
+        self.bubble = Some(Bubble { text: bubble, shown: self.now, hide_at: Some(self.now + ALERT_MS), dur: ALERT_MS, token });
+        self.bubble_fade.set(true, self.now);
+        self.memo.bubble_token = token;
+        self.memo_chime(voice);
+    }
+
+    /// 先「叮咚」，放完（AudioDone）再念；token 用提醒气泡的，别的台词就掐不掉它
+    fn memo_chime(&mut self, voice: String) {
+        let tok = self.memo.bubble_token;
+        self.stop_voice();
+        self.voice_req = 0;
+        self.memo.after_chime = Some(voice);
+        self.call("chime".into());
+        if self.io {
+            let vol = crate::core::config::get().tts.volume.max(0.5);
+            crate::services::audio::play(tok, crate::types::Audio(chime_wav()), vol);
+        }
+        self.voice_playing = Some(tok);
+    }
+
+    /// AudioDone：叮咚放完了就接着念
+    pub(super) fn memo_audio_done(&mut self, token: u64) {
+        if token == 0 || token != self.memo.bubble_token || !self.memo.active(self.now) {
+            return;
+        }
+        if let Some(v) = self.memo.after_chime.take() {
+            self.voice(&v, SpeakKind::Chat, token);
+        }
+    }
+
+    /// 没点她：隔一会儿再叮咚 + 追一句，蹦一下
+    pub(super) fn memo_nag(&mut self, n: u8) {
+        if self.memo.bubble_token == 0 || !self.memo.active(self.now) {
+            return;
+        }
+        self.call(format!("memo:nag:{n}"));
+        self.cmds.push(WinCmd::Show);
+        if !matches!(self.state, St::Drag | St::Fall) {
+            self.play(Shot::Jump);
+        }
+        self.fx(FxKind::Exclaim, 1);
+        if let Some(b) = &mut self.bubble
+            && b.token == self.memo.bubble_token
+        {
+            b.hide_at = Some(self.memo.alert_until);
+        }
+        let v = self.memo.nag_voice.clone();
+        self.memo_chime(v);
     }
 
     /// 提醒响着时点她 = 知道了（稍等一下，看是不是双击）
@@ -126,6 +232,7 @@ impl Behavior {
             return;
         }
         self.call(format!("memo:ack:{ids:?}"));
+        self.memo.after_chime = None;
         if self.io {
             store::ack(&ids);
         }
@@ -194,7 +301,7 @@ impl Behavior {
                 self.say(&if n > 0 { format!("清掉了 {n} 条做完的喵") } else { "没有做完的可以清喵".into() }, 2200);
             }
             // 平台层打开文件
-            MemoAct::OpenFile => {}
+            MemoAct::OpenFile | MemoAct::OpenWindow => {}
         }
     }
 
@@ -298,6 +405,12 @@ mod tests {
         let out = ev(&mut b, AppEvent::Memo(MemoEv::Due(vec![hit(7, "开会", false)])), 3100);
         assert!(out.contains(&WinCmd::Show));
         assert!(b.scene.bubble.as_ref().is_some_and(|x| x.text.contains("该开会了")));
+        assert!(b.calls.iter().any(|c| c == "chime"));
+        assert!(!b.calls.iter().any(|c| c == "speak:喵！到点啦，该开会了"));
+        let tok = b.memo.bubble_token;
+        // 别的台词掐不掉叮咚
+        b.say("路过一句", 1000);
+        ev(&mut b, AppEvent::AudioDone { token: tok }, 3900);
         assert!(b.calls.iter().any(|c| c == "speak:喵！到点啦，该开会了"));
         click(&mut b, 4000);
         assert!(!b.calls.iter().any(|c| c.starts_with("memo:ack")));
@@ -321,6 +434,26 @@ mod tests {
         }
         assert_eq!(b.state, St::Idle);
         assert!(!b.calls.iter().any(|c| c.starts_with("memo:ack")));
+    }
+
+    #[test]
+    fn nags_until_acked() {
+        let mut b = mk();
+        tick(&mut b, 3000);
+        ev(&mut b, AppEvent::Memo(MemoEv::Due(vec![hit(5, "该喝水", false)])), 3100);
+        let mut t = 3100;
+        while t < 3100 + NAG_MS + 500 { t += 250; tick(&mut b, t); }
+        assert!(b.calls.iter().any(|c| c == "memo:nag:1"));
+        assert_eq!(b.calls.iter().filter(|c| *c == "chime").count(), 2);
+        let tok = b.memo.bubble_token;
+        ev(&mut b, AppEvent::AudioDone { token: tok }, t + 900);
+        assert!(b.calls.iter().any(|c| c == "speak:喝水！还没去吗？快去快去喵"));
+        click(&mut b, t + 1500);
+        tick(&mut b, t + 2200);
+        assert!(b.calls.iter().any(|c| c == "memo:ack:[5]"));
+        while t < 3100 + NAG_MS * 3 { t += 500; tick(&mut b, t); }
+        assert!(!b.calls.iter().any(|c| c == "memo:nag:2"));
+        assert!(chime_wav().len() > 40_000);
     }
 
     #[test]

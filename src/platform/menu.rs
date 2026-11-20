@@ -172,6 +172,7 @@ fn gen_items(kind: &str) -> (String, Vec<(String, String)>) {
                 .collect();
             v.push((String::new(), String::new())); // 分隔线
             v.push(("dance:".into(), "🎲 随便跳一支".into()));
+            v.push((format!("dance:{}", crate::behavior::dance::SONG_ID), "🎵 跟着我的歌跳（songs 文件夹）".into()));
             ("💃 跳个舞".into(), v)
         }
         _ => (String::new(), Vec::new()),

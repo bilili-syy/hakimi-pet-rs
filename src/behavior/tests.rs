@@ -46,10 +46,11 @@ fn five_quick_pokes_make_her_hiss() {
     let mut b = mk();
     tick(&mut b, 3000);
     for i in 0..4 { click(&mut b, 3000 + i * 300); }
-    assert_ne!(b.state, St::Hiss);
+    assert!(!matches!(b.state, St::Hiss | St::Puff));
     click(&mut b, 4300);
-    assert_eq!(b.state, St::Hiss);
-    assert_eq!(b.scene.face, Face::Hiss);
+    // 一半炸毛哈气、一半鼓脸赌气
+    assert!(matches!(b.state, St::Hiss | St::Puff));
+    assert!(matches!(b.scene.face, Face::Hiss | Face::Puff));
     tick(&mut b, 4320 + 2200);
     assert_eq!(b.state, St::Idle);
 }

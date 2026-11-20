@@ -16,6 +16,7 @@ mod skin_menu;
 mod menu;
 mod perch;
 mod power;
+mod sense;
 mod settings;
 mod sys;
 mod timers;
@@ -436,6 +437,24 @@ fn rearm() {
     });
 }
 
+/// 两小时内要响的备忘提醒，先把语音合成进缓存（数据变了或每 10 分钟看一次）
+fn memo_prewarm() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let now = crate::core::memo::Now::get().dt;
+    let key = (crate::core::memo::version() << 32) | ((now.to_min() / 10) as u64 & 0xffff_ffff);
+    if LAST.swap(key, Ordering::Relaxed) == key { return; }
+    let soon = now.add_min(120);
+    let items: Vec<_> = crate::core::memo::pending()
+        .into_iter()
+        .filter(|i| i.due().is_some_and(|d| d <= soon))
+        .flat_map(|i| crate::behavior::memo_voices(&i.text))
+        .collect();
+    if !items.is_empty() {
+        crate::services::tts::prewarm_now(items);
+    }
+}
+
 fn tick() {
     if PUMPING.with(|p| p.get()) {
         rearm();
@@ -458,6 +477,11 @@ fn tick() {
     if !hits.is_empty() {
         evs.push(AppEvent::Memo(crate::types::MemoEv::Due(hits)));
         menu::refresh();
+    }
+    memo_prewarm();
+    // 场景感知：走开/回来、打字、晃鼠标、全屏、音乐
+    if let Some(h) = with(|s| s.hwnd) {
+        sense::maybe_poll(now, h, &mut evs);
     }
     for e in evs {
         emit(e);
@@ -650,6 +674,7 @@ fn after(a: MenuAction) {
         }
         MenuAction::Quit => do_quit(),
         MenuAction::Memo(crate::types::MemoAct::OpenFile) => open_path(&crate::core::memo::ensure_file()),
+        MenuAction::Memo(crate::types::MemoAct::OpenWindow) => settings::open(3),
         MenuAction::Mind(crate::types::MindAct::OpenFile) => open_path(&crate::core::memory::ensure_file()),
         // 清空记忆：弹框二次确认，确认了才真的发 Clear（行为层清空并哭一下）
         MenuAction::Mind(crate::types::MindAct::ClearAsk) if mind_menu::confirm_clear(main_hwnd()) => {

@@ -159,7 +159,9 @@ pub static SCORES: [Score; 3] = [
 
 const STOPPED: &[&str] = &["诶？不跳啦？那哈基米歇会儿喵～", "被你按住了喵…下次再跳给你看！"];
 const TOO_TIRED: &[&str] = &["跳不动了喵…让哈基米先歇一会儿嘛～", "腿软软的…今天的舞先欠着喵～"];
-const NO_SONG: &str = "（没找到歌，用哈基米牌鼓点喵）";
+const NO_SONG: &str = "（songs 文件夹里还没有歌，先用哈基米牌鼓点喵）";
+/// 菜单「🎵 跟着我的歌跳」：随机一支舞，配 songs 文件夹里随机一首歌；别的舞都用自己的内置鼓点
+pub const SONG_ID: &str = "song";
 
 /// id → 舞谱；"" 或不认识的 id 随机挑一支
 pub fn find(id: &str) -> &'static Score {
@@ -450,7 +452,8 @@ impl Routine {
 impl Behavior {
     /// 菜单「跳个舞」
     pub(super) fn start_routine(&mut self, id: &str) {
-        let score = find(id);
+        let use_song = id == SONG_ID;
+        let score = find(if use_song { "" } else { id });
         // 跟逗猫棒一样：正在玩/输入框里打了字/等 AI 回复时不开跳
         if self.play.game.is_some() || self.chat_busy() || self.waiting { return; }
         self.yield_chat();
@@ -468,7 +471,7 @@ impl Behavior {
         let now = self.now;
         let mut r = Routine::new(score, now);
         r.still = self.play.perch.is_some();
-        let path = if self.io { crate::services::songs::pick() } else { None };
+        let path = if self.io && use_song { crate::services::songs::pick() } else { None };
         let tok = self.next_token();
         self.song = Some(tok);
         let secs = score.secs.ceil() as u32 + 1;
@@ -491,7 +494,7 @@ impl Behavior {
         }
         self.routine = Some(r);
         let mut line = pick(score.intro);
-        if !has_song { line.push_str(NO_SONG); }
+        if use_song && !has_song { line.push_str(NO_SONG); }
         // 放着音乐：只出气泡不念（只有一个声道）
         self.say(&line, 3200);
     }

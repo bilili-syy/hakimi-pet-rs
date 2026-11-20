@@ -14,14 +14,17 @@ pub const WIN_H: u32 = 360;
 pub enum Face {
     Idle, Blink, Happy, Drag, Sit, Sleep, Eat, Hungry, Think, Walk1, Walk2,
     Shy, Dizzy, Surprised, Cry, Yawn, Love, Hiss, Stare, Dance, Honey,
+    /// v1.1 新表情：委屈嘟嘴 / 得意叉腰 / 疑惑歪头 / 害怕发抖 / 星星眼 / 鼓脸生气
+    Pout, Smug, Confused, Scared, Starry, Puff,
 }
 
 impl Face {
-    pub const ALL: [Face; 21] = [
+    pub const ALL: [Face; 27] = [
         Face::Idle, Face::Blink, Face::Happy, Face::Drag, Face::Sit, Face::Sleep, Face::Eat,
         Face::Hungry, Face::Think, Face::Walk1, Face::Walk2, Face::Shy, Face::Dizzy,
         Face::Surprised, Face::Cry, Face::Yawn, Face::Love, Face::Hiss, Face::Stare,
-        Face::Dance, Face::Honey,
+        Face::Dance, Face::Honey, Face::Pout, Face::Smug, Face::Confused, Face::Scared,
+        Face::Starry, Face::Puff,
     ];
     /// 对应 assets/sprites/<stem>.png
     pub fn stem(self) -> &'static str {
@@ -31,7 +34,8 @@ impl Face {
             Face::Think => "think", Face::Walk1 => "walk1", Face::Walk2 => "walk2", Face::Shy => "shy",
             Face::Dizzy => "dizzy", Face::Surprised => "surprised", Face::Cry => "cry",
             Face::Yawn => "yawn", Face::Love => "love", Face::Hiss => "hiss", Face::Stare => "stare",
-            Face::Dance => "dance", Face::Honey => "honey",
+            Face::Dance => "dance", Face::Honey => "honey", Face::Pout => "pout", Face::Smug => "smug",
+            Face::Confused => "confused", Face::Scared => "scared", Face::Starry => "starry", Face::Puff => "puff",
         }
     }
 }
@@ -207,6 +211,8 @@ pub enum MemoAct {
     /// 稍后 10 分钟再提醒（正在响的那些）
     Snooze,
     OpenFile,
+    /// 设置窗口的「备忘录」页
+    OpenWindow,
     ClearDone,
 }
 
@@ -267,6 +273,25 @@ pub enum AppEvent {
     Memo(MemoEv),
     /// 长期记忆：后台结果
     Mind(MindEv),
+    /// 场景感知（platform/sense.rs）
+    Sense(SenseEv),
+}
+
+/// 场景感知事件：只在状态变化时发
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SenseEv {
+    /// 用户没动静了：1 = 3 分钟，2 = 10 分钟
+    UserIdle(u8),
+    /// 走开 ≥5 分钟后又有输入了（离开了多少秒）
+    UserBack { secs: u32 },
+    /// 持续快速打字（20 秒里大部分时间在敲键盘）
+    Typing,
+    /// 鼠标左右猛晃
+    CursorShake,
+    /// 前台全屏程序（游戏/全屏视频）开始 / 结束
+    Fullscreen(bool),
+    /// 后台音乐播放器在出声 开始 / 停了
+    Music(bool),
 }
 
 /// 线程安全的事件投递器：服务层工作线程用它把结果送回 UI 线程。

@@ -31,11 +31,11 @@ const COSTUME_FACES: [&str; 8] = ["idle", "happy", "drag", "sit", "sleep", "eat"
 
 fn costume_alias(stem: &str) -> &str {
     match stem {
-        "shy" | "love" | "dance" => "happy",
+        "shy" | "love" | "dance" | "smug" | "starry" => "happy",
         "honey" => "eat",
-        "dizzy" | "surprised" | "hiss" => "drag",
-        "cry" => "hungry",
-        "stare" => "think",
+        "dizzy" | "surprised" | "hiss" | "scared" => "drag",
+        "cry" | "pout" => "hungry",
+        "stare" | "confused" | "puff" => "think",
         "yawn" => "idle",
         s => s,
     }

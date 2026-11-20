@@ -45,6 +45,12 @@ unsafe fn is_fullscreen(fg: HWND, pet: HWND) -> bool {
     covers(&r, &mi.rcMonitor)
 }
 
+/// 前台是不是全屏程序（不算她自己）
+pub unsafe fn fullscreen_now(pet: HWND) -> bool {
+    let fg = unsafe { GetForegroundWindow() };
+    !fg.is_invalid() && fg != pet && unsafe { is_fullscreen(fg, pet) }
+}
+
 fn covers(r: &RECT, m: &RECT) -> bool { r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom }
 
 fn on_battery() -> bool {

@@ -4,6 +4,9 @@ pub mod fx;
 pub mod lines;
 pub mod play;
 mod memo;
+pub use memo::memo_voices;
+mod sense;
+pub use sense::norm_birthday;
 mod emotion;
 mod skin;
 pub mod beat;
@@ -26,6 +29,7 @@ use std::time::Instant;
 pub enum St {
     Idle, Walk, Sit, Sleep, Eat, Happy, Hungry, Think, Drag, Fall,
     Shy, Dizzy, Surprised, Cry, Yawn, Love, Hiss, Stare, Dance, Honey,
+    Pout, Smug, Confused, Scared, Starry, Puff,
 }
 
 impl St {
@@ -50,18 +54,24 @@ impl St {
             St::Stare => Face::Stare,
             St::Dance => Face::Dance,
             St::Honey => Face::Honey,
+            St::Pout => Face::Pout,
+            St::Smug => Face::Smug,
+            St::Confused => Face::Confused,
+            St::Scared => Face::Scared,
+            St::Starry => Face::Starry,
+            St::Puff => Face::Puff,
         }
     }
     /// VOICE_MOOD
     fn voice_mood(self) -> Option<VoiceMood> {
         Some(match self {
-            St::Shy | St::Love | St::Dance | St::Honey | St::Happy | St::Eat => VoiceMood::Happy,
-            St::Cry | St::Dizzy | St::Sit => VoiceMood::Sad,
+            St::Shy | St::Love | St::Dance | St::Honey | St::Happy | St::Eat | St::Smug | St::Starry => VoiceMood::Happy,
+            St::Cry | St::Dizzy | St::Sit | St::Pout | St::Scared => VoiceMood::Sad,
             St::Yawn | St::Sleep => VoiceMood::Sleepy,
-            St::Hiss | St::Drag => VoiceMood::Mad,
+            St::Hiss | St::Drag | St::Puff => VoiceMood::Mad,
             St::Surprised | St::Stare => VoiceMood::Calm,
             St::Hungry => VoiceMood::Hungry,
-            St::Think => VoiceMood::Think,
+            St::Think | St::Confused => VoiceMood::Think,
             _ => return None,
         })
     }
@@ -102,6 +112,8 @@ enum Later {
     ChatVoiceTimeout(u64),
     /// 备忘提醒：点她之后确认「知道了」（等等看是不是双击）
     MemoAck,
+    /// 备忘提醒没人理：第 n 次追问
+    MemoNag(u8),
 }
 
 /// 透明度过渡（transition: opacity 0.25s）
@@ -248,6 +260,7 @@ pub struct Behavior {
     /// 新互动（behavior/play.rs）
     play: play::Play,
     memo: memo::MemoUi,
+    sense: sense::SenseUi,
     /// 情绪表情 + 长期记忆（behavior/emotion.rs）
     mind: emotion::MindUi,
     /// 语音回答进行中（behavior/chatvoice.rs）
@@ -341,6 +354,7 @@ impl Behavior {
             fake_chat_voice_off: false,
             key_hint_shown: false,
             memo: memo::MemoUi::default(),
+            sense: sense::SenseUi::default(),
             mind: emotion::MindUi::default(),
         };
         b.mood_cls = b.stats.mood();
@@ -419,6 +433,7 @@ impl Behavior {
                     self.song = None;
                     if self.state == St::Dance { self.end_dance(); }
                 }
+                self.memo_audio_done(token);
                 self.cv_on_audio_done(token);
                 self.emotion_cv_done();
             }
@@ -445,6 +460,7 @@ impl Behavior {
             AppEvent::PerchLost => self.on_perch_lost(),
             AppEvent::Memo(m) => self.on_memo(m),
             AppEvent::Mind(m) => self.on_mind(m),
+            AppEvent::Sense(e) => self.on_sense(e),
         }
         self.sync_play();
         self.build_scene();
@@ -454,6 +470,7 @@ impl Behavior {
     pub fn frame_at(&mut self, now: u64, out: &mut Vec<WinCmd>) -> u32 {
         self.now = now;
         self.run_timers();
+        self.sense_frame();
         self.dance_tick();
         self.sync_play();
         self.build_scene();
@@ -581,7 +598,7 @@ impl Behavior {
     fn on_later(&mut self, l: Later) {
         match l {
             Later::LevelUp(name) => {
-                self.react(St::Love, 3000, Some(pickv(lines::level_up(name))));
+                self.react(St::Starry, 3000, Some(pickv(lines::level_up(name))));
                 self.fx(FxKind::Spark, 8);
                 self.fx(FxKind::Heart, 4);
             }
@@ -599,7 +616,10 @@ impl Behavior {
             }
             Later::Greet => {
                 let slot = self.greet_slot_line();
-                let line = if Self::is_night() {
+                let fest = self.festive_line();
+                let line = if let Some(f) = fest.clone() {
+                    f
+                } else if Self::is_night() {
                     pick(lines::NIGHT)
                 } else if let Some(l) = slot {
                     l
@@ -608,7 +628,8 @@ impl Behavior {
                 } else {
                     pick(lines::HELLO)
                 };
-                self.react(St::Happy, 1500, Some(line));
+                let st = if fest.is_some() || (self.saved_existed && self.away_min >= 60.0) { St::Starry } else { St::Happy };
+                self.react(st, 1500, Some(line));
                 if self.stats.data.hunger < 30.0 { self.later(3000, Later::Beg); }
             }
             Later::Beg => self.go_beg(),
@@ -619,6 +640,7 @@ impl Behavior {
             }
             Later::ChatVoiceTimeout(t) => self.cv_timeout(t),
             Later::MemoAck => self.memo_ack(),
+            Later::MemoNag(n) => self.memo_nag(n),
         }
     }
 
@@ -726,6 +748,7 @@ impl Behavior {
 
     /// 气泡先出，声音随后到；新台词会打断旧的
     fn voice(&mut self, text: &str, kind: SpeakKind, token: u64) {
+        if self.memo_voice_busy(token) || self.sense_mute(token) { return; }
         self.stop_voice();
         if self.routine.is_some() { return; } // 跳舞时不念（内置鼓点走语音声道）；放歌时照念，audio 混音、压低音乐
         self.voice_req = token;
@@ -1028,8 +1051,10 @@ impl Behavior {
             self.pokes.clear();
             self.act(Act::Angry);
             self.play(Shot::Shake);
-            self.set_state(St::Hiss, None);
-            let l = if fastrand::bool() { lines::HISS } else { lines::POKE_MAD };
+            // 一半炸毛哈气，一半鼓脸赌气
+            let puff = fastrand::bool();
+            self.set_state(if puff { St::Puff } else { St::Hiss }, None);
+            let l = if puff { lines::PUFF } else if fastrand::bool() { lines::HISS } else { lines::POKE_MAD };
             self.say(&pick(l), 2600);
             self.fx(FxKind::Anger, 1);
             self.hold_timer(2200, StateAct::Set(St::Idle, Some((5000.0, 10000.0))));
@@ -1061,6 +1086,9 @@ impl Behavior {
                     return self.react(St::Cry, 2600, Some(pick(lines::CRY)));
                 }
                 self.play(Shot::Squash);
+                if fastrand::bool() {
+                    return self.react(St::Pout, 2600, Some(pick(lines::POUT)));
+                }
                 self.say(&pick(lines::POKE_SAD), 2600);
                 return self.set_state(St::Sit, Some((8000.0, 12000.0)));
             }
@@ -1077,6 +1105,7 @@ impl Behavior {
             if great { self.fx(FxKind::Heart, 3) } else { self.fx(FxKind::Spark, 6) }
         }
         if let Some(l) = self.affinity_line() { return self.react(St::Love, 2000, Some(l)); }
+        if fastrand::f64() < 0.15 { return self.react(St::Confused, 1600, Some(pick(lines::CONFUSED))); }
         let l = if great && fastrand::bool() { lines::POKE_GREAT } else { lines::POKE };
         self.react(St::Happy, 1200, Some(pick(l)));
     }
@@ -1093,9 +1122,11 @@ impl Behavior {
             return;
         }
         if big {
-            self.say(&pick(lines::LAND_BIG), 2600);
-            self.set_state(St::Drag, None);
-            self.hold_timer(1200, StateAct::Set(St::Idle, Some((4000.0, 8000.0))));
+            let scared = fastrand::bool();
+            self.say(&pick(if scared { lines::SCARED } else { lines::LAND_BIG }), 2600);
+            self.set_state(if scared { St::Scared } else { St::Drag }, None);
+            if scared { self.play(Shot::Shake); self.fx(FxKind::Sweat, 1); }
+            self.hold_timer(if scared { 2200 } else { 1200 }, StateAct::Set(St::Idle, Some((4000.0, 8000.0))));
         } else {
             self.set_state(St::Idle, Some((4000.0, 8000.0)));
         }
@@ -1347,7 +1378,11 @@ impl Behavior {
             PomodoroEv::Done { .. } => {
                 self.pomo_running = false;
                 self.play(Shot::Bounce);
-                self.react(St::Happy, 3500, Some(pick(lines::POMO_DONE)));
+                if fastrand::bool() {
+                    self.react(St::Smug, 3500, Some(pick(lines::SMUG)));
+                } else {
+                    self.react(St::Happy, 3500, Some(pick(lines::POMO_DONE)));
+                }
                 self.act(Act::Pat);
             }
             PomodoroEv::Cancel => {
@@ -1363,7 +1398,7 @@ impl Behavior {
             MoyuEv::Back { .. } => {
                 self.play(Shot::Bounce);
                 self.act(Act::Pat);
-                self.react(St::Happy, 3000, Some(pick(lines::MOYU_BACK)));
+                self.react(if fastrand::bool() { St::Smug } else { St::Happy }, 3000, Some(pick(lines::MOYU_BACK)));
             }
             MoyuEv::Nag { level, minutes, what, pomodoro } => {
                 let what = lines::moyu_name(&what);
@@ -1380,7 +1415,7 @@ impl Behavior {
                     }
                     2 => {
                         self.play(Shot::Shake);
-                        self.react(St::Hungry, 3500, Some(pickv(lines::moyu2(&what, minutes))));
+                        self.react(St::Pout, 3500, Some(pickv(lines::moyu2(&what, minutes))));
                     }
                     _ => {
                         self.play(Shot::Shake);

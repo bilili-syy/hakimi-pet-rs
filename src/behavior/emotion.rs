@@ -63,6 +63,12 @@ pub fn emotion_state(e: Emotion) -> St {
         Emotion::Stare => St::Stare,
         Emotion::Yawn => St::Yawn,
         Emotion::Idle => St::Idle,
+        Emotion::Pout => St::Pout,
+        Emotion::Smug => St::Smug,
+        Emotion::Confused => St::Confused,
+        Emotion::Scared => St::Scared,
+        Emotion::Starry => St::Starry,
+        Emotion::Puff => St::Puff,
     }
 }
 
@@ -120,7 +126,20 @@ impl Behavior {
                 self.fx(FxKind::Anger, 1);
             }
             Emotion::Dizzy => self.fx(FxKind::Dizzy, 1),
-            Emotion::Think | Emotion::Stare | Emotion::Yawn | Emotion::Idle => {}
+            Emotion::Starry | Emotion::Smug => {
+                self.play(Shot::Jump);
+                self.fx(FxKind::Spark, 6);
+            }
+            Emotion::Pout => self.play(Shot::Squash),
+            Emotion::Puff => {
+                self.play(Shot::Shake);
+                self.fx(FxKind::Anger, 1);
+            }
+            Emotion::Scared => {
+                self.play(Shot::Shake);
+                self.fx(FxKind::Sweat, 1);
+            }
+            Emotion::Think | Emotion::Stare | Emotion::Yawn | Emotion::Idle | Emotion::Confused => {}
         }
     }
 

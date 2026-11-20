@@ -54,6 +54,30 @@ pub const SONG: &[&str] = &["哈基米～哈基米～哈基米～哈基米哦南
 pub const HONEY: &[&str] = &["蜂蜜水！舔了蜂蜜，脚步就会变快喵！", "其实哈基米就是蜂蜜的意思哦～咕嘟咕嘟"];
 pub const FAST: &[&str] = &["冲冲冲！哈基米现在超快的喵！", "脚步变快啦——"];
 pub const SLOW: &[&str] = &["蜂蜜的劲儿过去了喵……"];
+// ---- v1.1 新表情的台词
+pub const POUT: &[&str] = &["哼……没人理哈基米", "呜……哈基米委屈了喵", "嘴巴撅起来了，要哄哄才好喵"];
+pub const SMUG: &[&str] = &["哼哼，哈基米厉害吧！", "夸我！快夸我喵！", "这点小事，难不倒哈基米～"];
+pub const CONFUSED: &[&str] = &["嗯？戳哈基米干嘛喵？", "诶……这是什么意思喵？", "哈基米没听懂，再说一遍嘛"];
+pub const SCARED: &[&str] = &["吓、吓死哈基米了！", "呜哇——好高好可怕喵！", "不要再摔哈基米了……"];
+pub const STARRY: &[&str] = &["哇——眼睛都要冒星星了喵！", "是小鱼干！是小鱼干！", "好厉害好厉害！哈基米超激动！"];
+pub const PUFF: &[&str] = &["哼！不理你了喵！", "气鼓鼓！再戳就咬你喵！", "要三条小鱼干才能哄好哈基米！"];
+pub const ALONE: &[&str] = &["人呢？哈基米自己玩一会儿喵～", "好安静……主人去哪儿了喵", "没人陪……那哈基米先打个盹"];
+pub const TYPING: &[&str] = &["敲键盘好快喵！加油加油～", "噼里啪啦——你今天好认真喵！", "哈基米给你打气！冲呀～"];
+pub const POUNCE: &[&str] = &["抓到了！……诶？又跑了喵！", "鼠标别跑！哈基米来啦！", "喵！那个箭头在挑衅我！"];
+pub const FS_OFF: &[&str] = &["忙完啦？哈基米刚才一直很安静哦～", "终于出来了喵，刚才好专心呀"];
+pub const MUSIC: &[&str] = &["这首好好听喵～哈基米跟着摇一摇", "音乐响起来啦，哈基米也要动起来～", "哼哼～这个旋律哈基米喜欢"];
+pub const BIRTHDAY: &[&str] = &["生日快乐！今天你是最重要的人喵！", "祝主人生日快乐～哈基米给你唱首歌！"];
+pub const NEW_YEAR: &[&str] = &["新年快乐喵！今年也请多多关照～"];
+pub const VALENTINE: &[&str] = &["情人节快乐～哈基米的小鱼干分你一半喵"];
+pub const HALLOWEEN: &[&str] = &["不给小鱼干就捣蛋喵！万圣节快乐～"];
+pub const XMAS: &[&str] = &["圣诞快乐喵！今晚要早点睡，等礼物哦～"];
+pub const YEAR_END: &[&str] = &["今年最后一天啦，谢谢你一直陪着哈基米喵"];
+pub const SPRING: &[&str] = &["新春快乐！哈基米给你拜年啦，红包拿来喵～"];
+pub const LANTERN: &[&str] = &["元宵节快乐喵！汤圆要芝麻馅的～"];
+pub const DRAGON_BOAT: &[&str] = &["端午安康喵！粽子是甜的还是咸的？"];
+pub const QIXI: &[&str] = &["七夕快乐喵～今天也有哈基米陪你"];
+pub const MID_AUTUMN: &[&str] = &["中秋快乐喵！月亮好圆，像一块大月饼～"];
+pub const WELCOME: &[&str] = &["你回来啦！哈基米等你好久了喵！", "欢迎回来～刚才去哪儿了喵？", "终于回来了！哈基米一个人好无聊"];
 
 /// 固定台词按「最可能在什么心情下说」预合成（PREWARM_MOOD；没写的是 calm）
 pub const PREWARM: &[(&[&str], VoiceMood)] = &[
@@ -110,6 +134,29 @@ pub const PREWARM: &[(&[&str], VoiceMood)] = &[
     (HONEY, VoiceMood::Happy),
     (FAST, VoiceMood::Happy),
     (SLOW, VoiceMood::Calm),
+    (POUT, VoiceMood::Sad),
+    (SMUG, VoiceMood::Happy),
+    (CONFUSED, VoiceMood::Think),
+    (SCARED, VoiceMood::Sad),
+    (STARRY, VoiceMood::Happy),
+    (PUFF, VoiceMood::Mad),
+    (WELCOME, VoiceMood::Happy),
+    (ALONE, VoiceMood::Calm),
+    (TYPING, VoiceMood::Happy),
+    (POUNCE, VoiceMood::Happy),
+    (FS_OFF, VoiceMood::Happy),
+    (MUSIC, VoiceMood::Happy),
+    (BIRTHDAY, VoiceMood::Happy),
+    (NEW_YEAR, VoiceMood::Happy),
+    (VALENTINE, VoiceMood::Happy),
+    (HALLOWEEN, VoiceMood::Happy),
+    (XMAS, VoiceMood::Happy),
+    (YEAR_END, VoiceMood::Happy),
+    (SPRING, VoiceMood::Happy),
+    (LANTERN, VoiceMood::Happy),
+    (DRAGON_BOAT, VoiceMood::Happy),
+    (QIXI, VoiceMood::Happy),
+    (MID_AUTUMN, VoiceMood::Happy),
 ];
 
 // ---- 带参数的台词（原版里是函数）
