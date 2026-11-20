@@ -210,6 +210,8 @@ pub struct Behavior {
     last_beg: u64,
 
     chatting: bool,
+    /// 测试用：io=false 时假装输入框里有字（真机读 platform::chat_has_text）
+    pub(crate) fake_chat_text: bool,
     waiting: bool,
     pomo_running: bool,
 
@@ -284,6 +286,7 @@ impl Behavior {
             pokes: Vec::new(),
             last_beg: 0,
             chatting: false,
+            fake_chat_text: false,
             waiting: false,
             pomo_running: false,
             token_seq: 0,
@@ -687,7 +690,8 @@ impl Behavior {
     // ============================================================ 自主行为
     /// 空闲时自己决定下一步做什么，受数值影响
     fn think(&mut self) {
-        if matches!(self.state, St::Drag | St::Fall) || self.chatting { return; }
+        if matches!(self.state, St::Drag | St::Fall) || self.chat_busy() { return; }
+        self.yield_chat();
         let m = self.stats.mood();
         let energy = self.stats.data.energy;
         let r = fastrand::f64();
@@ -863,6 +867,7 @@ impl Behavior {
         let Some(d) = &self.down else { return };
         let dist = (((sx - d.sx) as f32).powi(2) + ((sy - d.sy) as f32).powi(2)).sqrt();
         if !self.dragging && dist > 4.0 * s {
+            self.yield_chat();
             self.dragging = true;
             self.dragging_cls = true;
             self.act(Act::Drag);
@@ -916,6 +921,7 @@ impl Behavior {
     }
 
     fn on_poke(&mut self) {
+        self.yield_chat();
         if self.state == St::Sleep {
             self.act(Act::Wake);
             self.play(Shot::Shake);
@@ -1002,6 +1008,14 @@ impl Behavior {
 
     // ============================================================ 菜单
     fn on_menu(&mut self, a: MenuAction) {
+        // 让她做事的菜单项：输入框开着但没打字就顺手关掉；打了字就留着（框跟着她走）
+        if matches!(
+            a,
+            MenuAction::Feed | MenuAction::Pat | MenuAction::Honey | MenuAction::Song | MenuAction::Sleep
+                | MenuAction::Walk | MenuAction::Costume(_) | MenuAction::Outfit(..) | MenuAction::ClearOutfit
+        ) {
+            self.yield_chat();
+        }
         match a {
             MenuAction::Feed => {
                 let was_starving = self.stats.data.hunger < 15.0;
@@ -1112,6 +1126,21 @@ impl Behavior {
         self.state_timer = None;
         if matches!(self.state, St::Walk | St::Sleep) { self.set_state(St::Idle, None); }
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Open));
+    }
+
+    /// 输入框里有没有打了字
+    fn chat_typed(&self) -> bool {
+        if self.io { crate::platform::chat_has_text() } else { self.fake_chat_text }
+    }
+
+    /// 聊天框开着且「有内容」：打了字，或者正在等 AI 回复。这时不自己溜达/睡觉，也不被别的动作关掉
+    fn chat_busy(&self) -> bool { self.chatting && (self.waiting || self.chat_typed()) }
+
+    /// 别的动作来了：空输入框直接收起（不改状态，让那个动作自己定）；有内容就留着
+    fn yield_chat(&mut self) {
+        if !self.chatting || self.chat_busy() { return; }
+        self.chatting = false;
+        self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Close));
     }
 
     fn close_chat(&mut self) {

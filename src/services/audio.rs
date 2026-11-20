@@ -208,6 +208,58 @@ mod tests {
         assert_eq!(can_decode(ogg), crate::services::tts::bundled_playable());
     }
 
+    /// 诊断：按 start() 里 Src::Mem 完全一样的方式解码一句内置台词，把样本写成 16 位 wav，
+    /// 另外按 48k 双声道（常见声卡格式）走一遍 rodio 的统一转换，看重采样/声道复制有没有问题。
+    /// `HAKIMI_DUMP_TEXT=再戳要挠你了喵！ HAKIMI_DUMP_DIR=... cargo test -- --ignored dump_bundled_line`
+    #[test]
+    #[ignore]
+    fn dump_bundled_line() {
+        use rodio::Source;
+        let text = std::env::var("HAKIMI_DUMP_TEXT").unwrap_or_else(|_| "再戳要挠你了喵！".into());
+        let dir = std::path::PathBuf::from(std::env::var("HAKIMI_DUMP_DIR").unwrap_or_else(|_| ".".into()));
+        let t = crate::core::config::TtsConfig::default();
+        let bytes = crate::services::tts::bundled(&t, &text).expect("bundled line").to_vec();
+        let len = bytes.len() as u64;
+        let build = |b: Vec<u8>| {
+            rodio::Decoder::builder().with_data(std::io::Cursor::new(b)).with_byte_len(len).with_seekable(true).build().unwrap()
+        };
+        let dec = build(bytes.clone());
+        let (sr, ch): (u32, u16) = (dec.sample_rate().into(), dec.channels().into());
+        let raw: Vec<f32> = dec.collect();
+        println!("decoded: {sr} Hz, {ch} ch, {} samples, {:.3}s", raw.len(), raw.len() as f64 / f64::from(sr) / f64::from(ch));
+        write_wav(&dir.join("rodio_raw.wav"), sr, ch, &raw);
+        // 和真机一样：Player 接到 48k 双声道的 mixer 上，从 mixer 输出端拉样本（声卡就是这么拉的）
+        let (mixer, out) = rodio::mixer::mixer(2.try_into().unwrap(), 48_000.try_into().unwrap());
+        let player = rodio::Player::connect_new(&mixer);
+        player.set_volume(1.0);
+        player.append(build(bytes));
+        let conv: Vec<f32> = out.take(96_000 * 4).collect();
+        let last = conv.iter().rposition(|s| s.abs() > 1e-4).unwrap_or(0);
+        println!("via mixer 48k/2ch: last non-silent sample at {:.3}s, player empty={}", last as f64 / 96_000.0, player.empty());
+        write_wav(&dir.join("rodio_48k_stereo.wav"), 48_000, 2, &conv);
+    }
+
+    fn write_wav(path: &std::path::Path, sr: u32, ch: u16, samples: &[f32]) {
+        let data_len = (samples.len() * 2) as u32;
+        let mut out = Vec::with_capacity(44 + data_len as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&ch.to_le_bytes());
+        out.extend_from_slice(&sr.to_le_bytes());
+        out.extend_from_slice(&(sr * u32::from(ch) * 2).to_le_bytes());
+        out.extend_from_slice(&(ch * 2).to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        for s in samples {
+            out.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
     /// 真开声卡（音量 0，不出声）：验证 play → AudioDone、stop → AudioDone。
     /// `cargo test -- --ignored audio_device` 手动跑；CI/无声卡环境跳过。
     #[test]
