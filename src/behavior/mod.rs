@@ -3,6 +3,7 @@
 pub mod fx;
 pub mod lines;
 pub mod play;
+mod memo;
 
 use crate::core::stats::{Act, ActResult, MoodLevel, Stats};
 use crate::render::{BubbleView, Rect, Scene, StatusView, Xf, ZGlyph, anim};
@@ -93,6 +94,8 @@ enum Later {
     Prewarm,
     BlinkEnd,
     DoubleBlink,
+    /// 备忘提醒：点她之后确认「知道了」（等等看是不是双击）
+    MemoAck,
 }
 
 /// 透明度过渡（transition: opacity 0.25s）
@@ -230,6 +233,7 @@ pub struct Behavior {
 
     /// 新互动（behavior/play.rs）
     play: play::Play,
+    memo: memo::MemoUi,
 }
 
 impl Behavior {
@@ -304,6 +308,7 @@ impl Behavior {
             costume,
             outfits,
             play: play::Play::default(),
+            memo: memo::MemoUi::default(),
         };
         b.mood_cls = b.stats.mood();
         b.next_blink = b.now + rand(2500.0, 6000.0) as u64;
@@ -359,13 +364,14 @@ impl Behavior {
                 if let Some(b) = &mut self.bubble { b.hide_at = Some(now + 60_000); }
             }
             AppEvent::AudioDone { token } => {
+                let tail = self.memo.bubble_tail(token, now);
                 if self.voice_playing == Some(token) {
                     self.voice_playing = None;
                     if let Some(b) = &mut self.bubble
                         && b.token == token
                         && self.bubble_fade.on
                     {
-                        b.hide_at = Some(now + 1000);
+                        b.hide_at = Some(now + tail);
                     }
                 }
                 if self.song == Some(token) {
@@ -394,6 +400,7 @@ impl Behavior {
             AppEvent::Perched(k) => self.on_perched(k),
             AppEvent::ClimbFailed => self.on_climb_failed(),
             AppEvent::PerchLost => self.on_perch_lost(),
+            AppEvent::Memo(m) => self.on_memo(m),
         }
         self.sync_play();
         self.build_scene();
@@ -566,6 +573,7 @@ impl Behavior {
                 if self.io { crate::services::tts::prewarm(items); }
             }
             Later::BlinkEnd => { if self.face == Face::Blink { self.show(Face::Idle); } }
+            Later::MemoAck => self.memo_ack(),
             Later::DoubleBlink => {
                 if self.face == Face::Idle {
                     self.show(Face::Blink);
@@ -893,7 +901,8 @@ impl Behavior {
                 self.down = None;
                 self.dragging = false;
             }
-            MouseEv::DoubleClick { x, y } if self.zone(x, y) == Zone::Pet => self.open_chat(),
+            // 备忘提醒响着时双击 = 稍后再提醒，否则开聊天
+            MouseEv::DoubleClick { x, y } if self.zone(x, y) == Zone::Pet && !self.memo_double_click() => self.open_chat(),
             _ => {}
         }
     }
@@ -959,6 +968,7 @@ impl Behavior {
 
     fn on_poke(&mut self) {
         self.yield_chat();
+        if self.memo_poke() { return; }
         if self.state == St::Sleep {
             self.act(Act::Wake);
             self.play(Shot::Shake);
@@ -1128,6 +1138,7 @@ impl Behavior {
                 if self.io { crate::core::config::update(|c| c.moyu.enabled = on); }
                 self.say(&pick(if on { lines::MOYU_ON } else { lines::MOYU_OFF }), 2600);
             }
+            MenuAction::Memo(m) => self.on_memo_menu(m),
             MenuAction::ForgetChat => {
                 if self.io { crate::services::ai::clear_history(); }
                 self.play(Shot::Shake);
@@ -1204,6 +1215,8 @@ impl Behavior {
             self.act(Act::Chat);
             return self.drink_honey();
         }
+        // 「提醒我…」「记一下…」「我有什么待办」
+        if self.memo_chat(&text) { return; }
         self.waiting = true;
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(false)));
         self.set_state(St::Think, None);
