@@ -76,6 +76,8 @@ pub enum MouseEv {
     Move { x: f32, y: f32, sx: i32, sy: i32 },
     DoubleClick { x: f32, y: f32 },
     Leave,
+    /// 滚轮（WM_MOUSEWHEEL，光标在她身上时）。delta：一格 = ±120，向上为正；x/y 同上（窗口内逻辑像素）
+    Wheel { delta: i32, x: f32, y: f32 },
 }
 
 /// 右键菜单 / 托盘菜单的动作。平台层把每个动作都交给 Handler::event，
@@ -93,9 +95,62 @@ pub enum MenuAction {
     Tts(bool), TtsChatOnly(bool), Moyu(bool),
     ForgetChat, OpenDataDir, AutoStart(bool),
     ToggleVisible, CallToCenter, Quit,
+    /// 老的「直接喂到嘴里」（Feed 现在是扔一条小鱼干让她去追 / 你拖到她嘴边）
+    FeedNow,
+    /// 小游戏：逗猫棒
+    Game,
+    /// 今日签到（第一次互动也会自动签）
+    CheckIn,
+    /// 天气播报：现在天气、气温、今天最高最低、降雨概率
+    WeatherReport,
+    /// 爬到当前窗口顶上坐着
+    Climb,
 }
 
 // ---------------------------------------------------------------- 事件
+/// 天气大类（services::weather 从 wttr.in 的 weatherCode 归类）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeatherKind { Clear, Cloudy, Fog, Rain, Snow, Thunder }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Weather {
+    pub kind: WeatherKind,
+    pub temp_c: f32,
+    /// 中文描述（如「小雨」），可能为空
+    pub desc: String,
+    pub city: String,
+    /// 今天最高/最低气温（拿不到时 None）
+    pub high_c: Option<f32>,
+    pub low_c: Option<f32>,
+    /// 今天降雨概率（0–100，取全天各时段最大值）
+    pub rain_chance: Option<u32>,
+}
+
+/// 桌面上的小道具（单独的小分层窗口）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToyKind { Fish, Can, Teaser }
+
+/// 她坐到了哪儿
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerchKind {
+    /// 前台窗口的上沿
+    WindowTop,
+    /// 屏幕侧边（探出半个身子）
+    ScreenSide,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ToyEv {
+    /// 用户按住了道具
+    Grabbed,
+    /// 用户松手：(dx, dy) = 道具中心相对她嘴巴的位置（逻辑像素）
+    Dropped { dx: f32, dy: f32 },
+    /// 道具掉到地面；dx = 道具中心相对她身体中线（逻辑像素）
+    Landed { dx: f32 },
+    /// ToyCmd::Chase 走完：ok = 已经走到道具跟前
+    Reached { ok: bool },
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatReply {
     pub ok: bool,
@@ -141,6 +196,17 @@ pub enum AppEvent {
     Peek,
     /// 用户又双击了一次程序
     SecondInstance,
+    /// 光标位置（相对窗口左上角的逻辑像素，可在窗口外）。只在 WinCmd::CursorPoll 打开时、位置变了才发
+    Cursor { x: f32, y: f32 },
+    /// 后台拉到的天气
+    Weather(Weather),
+    Toy(ToyEv),
+    /// WinCmd::Climb 成功跳上去了
+    Perched(PerchKind),
+    /// WinCmd::Climb 条件不满足（没有合适的窗口），什么都没做
+    ClimbFailed,
+    /// 坐着的窗口挪走/关了/最小化：平台层已经让她开始下落（之后照常发 Landed）
+    PerchLost,
 }
 
 /// 线程安全的事件投递器：服务层工作线程用它把结果送回 UI 线程。
@@ -171,6 +237,25 @@ pub enum WinCmd {
     Show, Hide,
     ChatInput(ChatInputCmd),
     Quit,
+    /// 光标轮询间隔（毫秒，0 = 关）。平台层只在窗口可见时 GetCursorPos，位置变了才发 AppEvent::Cursor
+    CursorPoll(u32),
+    /// 跳到前台窗口上沿 / 屏幕侧边。成功发 Perched，不行发 ClimbFailed
+    Climb(PerchKind),
+    /// 从坐着的地方跳下来（带重力落地，发 Landed）
+    Unperch,
+    Toy(ToyCmd),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ToyCmd {
+    /// 生成道具。Fish/Can：在她身边 side（-1/1）方向 offset 逻辑像素处、她头顶高度出现，然后往下掉（可以被拖）；
+    /// Teaser：跟着光标走、点不到（点穿）
+    Spawn { kind: ToyKind, side: i32, offset: f32 },
+    /// 让道具往下掉到地面（发 Landed）
+    Fall,
+    /// 她朝道具走过去（每 16ms 走 speed 物理像素），走到发 Reached
+    Chase { speed: f32 },
+    Remove,
 }
 
 // ---------------------------------------------------------------- 画面
