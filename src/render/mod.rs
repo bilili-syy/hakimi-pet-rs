@@ -137,7 +137,8 @@ const PET_X: f32 = 20.0;
 const PET_W: f32 = 200.0;
 const PET_H: f32 = 293.0;
 const PET_Y: f32 = WIN_H as f32 - PET_H;
-const C_TEXT: u32 = 0x5a3b2e;
+// 原来 #5a3b2e 在奶白底上偏灰、发虚（电脑上看对比度不够），压深一档
+const C_TEXT: u32 = 0x3a2416;
 const C_BG: u32 = 0xfffaf0;
 const C_BORDER: u32 = 0xfbbc04;
 const C_RED: u32 = 0xea4335;
@@ -462,10 +463,10 @@ impl Renderer {
         }
     }
 
-    /// 气泡：left/right 8px、border 2、padding 6/10 → 内容宽 200；13px 行高 1.35；内容最多 128 高
+    /// 气泡：left/right 8px、border 2、padding 6/10 → 内容宽 200；14px 行高 1.35；内容最多 128 高
     fn build_bubble(&mut self, text: &str, scroll: f32, s: f32) -> Option<(Pixmap, Rect)> {
-        let px = 13.0 * s;
-        let lh = 13.0 * 1.35 * s;
+        let px = 14.0 * s;
+        let lh = 14.0 * 1.35 * s;
         let content_w = 200.0 * s;
         let tkey = format!("{s}|{text}");
         if self.bubble_text.as_ref().is_none_or(|t| t.key != tkey) {

@@ -13,6 +13,11 @@ mod types;
 
 fn main() {
     core::log::log(&format!("start {}", env!("CARGO_PKG_VERSION")));
+    // release 是 windows 子系统，panic 没有控制台可写，以前闪退什么都不留；记进日志方便排查
+    std::panic::set_hook(Box::new(|info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        core::log::log(&format!("PANIC {info}\n{bt}"));
+    }));
     core::config::reload();
     platform::run(|tx| Box::new(app::App::new(tx)));
 }

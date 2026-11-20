@@ -173,6 +173,49 @@ mod gdi {
     use windows::Win32::Graphics::Gdi::*;
     use windows::core::PCWSTR;
 
+    /// 覆盖率加深表：255·(c/255)^0.7
+    static GAMMA: std::sync::LazyLock<[u8; 256]> = std::sync::LazyLock::new(|| {
+        let mut t = [0u8; 256];
+        for (i, v) in t.iter_mut().enumerate() { *v = (255.0 * (i as f32 / 255.0).powf(0.7)).round() as u8; }
+        t
+    });
+
+    /// 字体选择：(正文字体, 正文字重, 粗体字体, 粗体字重, 质量)。
+    /// 默认优先思源黑体 Noto Sans SC（Medium 正文 / Bold 标题），笔画比微软雅黑小字号下实很多；
+    /// 没装就退回微软雅黑。用 ClearType 栅格化再把 RGB 取平均，相当于横向 3 倍超采样，边缘更顺。
+    /// HAKIMI_FONT / HAKIMI_FONT_W / HAKIMI_FONT_Q=aa 可临时覆盖（调试选字体用）。
+    struct FontPick { body: String, body_w: i32, bold: String, bold_w: i32, q: FONT_QUALITY }
+    static FONT: std::sync::LazyLock<FontPick> = std::sync::LazyLock::new(|| {
+        let q = if std::env::var("HAKIMI_FONT_Q").is_ok_and(|v| v == "aa") { ANTIALIASED_QUALITY } else { CLEARTYPE_QUALITY };
+        if let Ok(name) = std::env::var("HAKIMI_FONT") {
+            let w = std::env::var("HAKIMI_FONT_W").ok().and_then(|v| v.parse().ok()).unwrap_or(FW_NORMAL.0 as i32);
+            return FontPick { bold: name.clone(), body: name, body_w: w, bold_w: (w + 300).min(900), q };
+        }
+        if installed("Noto Sans SC Medium") && installed("Noto Sans SC") {
+            FontPick { body: "Noto Sans SC Medium".into(), body_w: 500, bold: "Noto Sans SC".into(), bold_w: FW_BOLD.0 as i32, q }
+        } else {
+            FontPick { body: "Microsoft YaHei".into(), body_w: FW_NORMAL.0 as i32, bold: "Microsoft YaHei".into(), bold_w: FW_BOLD.0 as i32, q }
+        }
+    });
+
+    /// 系统里有没有这个字体（建一个看 GDI 实际给的是不是它，没装会被悄悄换成别的）
+    fn installed(name: &str) -> bool {
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            if dc.is_invalid() { return false; }
+            let face: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let f = CreateFontW(-16, 0, 0, 0, 0, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, 0, PCWSTR(face.as_ptr()));
+            let old = SelectObject(dc, f.into());
+            let mut buf = [0u16; 64];
+            let n = GetTextFaceW(dc, Some(&mut buf)).max(0) as usize;
+            SelectObject(dc, old);
+            let _ = DeleteObject(f.into());
+            let _ = DeleteDC(dc);
+            let got = String::from_utf16_lossy(&buf[..n.saturating_sub(1).min(64)]);
+            got.trim_end_matches('\0').eq_ignore_ascii_case(name)
+        }
+    }
+
     pub struct Gdi {
         dc: HDC,
         fonts: HashMap<(u32, bool), HFONT>,
@@ -189,12 +232,14 @@ mod gdi {
         fn font(&mut self, px: f32, bold: bool) -> HFONT {
             let k = ((px * 4.0).round() as u32, bold);
             if let Some(f) = self.fonts.get(&k) { return *f; }
-            let face: Vec<u16> = "Microsoft YaHei".encode_utf16().chain(Some(0)).collect();
+            let fp = &*FONT;
+            let (fname, fw) = if bold { (&fp.bold, fp.bold_w) } else { (&fp.body, fp.body_w) };
+            let face: Vec<u16> = fname.encode_utf16().chain(Some(0)).collect();
             let f = unsafe {
                 CreateFontW(
                     -(px.round().max(1.0) as i32), 0, 0, 0,
-                    if bold { FW_BOLD.0 as i32 } else { FW_NORMAL.0 as i32 },
-                    0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                    fw,
+                    0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, fp.q,
                     0, PCWSTR(face.as_ptr()),
                 )
             };
@@ -260,7 +305,8 @@ mod gdi {
                 let mut data = vec![0u8; n];
                 for (i, d) in data.iter_mut().enumerate() {
                     let (b, g, r) = (src[i * 4] as u16, src[i * 4 + 1] as u16, src[i * 4 + 2] as u16);
-                    *d = ((r + g + b) / 3) as u8;
+                    // 灰度抗锯齿的笔画边缘偏淡，细字在浅底上发虚：覆盖率做一次 0.7 次幂加粗边缘
+                    *d = GAMMA[((r + g + b) / 3) as usize];
                 }
                 SelectObject(self.dc, old_font);
                 SelectObject(self.dc, old_bmp);
