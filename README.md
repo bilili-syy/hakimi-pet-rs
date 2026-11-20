@@ -16,6 +16,9 @@
 - 网络：ureq（读系统代理）
 - 摸鱼监督：直接调 user32，不再起 PowerShell
 
+## 设置
+右键哈基米 →「⚙️ 设置…」（或双击托盘图标）：选 AI 服务商、填 API Key（每家都有「如何获取 API Key？」官网链接和「测试连接」按钮）、语音、开机自启、大小、天气城市、提醒等。
+
 ## 数据
 继续用 `%APPDATA%\hakimi-pet\`（save.json、config.json、chat.json、tts-cache、songs），和 Electron 版互通。
 

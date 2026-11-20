@@ -116,6 +116,17 @@ pub fn set_autostart(on: bool) {
     }
 }
 
+/// 用默认浏览器打开网址（设置窗口里「如何获取 API Key？」）
+pub fn open_url(url: &str) {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return;
+    }
+    let u = HSTRING::from(url);
+    unsafe {
+        ShellExecuteW(None, w!("open"), &u, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
 /// 用资源管理器 / 默认程序打开文件或文件夹
 pub fn open_path(path: &std::path::Path) {
     let p = HSTRING::from(path.as_os_str());
