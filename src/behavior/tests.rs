@@ -198,7 +198,8 @@ fn frame_interval_idle_vs_animating() {
     assert!(ms <= IDLE_FRAME_MS);
     ev(&mut b, AppEvent::Menu(MenuAction::Feed), 4000);
     let (ms, _) = tick(&mut b, 4016);
-    assert_eq!(ms, ANIM_FRAME_MS);
+    // 待机扭曲还在渐出（DEPTH_RAMP_MS）那几帧沿用灵动帧间隔，渐出完就是普通动画帧
+    if b.scene.live.warping() { assert_eq!(ms, crate::render::live::LIVE_FRAME_MS.min(ANIM_FRAME_MS)); } else { assert_eq!(ms, ANIM_FRAME_MS); }
 }
 
 #[test]
