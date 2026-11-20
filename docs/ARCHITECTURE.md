@@ -105,3 +105,16 @@ src/
 - 天气：`services/weather.rs`，公开 `refresh(tx)`（后台拉 wttr.in，结果发 `AppEvent::Weather` 并缓存）、`latest() -> Option<WeatherInfo>`、`report_line(&w)`。
 - 存档新增字段（save.json，camelCase）：`checkinLast` `checkinStreak` `checkinTotal` `gameBest` `weatherReportLast`；未知字段照旧保留。
 - 菜单新增：扔小鱼干（feed）/ 直接喂（feednow）/ 逗猫棒（game）/ 签到（checkin）/ 天气播报（weather）/ 爬窗口（climb）。
+
+## 角色包 / 皮肤（feat/skins）
+- 用户教程：docs/SKINS.md；示例：examples/skins/demo（`python examples/skins/make_demo.py` 重新生成图）。
+- 数据：`core/skin.rs`（skin.json 宽松解析、扫描 `%APPDATA%\hakimi-pet\skins\<id>\`、全局当前皮肤 + `version()`，任何线程可调）。启动时只读清单，不解码图片。
+- 立绘：`render/skin_loader.rs`。按需解码当前皮肤的那一张、等比缩进 200×293 框（贴底居中 × `scale`），进原有的 SpriteCache（键 `skin:<版本>:…`）；`version()` 变了就把 `skin:` 键全部释放。没画的状态回退内置（blink / walk 帧先借 idle）。叠加层接口：`skin_loader::overlay(cache, "mouthOpen", w, h)`。
+- 菜单：菜单表 `COSTUME` 末尾一行 `Gen("skin")`，由 `platform/skin_menu.rs` 生成「🎭 角色」子菜单，菜单 id `skin:<id>` / `skin:@open` / `skin:@reload` 都映射成 `MenuAction::Costume("skin:…")`（types.rs 冻结，没加变体）；行为层 `behavior/skin.rs` 认前缀，`skin:@open` 由平台层 on_menu 打开文件夹。
+- 钩子（只加不删）：`render/mod.rs`（update 开头 sync、draw_pet 选底图）、`behavior/mod.rs`（new 里 init、Costume 分支、say_opts 换台词）、`services/ai.rs`（system prompt 末尾追加 persona）、`services/tts.rs`（read_cache 先查 voiceDir）。
+- 存档新增字段（save.json）：`skin`（皮肤 id，缺省 = `hakimi`），存在 StatsData.extra 里，别的字段照旧保留。
+
+## 换装（feat/outfits）
+- 清单在 `core/costume.rs` 的 `COSTUMES`（菜单顺序、文字）；加一套衣服 = 放 `assets/outfits/<id>/` 8 张（idle/happy/drag/sit/sleep/eat/think/hungry，400×587）+ 加一行。
+- 默认是奶白水手服 `sailor`：config.json 里写 `""`（和 Electron 版互通，老配置的 `""` 也就换成了新默认）；原装卫衣是 `hoodie`。
+- 水手服走分层：`outfits/sailor/layered/{idle,blink,walk1,walk2,happy,eat,hungry}.png` + 原来的 tail/star 层；drag/sit/sleep/think 单张，其余表情按 `costume_alias` 回落。

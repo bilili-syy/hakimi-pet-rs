@@ -12,8 +12,10 @@
 mod chat;
 mod memo_menu;
 mod mind_menu;
+mod skin_menu;
 mod menu;
 mod perch;
+mod power;
 mod settings;
 mod sys;
 mod timers;
@@ -439,6 +441,10 @@ fn tick() {
     }
     pump();
 
+    // 省电探测（藏起来/全屏程序/锁屏/电池 → 灵动效果降帧），每 2 秒一次
+    if let Some(h) = with(|s| s.hwnd) {
+        power::maybe_probe(now, h);
+    }
     // 帧
     let due = with(|s| !s.quitting && now >= s.next_frame).unwrap_or(false);
     if due {
@@ -626,6 +632,8 @@ fn after(a: MenuAction) {
         MenuAction::Mind(crate::types::MindAct::ClearAsk) if mind_menu::confirm_clear(main_hwnd()) => {
             on_menu(MenuAction::Mind(crate::types::MindAct::Clear));
         }
+        // 「🎭 角色」→「打开皮肤文件夹」（不存在先建）
+        MenuAction::Costume(c) if c == crate::core::skin::MENU_OPEN => open_path(&crate::core::skin::ensure_dir()),
         _ => {}
     }
     menu::refresh();
