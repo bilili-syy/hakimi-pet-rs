@@ -238,6 +238,26 @@ mod tests {
         assert!(!sync(&mut c));
     }
 
+    /// 手动看效果：HAKIMI_SNAP=skin.png cargo test skin_snapshot -- --ignored
+    /// 用 examples/skins/demo 画 待机 / 眨眼(叠加层) / 开心 / 坐（没画 → 回退哈基米）
+    #[test]
+    #[ignore]
+    fn skin_snapshot() {
+        let out = std::env::var("HAKIMI_SNAP").unwrap_or_else(|_| "skin.png".into());
+        let demo = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join("skins").join("demo");
+        crate::core::skin::activate_for_test(Some(load_dir(&demo).unwrap()));
+        let mut r = crate::render::Renderer::new();
+        let faces = [Face::Idle, Face::Blink, Face::Happy, Face::Sit];
+        let mut sheet = Pixmap::new(240 * faces.len() as u32, 360).unwrap();
+        for (i, f) in faces.iter().enumerate() {
+            let sc = crate::render::Scene { face: *f, ..Default::default() };
+            r.draw(&sc, 1.0);
+            sheet.draw_pixmap(240 * i as i32, 0, r.pixmap().unwrap().as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        }
+        crate::core::skin::activate_for_test(None);
+        sheet.save_png(&out).unwrap();
+    }
+
     #[test]
     fn rejects_huge_header() {
         let d = tmp("huge");

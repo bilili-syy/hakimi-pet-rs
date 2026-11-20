@@ -438,6 +438,16 @@ pub fn voice_line(text: &str) -> Option<Vec<u8>> {
 /// 台词钩子
 pub fn line_override(text: &str, category: Option<&str>) -> Option<String> { active()?.line_for(text, category) }
 
+/// 测试用：直接把某个包设成当前皮肤（不扫描 APPDATA）
+#[cfg(test)]
+pub fn activate_for_test(info: Option<SkinInfo>) {
+    with(|r| {
+        r.skins = info.into_iter().map(Arc::new).collect();
+        r.active = r.skins.first().cloned();
+    });
+    bump();
+}
+
 // ------------------------------------------------------------------ save.json
 
 /// 存档里的皮肤 id（没有 / 不是字符串 → 内置）
