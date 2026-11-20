@@ -348,3 +348,83 @@ fn typed_chat_box_stays_and_blocks_autonomy() {
     assert!(b.chatting);
     assert_ne!(b.state, St::Sleep);
 }
+
+// ---------------------------------------------------------------- 语音回答（字和声音同步）
+
+fn audio() -> Option<crate::types::Audio> { Some(crate::types::Audio(vec![1, 2, 3])) }
+
+#[test]
+fn chat_voice_waits_for_audio_then_shows_text_and_plays_together() {
+    let mut b = mk();
+    b.fake_chat_voice = true;
+    tick(&mut b, 3000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 3000);
+    ev(&mut b, AppEvent::ChatSubmit("讲讲天气".into()), 3100);
+    let reply = "今天天气很好喵！我们出去玩吧～记得带伞，下午可能会下雨哦。";
+    let out = ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, text: reply.into(), need_key: false }), 5000);
+    // 回复到了但还在思考：输入框没解锁、气泡里还不是回复
+    assert!(!out.contains(&WinCmd::ChatInput(ChatInputCmd::Enable(true))));
+    assert_eq!(b.state, St::Think);
+    assert!(b.calls.iter().any(|c| c == "cvspeak:今天天气很好喵！"));
+    assert_ne!(b.scene.bubble.as_ref().map(|x| x.text.as_str()), Some("今天天气很好喵！"));
+    let t1 = b.token_seq;
+    // 第一句合成好：字出现 + 同时开始念，并预合成第二句
+    let out = ev(&mut b, AppEvent::Speech { token: t1, audio: audio() }, 6500);
+    assert!(out.contains(&WinCmd::ChatInput(ChatInputCmd::Enable(true))));
+    assert_eq!(b.state, St::Happy);
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "今天天气很好喵！");
+    let p1 = b.voice_playing.expect("playing first sentence");
+    assert!(b.calls.iter().any(|c| *c == format!("cvplay:{p1}")));
+    assert!(b.calls.iter().any(|c| c == "cvspeak:我们出去玩吧～"));
+    let t2 = b.token_seq;
+    // 第二句先合成好：等第一句念完才出字
+    ev(&mut b, AppEvent::Speech { token: t2, audio: audio() }, 7000);
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "今天天气很好喵！");
+    ev(&mut b, AppEvent::AudioDone { token: p1 }, 8000);
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "今天天气很好喵！我们出去玩吧～");
+    let p2 = b.voice_playing.expect("playing second sentence");
+    assert_ne!(p1, p2);
+    // 第三句合成失败：第二句念完把剩下的字全显示，不出声
+    let t3 = b.token_seq;
+    ev(&mut b, AppEvent::Speech { token: t3, audio: None }, 8500);
+    ev(&mut b, AppEvent::AudioDone { token: p2 }, 9500);
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, reply);
+    assert!(b.cv.is_none());
+}
+
+#[test]
+fn chat_voice_timeout_shows_text_without_voice() {
+    let mut b = mk();
+    b.fake_chat_voice = true;
+    tick(&mut b, 3000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 3000);
+    ev(&mut b, AppEvent::ChatSubmit("你好".into()), 3100);
+    ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, text: "你好呀喵～".into(), need_key: false }), 4000);
+    assert_eq!(b.state, St::Think);
+    let t = b.token_seq;
+    tick(&mut b, 4000 + 14_000);
+    assert_eq!(b.state, St::Think);
+    // 15 秒还没合成好：直接出字
+    let out = { let mut o = Vec::new(); b.frame_at(4000 + 15_001, &mut o); o };
+    assert!(out.contains(&WinCmd::ChatInput(ChatInputCmd::Enable(true))));
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "你好呀喵～");
+    assert!(b.calls.iter().any(|c| c == "cvtimeout"));
+    // 迟到的语音不再播
+    ev(&mut b, AppEvent::Speech { token: t, audio: audio() }, 20_000);
+    assert!(!b.calls.iter().any(|c| c.starts_with("cvplay:") || c.starts_with("play:")));
+}
+
+#[test]
+fn chat_voice_off_shows_text_immediately_without_tts() {
+    let mut b = mk();
+    b.fake_chat_voice_off = true;
+    tick(&mut b, 3000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 3000);
+    ev(&mut b, AppEvent::ChatSubmit("你好".into()), 3100);
+    let before = b.calls.iter().filter(|c| c.starts_with("speak:")).count();
+    ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, text: "你好呀喵～".into(), need_key: false }), 4000);
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "你好呀喵～");
+    assert_eq!(b.state, St::Happy);
+    assert_eq!(b.calls.iter().filter(|c| c.starts_with("speak:")).count(), before);
+    assert!(!b.calls.iter().any(|c| c.starts_with("cvspeak:")));
+}

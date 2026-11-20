@@ -39,6 +39,8 @@ pub struct TtsConfig {
     /// all / chat / off
     pub speak: String,
     pub volume: f32,
+    /// 语音回答：聊天回复等语音合成好了再和文字一起出来（关了 = 文字立刻出、聊天回复不念）
+    pub chat_voice_reply: bool,
     /// 未知字段原样保留
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -53,6 +55,7 @@ impl Default for TtsConfig {
             style: "十八岁左右的元气少女猫娘，声音清亮甜美、略带奶音，说话轻快俏皮，句尾喜欢拖长撒娇。".into(),
             speak: "all".into(),
             volume: 0.9,
+            chat_voice_reply: true,
             extra: Map::new(),
         }
     }
@@ -109,6 +112,10 @@ pub struct Config {
     /// santa / glasses / scarf
     pub outfit: Vec<String>,
     pub moyu: MoyuConfig,
+    /// 天气城市（wttr.in 认的名字，如「北京」「Shanghai」）；空 = 按出口 IP 自动定位
+    pub weather_city: String,
+    /// 哈基米大小倍数（乘在系统 DPI 缩放上），1.0 = 标准；载入时夹到 0.5~2.0
+    pub scale: f32,
     /// 未知字段（_说明 之类）原样保留
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -142,6 +149,8 @@ impl Default for Config {
             costume: String::new(),
             outfit: Vec::new(),
             moyu: MoyuConfig::default(),
+            weather_city: String::new(),
+            scale: 1.0,
             extra,
         }
     }
@@ -180,8 +189,18 @@ pub fn merge(saved: &Value) -> Config {
     obj.insert("reminders".into(), sub::<Reminders>(saved.get("reminders")));
     obj.insert("tts".into(), sub::<TtsConfig>(saved.get("tts")));
     obj.insert("moyu".into(), sub::<MoyuConfig>(saved.get("moyu")));
-    lenient(obj)
+    let mut c: Config = lenient(obj);
+    c.scale = clamp_scale(c.scale);
+    c
 }
+
+/// 大小倍数夹到 0.5~2.0（NaN / 0 当 1.0）
+pub fn clamp_scale(s: f32) -> f32 {
+    if s.is_finite() && s > 0.0 { s.clamp(0.5, 2.0) } else { 1.0 }
+}
+
+/// 没填聊天 API Key（新手第一次打开聊天时提示去设置）
+pub fn ai_key_missing(c: &Config) -> bool { c.api_key.trim().is_empty() }
 
 /// 把文件文本解析成配置（坏文件 = 全默认，和原版一致）
 pub fn parse(text: &str) -> Config {
@@ -234,17 +253,28 @@ pub fn update(f: impl FnOnce(&mut Config)) -> Config {
     c
 }
 
+/// 设置窗口「保存」：整份替换（c 是从 get() 拿的副本改出来的，未知字段都还在），原子写回文件。
+/// 返回写盘是否成功。
+pub fn replace(c: Config) -> bool {
+    let mut guard = CONFIG.write().unwrap_or_else(|e| e.into_inner());
+    let ok = write(&c);
+    *guard = Some(c);
+    ok
+}
+
 /// 序列化成和原版一样的 2 空格缩进 JSON
 pub fn to_json(c: &Config) -> String {
     serde_json::to_string_pretty(c).unwrap_or_default()
 }
 
-fn write(c: &Config) {
+fn write(c: &Config) -> bool {
     let s = to_json(c);
-    if s.is_empty() { return; }
+    if s.is_empty() { return false; }
     if let Err(e) = super::save::write_atomic(&super::paths::config_file(), s.as_bytes()) {
         super::log::log(&format!("config write failed {e}"));
+        return false;
     }
+    true
 }
 
 #[cfg(test)]
@@ -305,6 +335,48 @@ mod tests {
         // 写回再读，值不变
         let again = parse(&to_json(&c));
         assert_eq!(to_json(&again), to_json(&c));
+    }
+
+    #[test]
+    fn round_trip_keeps_unknown_fields_everywhere() {
+        // 用户手写的未知字段（顶层和三个子对象里）+ 新字段，经过「读 → 设置窗口改几项 → 写」都要原样保留
+        let text = r#"{"apiKey":"k","futureFlag":{"a":[1,2]},"_说明":"自定义说明",
+            "reminders":{"water":30,"snooze":5},"tts":{"apiKey":"t","chatVoiceReply":false,"pitch":1.5},
+            "moyu":{"minutes":15,"whitelist":["code"]},"weatherCity":"杭州","scale":1.2}"#;
+        let mut c = parse(text);
+        assert_eq!(c.weather_city, "杭州");
+        assert!((c.scale - 1.2).abs() < 1e-6);
+        assert!(!c.tts.chat_voice_reply);
+        // 设置窗口改了几个已知字段
+        c.model = "deepseek-flash".into();
+        c.tts.volume = 0.5;
+        c.reminders.water = 0;
+        let out: Value = serde_json::from_str(&to_json(&c)).unwrap();
+        assert_eq!(out["futureFlag"], serde_json::json!({"a":[1,2]}));
+        assert_eq!(out["_说明"], "自定义说明");
+        assert_eq!(out["reminders"]["snooze"], 5);
+        assert_eq!(out["reminders"]["water"], 0);
+        assert_eq!(out["tts"]["pitch"], 1.5);
+        assert_eq!(out["tts"]["chatVoiceReply"], false);
+        assert_eq!(out["moyu"]["whitelist"], serde_json::json!(["code"]));
+        assert_eq!(out["weatherCity"], "杭州");
+        assert_eq!(out["model"], "deepseek-flash");
+        assert_eq!(out["apiKey"], "k");
+        // 再读一遍完全一样
+        assert_eq!(to_json(&parse(&to_json(&c))), to_json(&c));
+    }
+
+    #[test]
+    fn new_fields_default_and_clamp() {
+        let c = parse("{}");
+        assert!(c.tts.chat_voice_reply);
+        assert_eq!(c.weather_city, "");
+        assert!((c.scale - 1.0).abs() < 1e-6);
+        assert!((parse(r#"{"scale":9}"#).scale - 2.0).abs() < 1e-6);
+        assert!((parse(r#"{"scale":0}"#).scale - 1.0).abs() < 1e-6);
+        assert!((parse(r#"{"scale":"big"}"#).scale - 1.0).abs() < 1e-6);
+        assert!(ai_key_missing(&c));
+        assert!(!ai_key_missing(&parse(r#"{"apiKey":"x"}"#)));
     }
 
     #[test]
