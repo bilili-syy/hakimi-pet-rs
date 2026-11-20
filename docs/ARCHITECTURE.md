@@ -46,8 +46,13 @@ src/
 | Moyu(on) | 在 Handler（它会写 config）之后启停监督 |
 | Quit | 调 `Handler::quit` 然后退出 |
 
-其余（Chat、Feed、Pat、Honey、Song、Status、Sleep、Walk、Costume、Outfit、ClearOutfit、Tts、TtsChatOnly、ForgetChat）只由行为层处理；
+其余（Chat、Feed、Pat、Honey、Song、Status、Sleep、Walk、Costume、Outfit、ClearOutfit、Tts、TtsChatOnly、ForgetChat、Dance）只由行为层处理；
 其中会改配置的（Costume/Outfit/Tts/TtsChatOnly/Moyu）由行为层调 `core::config::update` 写入，平台层每次弹菜单时读 `core::config::get()` 决定勾选状态。
+
+## 跳个舞
+- 舞谱在 `behavior/dance.rs` 的 `SCORES`（BPM、时长、按拍计长的动作段），加一条菜单就自动多一支舞。
+- 动作关键帧在 `render/dance.rs`（纯函数）；节拍检测和内置鼓点在 `behavior/beat.rs`（后台线程边解码边算能量，不加依赖）。
+- 跳舞时帧间隔 25ms，结束后回到原来的空闲帧率。
 
 ## 约定
 - `types.rs` 冻结；各模块 `mod.rs`/公开函数签名是约定，改之前先说。

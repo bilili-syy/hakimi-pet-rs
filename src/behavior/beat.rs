@@ -352,4 +352,20 @@ mod tests {
         }
         assert_eq!(got, Some(None));
     }
+
+    #[test]
+    fn analyze_file_decodes_with_rodio() {
+        let path = std::env::temp_dir().join(format!("hakimi-beat-{}.wav", std::process::id()));
+        std::fs::write(&path, synth_wav(120.0, 8.0)).unwrap();
+        let p = analyze_file(path.clone(), 6);
+        let mut got = None;
+        for _ in 0..500 {
+            if let Some(x) = p.poll() { got = Some(x); break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(&path);
+        let info = got.expect("finished").expect("decoded");
+        assert!((info.bpm().unwrap() - 120.0).abs() < 2.0, "{:?}", info.bpm());
+        assert_eq!(info.env.len(), 6000 / ENV_MS as usize);
+    }
 }
