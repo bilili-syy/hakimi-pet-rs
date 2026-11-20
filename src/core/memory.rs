@@ -372,7 +372,6 @@ struct Store {
 }
 
 static STORE: Mutex<Option<Store>> = Mutex::new(None);
-static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub fn file() -> PathBuf { super::paths::data_dir().join("memory.json") }
 
@@ -394,11 +393,6 @@ fn read_file() -> Book {
     }
 }
 
-fn bump() { VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-
-/// 数据变了就 +1（菜单据此刷新条数）
-pub fn version() -> u64 { VERSION.load(std::sync::atomic::Ordering::Relaxed) }
-
 fn with<R>(f: impl FnOnce(&mut Store) -> R) -> R {
     let mut g = STORE.lock().unwrap_or_else(|e| e.into_inner());
     let s = g.get_or_insert_with(|| Store { book: read_file(), mtime: mtime(), checked_at: std::time::Instant::now() });
@@ -408,7 +402,6 @@ fn with<R>(f: impl FnOnce(&mut Store) -> R) -> R {
         if m != s.mtime {
             s.book = read_file();
             s.mtime = m;
-            bump();
         }
     }
     f(s)
@@ -420,7 +413,6 @@ fn save(s: &mut Store) {
         super::log::log(&format!("memory write failed {e}"));
     }
     s.mtime = mtime();
-    bump();
 }
 
 /// 改数据，f 返回 (结果, 有没有变)；变了就写盘

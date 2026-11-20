@@ -18,6 +18,8 @@ use crate::types::{ChatReply, MindAct, MindEv, SpeakKind};
 pub const AFTER_MS: u64 = 2000;
 /// 正在念：最长演多久（和气泡兜底一致）
 const VOICE_MAX_MS: u64 = 60_000;
+/// mind.emo 里表示「语音回答（chatvoice）整段」的 token
+const CV_TOKEN: u64 = u64::MAX;
 /// 每几轮成功的聊天总结一次新事实
 pub const EXTRACT_EVERY: u32 = 4;
 /// 主动关心：一天最多几次、两次至少隔多少分钟、启动多久之后才开始、每次 tick（20 秒）的概率
@@ -34,6 +36,8 @@ const CARE_HOURS: std::ops::Range<u32> = 9..22;
 pub struct MindUi {
     /// 正在演的情绪：(气泡的语音 token, 状态)
     emo: Option<(u64, St)>,
+    /// 语音回答还在合成、还没出字：(情绪, 字数)
+    cv_emo: Option<(Emotion, usize)>,
     /// 距上次总结又聊了几轮
     turns: u32,
     /// 正在等后台给关心的话
@@ -167,6 +171,38 @@ impl Behavior {
     pub(super) fn emotion_audio_done(&mut self, token: u64) {
         let Some((t, st)) = self.mind.emo else { return };
         if t != token {
+            return;
+        }
+        self.mind.emo = None;
+        if self.state == st {
+            self.hold_timer(AFTER_MS, StateAct::ChatIdle);
+        }
+    }
+
+    /// 语音回答（chatvoice）接手了这条回复：记下情绪，等第一段出字
+    pub(super) fn emotion_cv_pending(&mut self, e: Option<Emotion>, chars: usize) {
+        self.mind.cv_emo = e.map(|e| (e, chars));
+    }
+
+    /// 语音回答第一段出字（或合成失败直接出全文）的那一刻：换表情
+    pub(super) fn emotion_cv_reveal(&mut self) {
+        let Some((e, n)) = self.mind.cv_emo.take() else { return };
+        self.emotion_face(Some(e));
+        let st = emotion_state(e);
+        if self.cv.is_some() {
+            // 念完最后一段（emotion_cv_done）再 2 秒回平时
+            self.mind.emo = Some((CV_TOKEN, st));
+            self.hold_timer(VOICE_MAX_MS, StateAct::ChatIdle);
+        } else {
+            self.mind.emo = None;
+            self.hold_timer(speak_ms(n) + AFTER_MS, StateAct::ChatIdle);
+        }
+    }
+
+    /// AudioDone 之后：语音回答整段结束了就 2 秒后回平时
+    pub(super) fn emotion_cv_done(&mut self) {
+        let Some((t, st)) = self.mind.emo else { return };
+        if t != CV_TOKEN || self.cv.is_some() {
             return;
         }
         self.mind.emo = None;
@@ -386,6 +422,29 @@ mod tests {
         assert_eq!(b.state, St::Love, "开口时换回表情");
         ev(&mut b, AppEvent::AudioDone { token: tk }, 9000);
         tick(&mut b, 11_100);
+        assert_eq!(b.state, St::Idle);
+    }
+
+    #[test]
+    fn chat_voice_reply_keeps_face_until_done() {
+        let mut b = mk();
+        b.fake_chat_voice = true;
+        tick(&mut b, 3000);
+        ev(&mut b, AppEvent::ChatSubmit("你是不是脸红了".into()), 3050);
+        ev(&mut b, reply("[shy]才、才没有呢喵"), 3100);
+        assert!(b.calls.iter().any(|c| c == "cvspeak:才、才没有呢喵"), "{:?}", b.calls);
+        assert_eq!(b.state, St::Think, "合成好之前还在思考");
+        let req = b.token_seq;
+        ev(&mut b, AppEvent::Speech { token: req, audio: Some(Audio(vec![1])) }, 4000);
+        assert_eq!(b.state, St::Shy);
+        assert_eq!(bubble(&b), "才、才没有呢喵");
+        let playing = b.token_seq;
+        tick(&mut b, 9000);
+        assert_eq!(b.state, St::Shy);
+        ev(&mut b, AppEvent::AudioDone { token: playing }, 9500);
+        tick(&mut b, 11_400);
+        assert_eq!(b.state, St::Shy);
+        tick(&mut b, 11_600);
         assert_eq!(b.state, St::Idle);
     }
 

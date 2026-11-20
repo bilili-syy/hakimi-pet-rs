@@ -41,8 +41,9 @@ src/
 | ToggleVisible / CallToCenter | 显示/隐藏、挪到工作区 62% 处地面；变可见时发 `AppEvent::Peek` |
 | PomodoroStart(m) / PomodoroStop | 计时，发 `AppEvent::Pomodoro(..)`，刷新菜单文字 |
 | AutoStart(on) | 写 HKCU\…\Run |
-| OpenSettings / OpenDataDir / OpenSongDir | 打开 config.json / 数据目录 / songs 目录（不存在先建） |
-| ReloadSettings | 在 Handler 之后重排提醒定时器、按 moyu.enabled 启停监督 |
+| OpenSettings | 打开设置窗口（platform/settings.rs，按需创建、关掉即销毁） |
+| OpenConfigFile / OpenDataDir / OpenSongDir | 打开 config.json / 数据目录 / songs 目录（不存在先建） |
+| ReloadSettings | 在 Handler 之后重排提醒定时器、按 moyu.enabled 启停监督、套用「哈基米大小」（scale） |
 | Moyu(on) | 在 Handler（它会写 config）之后启停监督 |
 | Quit | 调 `Handler::quit` 然后退出 |
 | Memo(OpenFile) | 打开 memo.json（不存在先建）；其余 Memo(..) 由行为层调 core::memo 处理 |
@@ -56,6 +57,24 @@ src/
 
 其余（Chat、Feed、Pat、Honey、Song、Status、Sleep、Walk、Costume、Outfit、ClearOutfit、Tts、TtsChatOnly、ForgetChat、Dance）只由行为层处理；
 其中会改配置的（Costume/Outfit/Tts/TtsChatOnly/Moyu）由行为层调 `core::config::update` 写入，平台层每次弹菜单时读 `core::config::get()` 决定勾选状态。
+
+## 右键菜单（数据驱动）
+- 整个菜单在 `platform/menu.rs` 的 `MENU` 表里：顶层只有 聊天 / 喂养▸ / 互动▸ / 娱乐▸ / 工具▸ / 换装▸ / 状态 / 设置… / 藏起来 / 退出。
+- 加功能 = 在对应分组里加一行 `Item("id", "文字")`，再在 `parse_id` 里把 id 映射成 `MenuAction`；`table_integrity` 测试会检查 id 唯一、都能映射、顶层 ≤ 10 项。
+- 勾选 / 动态文字 / 能不能点由 `checked` / `label` / `enabled` 三个纯函数决定；舞谱和备忘录是运行时生成的子菜单（`Gen("dance")` / `Gen("memo")`）。
+- 托盘：同一份菜单；单击 = 藏起来/叫出来（等过双击时间才执行），双击 = 打开设置。
+- 自测：`WM_APP+9` 下标 10 = 打开设置窗口、11 = 打开聊天框；`WM_APP+10` = 在光标处弹出右键菜单。
+
+## 设置窗口
+- `platform/settings.rs`：原生 Win32 控件 + 临时 comctl32 v6 激活上下文（程序本身没有清单）。三页：AI 聊天 / 语音 / 常规。
+- 保存：`core::config::replace` 原子写回（未知字段保留），再走 `settings:reload`。Key 不进日志。
+- 「测试连接」= `services::ai::test_connection`（用窗口里没保存的值），「试听」= `services::tts::synth_test`；后台线程跑，PostMessage 回窗口。
+- config 新字段：`weatherCity`（空 = 按 IP）、`scale`（0.5~2.0）、`tts.chatVoiceReply`（语音回答，默认开）。
+
+## 语音回答（behavior/chatvoice.rs）
+- `tts.chatVoiceReply` 开且 TTS 可用：AI 回复到了先保持「思考中」，按句切开（最多 4 段），第一段合成好才出字并同时开念；
+  后面每段在前一段念的时候预合成，念完才出下一段字。某段合成失败或 15 秒没好：剩下的字直接全显示，不出声。
+- 关掉：聊天回复只出字、不念（其它台词照旧）。
 
 ## 情绪表情 + 长期记忆（feat/memory-emotion）
 - 情绪标签：`services/emotion.rs`。系统提示词要求回复以 `[happy]` 等标签开头（只用现有立绘名）；`analyze(text)` 去标签（含【】［］、大小写、正文里混进来的）→ 没有/不认识就按关键词猜 → idle。流式回复用 `TagStream`（标签被拆开也能认，半截标签先扣着）。

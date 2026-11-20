@@ -10,10 +10,12 @@ pub const MAX_HISTORY: usize = 20;
 /// 原版 AbortController 30 秒
 const TIMEOUT_SECS: u64 = 30;
 
-const NEED_KEY: &str = "哈基米的大脑还没接上喵……右键我选「设置」，把 Gemini API Key 填进去就能聊天啦！";
+const NEED_KEY: &str = "哈基米的大脑还没接上喵……右键我点「⚙️ 设置…」，在「AI 聊天」里填好 API Key 就能聊天啦！";
+/// 第一次打开聊天、还没填 Key 时她先说的一句（behavior 用）
+pub const KEY_HINT: &str = "要先帮哈基米接上大脑喵～右键我点「⚙️ 设置…」，在「AI 聊天」里选个服务商、填好 API Key，里面有获取 Key 的链接哦！";
 const ERR_GENERIC: &str = "哈基米的脑袋卡住了喵……等会儿再问我一次？";
 const ERR_TIMEOUT: &str = "网络好慢喵……30 秒都没等到回音。是不是代理没开？";
-const ERR_KEY: &str = "API Key 好像不对喵……右键「设置」检查一下？";
+const ERR_KEY: &str = "API Key 好像不对喵……右键「⚙️ 设置…」检查一下？里面有「测试连接」按钮哦";
 const ERR_429: &str = "问得太快啦，额度用完了喵，歇一会儿再来";
 const ERR_NET: &str = "连不上服务器喵……国内要开代理才能找到 Gemini 哦";
 
@@ -308,6 +310,98 @@ pub fn ask_once(system: &str, user: &str) -> Result<String, String> {
     r.map_err(|e| e.detail)
 }
 
+// ------------------------------------------------------------------ 设置窗口「测试连接」
+
+/// 测试连接用的参数（设置窗口里还没保存的值）
+#[derive(Clone, Debug)]
+pub struct TestParams {
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub proxy: String,
+}
+
+/// 发一条很短的请求，成功返回 (耗时毫秒, 回复)；失败返回给新手看的中文原因。不写日志、不碰 chat.json。
+pub fn test_connection(p: &TestParams) -> Result<(u64, String), String> {
+    let key = p.api_key.trim();
+    if key.is_empty() { return Err("还没填 API Key".into()); }
+    let model = p.model.trim();
+    if model.is_empty() { return Err("还没填模型名".into()); }
+    let agent = super::net::agent_with_proxy(&p.proxy, 25);
+    let system = "你是连接测试。只回复一个字：喵";
+    let history = [json!({ "role": "user", "text": "ping" })];
+    let base_in = p.base_url.trim();
+    let t0 = std::time::Instant::now();
+    let r = if p.provider == "openai" {
+        let base = if base_in.is_empty() { "https://api.openai.com/v1" } else { base_in };
+        let base = base.trim_end_matches('/');
+        let auth = format!("Bearer {key}");
+        super::net::post_json_via(&agent, &format!("{base}/chat/completions"), &[("Authorization", &auth)], &openai_body(model, system, &history))
+    } else {
+        let base = if base_in.is_empty() { "https://generativelanguage.googleapis.com/v1beta" } else { base_in };
+        let base = base.trim_end_matches('/');
+        let url = format!("{base}/models/{}:generateContent", encode_component(model));
+        super::net::post_json_via(&agent, &url, &[("x-goog-api-key", key)], &gemini_body(model, system, &history))
+    };
+    let ms = t0.elapsed().as_millis() as u64;
+    let (status, text) = r.map_err(|e| explain_net(&e))?;
+    let json: Option<Value> = serde_json::from_str(&text).ok();
+    if !(200..300).contains(&status) {
+        let msg = json
+            .as_ref()
+            .and_then(|j| j.get("error"))
+            .and_then(|e| e.get("message").and_then(Value::as_str).map(str::to_string).or_else(|| e.as_str().map(str::to_string)))
+            .unwrap_or_default();
+        return Err(explain_status(status, &redact(&msg, key)));
+    }
+    let json = json.ok_or("服务器返回的不是 JSON，接口地址可能填错了（要填到 /v1 这一级）")?;
+    let reply = if p.provider == "openai" { parse_openai(&json) } else { parse_gemini(&json) };
+    match reply {
+        Ok(t) => Ok((ms, t.chars().take(30).collect())),
+        // 通了但没有正文（思考型模型 token 不够、被安全拦截等）：算连上了
+        Err(e) => Ok((ms, format!("（连上了，但回复是空的：{}）", e.detail))),
+    }
+}
+
+/// 把服务器错误里可能带的 Key 片段遮掉，再截短
+fn redact(msg: &str, key: &str) -> String {
+    let mut m = msg.to_string();
+    if key.len() >= 6 { m = m.replace(key, "***"); }
+    let m = m.trim();
+    let short: String = m.chars().take(90).collect();
+    if m.chars().count() > 90 { format!("{short}…") } else { short }
+}
+
+fn explain_net(e: &ureq::Error) -> String {
+    if matches!(e, ureq::Error::Timeout(_)) {
+        return "连接超时：网络太慢，或者需要开代理（Gemini / OpenAI 在国内要代理）".into();
+    }
+    match e {
+        ureq::Error::HostNotFound => "找不到服务器：检查接口地址有没有拼错，或者网络是否正常".into(),
+        ureq::Error::ConnectProxyFailed(_) | ureq::Error::InvalidProxyUrl => "代理连不上：检查「代理」那一栏，或代理软件有没有开".into(),
+        ureq::Error::BadUri(_) => "接口地址格式不对，应该像 https://api.xxx.com/v1".into(),
+        _ if super::net::is_network_error(e) => "连不上服务器：检查网络；Gemini / OpenAI 在国内需要开代理".into(),
+        _ => "请求失败，稍后再试".into(),
+    }
+}
+
+/// HTTP 状态码 → 新手看得懂的话
+pub fn explain_status(status: u16, server_msg: &str) -> String {
+    let base = match status {
+        400 if server_msg.to_ascii_lowercase().contains("key") => "API Key 不对",
+        400 => "请求被拒绝（模型名或参数不对）",
+        401 => "API Key 不对或已失效",
+        402 => "账户余额不足，需要先充值",
+        403 => "没有权限：Key 不对，或者当前地区/账号不能用这个服务",
+        404 => "找不到：模型名或接口地址填错了",
+        429 => "太频繁或额度用完了，歇一会儿再试",
+        500..=599 => "服务器那边出错了，稍后再试",
+        _ => "请求失败",
+    };
+    if server_msg.is_empty() { format!("{base}（HTTP {status}）") } else { format!("{base}（HTTP {status}：{server_msg}）") }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -363,6 +457,19 @@ mod tests {
         assert_eq!(e(ErrKind::Status(500)), ERR_GENERIC);
         assert_eq!(e(ErrKind::Timeout), ERR_TIMEOUT);
         assert_eq!(e(ErrKind::Network), ERR_NET);
+    }
+
+    #[test]
+    fn status_texts_and_redact() {
+        assert!(explain_status(401, "").starts_with("API Key 不对"));
+        assert!(explain_status(400, "API key not valid").starts_with("API Key 不对"));
+        assert!(explain_status(404, "model not found").contains("模型名"));
+        assert!(explain_status(402, "").contains("余额"));
+        assert!(explain_status(503, "").contains("服务器"));
+        assert_eq!(redact("bad key sk-abcdef123 here", "sk-abcdef123"), "bad key *** here");
+        assert!(redact(&"x".repeat(200), "k").chars().count() <= 91);
+        let p = TestParams { provider: "openai".into(), base_url: String::new(), api_key: " ".into(), model: "m".into(), proxy: String::new() };
+        assert_eq!(test_connection(&p).unwrap_err(), "还没填 API Key");
     }
 
     #[test]

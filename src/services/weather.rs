@@ -9,9 +9,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub type WeatherInfo = Weather;
 
 const URL: &str = "https://wttr.in/?format=j1&lang=zh";
+
+/// 设置里填了城市就查那个城市，空 = 按出口 IP
+pub fn url_for(city: &str) -> String {
+    let c = city.trim();
+    if c.is_empty() { return URL.into(); }
+    let mut enc = String::new();
+    for b in c.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.".contains(&b) { enc.push(b as char) } else { enc.push_str(&format!("%{b:02X}")) }
+    }
+    format!("https://wttr.in/{enc}?format=j1&lang=zh")
+}
 static BUSY: AtomicBool = AtomicBool::new(false);
 /// (结果, 拿到时的 epoch 毫秒)
-static LATEST: Mutex<Option<(WeatherInfo, u64)>> = Mutex::new(None);
+static LATEST: Mutex<Option<(WeatherInfo, u64, String)>> = Mutex::new(None);
 
 fn epoch_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -20,7 +31,11 @@ fn epoch_ms() -> u64 {
 /// 最近一次拿到的天气（3 小时以上的旧数据不算）
 pub fn latest() -> Option<WeatherInfo> {
     let g = LATEST.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().filter(|(_, t)| epoch_ms().saturating_sub(*t) < 3 * 3600 * 1000).map(|(w, _)| w.clone())
+    let city = crate::core::config::get().weather_city;
+    // 换了城市，旧缓存作废
+    g.as_ref()
+        .filter(|(_, t, c)| epoch_ms().saturating_sub(*t) < 3 * 3600 * 1000 && *c == city)
+        .map(|(w, _, _)| w.clone())
 }
 
 /// 后台拉一次天气（已经在拉就忽略）
@@ -30,7 +45,8 @@ pub fn refresh(tx: &EventSender) {
     }
     let tx = tx.clone();
     let r = std::thread::Builder::new().name("weather".into()).stack_size(256 * 1024).spawn(move || {
-        let w = crate::services::net::get_text(URL, 20, 512 * 1024)
+        let city = crate::core::config::get().weather_city;
+        let w = crate::services::net::get_text(&url_for(&city), 20, 512 * 1024)
             .ok()
             .filter(|(st, _)| *st == 200)
             .and_then(|(_, body)| parse(&body));
@@ -42,7 +58,7 @@ pub fn refresh(tx: &EventSender) {
             None => crate::core::log::log("weather unavailable"),
         }
         if let Some(w) = &w {
-            *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = Some((w.clone(), epoch_ms()));
+            *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = Some((w.clone(), epoch_ms(), city));
         }
         BUSY.store(false, Ordering::Release);
         if let Some(w) = w {

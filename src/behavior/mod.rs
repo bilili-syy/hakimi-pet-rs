@@ -7,6 +7,7 @@ mod memo;
 mod emotion;
 pub mod beat;
 pub mod dance;
+mod chatvoice;
 
 use crate::core::stats::{Act, ActResult, MoodLevel, Stats};
 use crate::render::{BubbleView, Rect, Scene, StatusView, Xf, ZGlyph, anim};
@@ -95,6 +96,8 @@ enum Later {
     Greet,
     Beg,
     Prewarm,
+    /// 语音回答：等某一句合成超时（token）
+    ChatVoiceTimeout(u64),
     BlinkEnd,
     DoubleBlink,
     /// 备忘提醒：点她之后确认「知道了」（等等看是不是双击）
@@ -241,6 +244,13 @@ pub struct Behavior {
     memo: memo::MemoUi,
     /// 情绪表情 + 长期记忆（behavior/emotion.rs）
     mind: emotion::MindUi,
+    /// 语音回答进行中（behavior/chatvoice.rs）
+    cv: Option<chatvoice::ChatVoice>,
+    /// 测试用：io=false 时假装「语音回答」开着且 TTS 可用 / 用户关了语音回答
+    pub(crate) fake_chat_voice: bool,
+    pub(crate) fake_chat_voice_off: bool,
+    /// 这次运行里已经提醒过「去设置里填 Key」
+    key_hint_shown: bool,
 }
 
 impl Behavior {
@@ -316,6 +326,10 @@ impl Behavior {
             costume,
             outfits,
             play: play::Play::default(),
+            cv: None,
+            fake_chat_voice: false,
+            fake_chat_voice_off: false,
+            key_hint_shown: false,
             memo: memo::MemoUi::default(),
             mind: emotion::MindUi::default(),
         };
@@ -358,6 +372,7 @@ impl Behavior {
             AppEvent::ChatSubmit(t) => self.on_chat_submit(t),
             AppEvent::ChatCancel => self.close_chat(),
             AppEvent::ChatReply(r) => self.on_chat_reply(r),
+            AppEvent::Speech { token, audio } if self.cv_wants(token) => self.cv_on_speech(token, audio),
             AppEvent::Speech { token, audio } => {
                 self.emotion_speech(token, audio.is_some());
                 if token != self.voice_req || token == 0 { return self.flush(out); }
@@ -394,6 +409,8 @@ impl Behavior {
                     self.song = None;
                     if self.state == St::Dance { self.end_dance(); }
                 }
+                self.cv_on_audio_done(token);
+                self.emotion_cv_done();
             }
             AppEvent::Remind(k) => self.on_remind(k),
             AppEvent::Pomodoro(p) => self.on_pomodoro(p),
@@ -591,6 +608,7 @@ impl Behavior {
                 self.call(format!("prewarm:{}", items.len()));
                 if self.io { crate::services::tts::prewarm(items); }
             }
+            Later::ChatVoiceTimeout(t) => self.cv_timeout(t),
             Later::BlinkEnd => { if self.face == Face::Blink { self.show(Face::Idle); } }
             Later::MemoAck => self.memo_ack(),
             Later::DoubleBlink => {
@@ -695,6 +713,7 @@ impl Behavior {
     fn say(&mut self, text: &str, ms: u64) { self.say_opts(text, ms, true, SpeakKind::Line); }
 
     fn say_opts(&mut self, text: &str, ms: u64, voice: bool, kind: SpeakKind) {
+        self.cv_interrupted();
         let token = if voice { self.next_token() } else { 0 };
         self.bubble = Some(Bubble { text: text.to_string(), shown: self.now, hide_at: Some(self.now + ms), dur: ms, token });
         self.bubble_fade.set(true, self.now);
@@ -1145,6 +1164,8 @@ impl Behavior {
             MenuAction::ReloadSettings => {
                 let (c, o) = if self.io {
                     let cfg = crate::core::config::reload();
+                    // 设置窗口里关了声音：正在念的停掉
+                    if !cfg.tts.enabled { self.stop_voice(); }
                     (cfg.costume, cfg.outfit)
                 } else {
                     (self.costume.clone(), self.outfits.clone())
@@ -1174,6 +1195,7 @@ impl Behavior {
             // 平台层自己处理：番茄钟（会发 AppEvent::Pomodoro）、显示/隐藏/叫到中间（会发 Peek）、
             // 打开文件/文件夹、自启、退出（会调 Handler::quit）
             MenuAction::PomodoroStart(_) | MenuAction::PomodoroStop | MenuAction::OpenSongDir | MenuAction::OpenSettings
+            | MenuAction::OpenConfigFile
             | MenuAction::OpenDataDir | MenuAction::AutoStart(_) | MenuAction::ToggleVisible | MenuAction::CallToCenter
             | MenuAction::Quit => {}
         }
@@ -1208,6 +1230,11 @@ impl Behavior {
         self.state_timer = None;
         if matches!(self.state, St::Walk | St::Sleep) { self.set_state(St::Idle, None); }
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Open));
+        // 新手：还没填聊天 Key，第一次打开聊天就先告诉她去哪儿填
+        if !self.key_hint_shown && self.io && crate::core::config::ai_key_missing(&crate::core::config::get()) {
+            self.key_hint_shown = true;
+            self.say(crate::services::ai::KEY_HINT, 9000);
+        }
     }
 
     /// 输入框里有没有打了字
@@ -1265,6 +1292,16 @@ impl Behavior {
     fn on_chat_reply(&mut self, r: ChatReply) {
         // 去掉情绪标签（气泡和 TTS 只拿干净文字）
         let (r, emo) = self.emotion_split(r);
+        // 语音回答：先合成，字和声音一起出来（chatvoice.rs）；这期间保持思考中
+        if r.ok && self.chat_voice_on() {
+            self.cv_start(&r.text);
+            if self.cv.is_some() {
+                // 第一段出字时再换表情（emotion_cv_reveal），整段念完 2 秒后回平时
+                self.emotion_cv_pending(emo, r.text.chars().count());
+                self.mind_after_reply(true);
+                return;
+            }
+        }
         self.waiting = false;
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(true)));
         if r.ok {
@@ -1278,7 +1315,9 @@ impl Behavior {
         }
         // 字多就多停一会儿：2.5 秒起，每字 +0.15 秒，最多 20 秒
         let ms = (2500 + r.text.encode_utf16().count() as u64 * 150).min(20_000);
-        self.say_opts(&r.text, ms, true, if r.ok { SpeakKind::Chat } else { SpeakKind::Line });
+        // 语音回答关了：聊天回复只出字
+        let voice = !(r.ok && self.chat_voice_disabled_by_user());
+        self.say_opts(&r.text, ms, voice, if r.ok { SpeakKind::Chat } else { SpeakKind::Line });
         self.hold_timer(2500, StateAct::ChatIdle);
         self.emotion_hold(emo);
         self.mind_after_reply(r.ok);
