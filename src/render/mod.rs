@@ -140,7 +140,9 @@ const PET_Y: f32 = WIN_H as f32 - PET_H;
 // 原来 #5a3b2e 在奶白底上偏灰、发虚（电脑上看对比度不够），压深一档
 const C_TEXT: u32 = 0x3a2416;
 const C_BG: u32 = 0xfffaf0;
-const C_BORDER: u32 = 0xfbbc04;
+/// 气泡/状态卡的边和阴影（原版 #fbbc04 边 + 红绿蓝阴影）
+const C_CARD_EDGE: u32 = 0xf2b048;
+const C_SHADOW: u32 = 0x7a4a1e;
 const C_RED: u32 = 0xea4335;
 const C_GREEN: u32 = 0x34a853;
 const C_BLUE: u32 = 0x4285f4;
@@ -586,14 +588,16 @@ impl Renderer {
     }
 }
 
-/// 原版卡片：圆角 12、2px #fbbc04 边、#fffaf0 底、下方三层四色 box-shadow（红 2/绿 4/蓝 6）
+/// 卡片：圆角 12、2px 暖橙边、#fffaf0 底、下方一层柔和的浅棕阴影（和设置窗口同一套奶油/橙色调）。
+/// 原版是红/绿/蓝三层错开的彩色 box-shadow，缩小后像花边，2026-11-20 按用户要求换掉。
 fn draw_card(pm: &mut Pixmap, w: f32, h: f32, s: f32, bg_alpha: f32) {
     let id = Transform::identity();
     let r = 12.0 * s;
-    shapes::fill_rrect(pm, 0.0, 6.0 * s, w, h, r, C_BLUE, 1.0, id);
-    shapes::fill_rrect(pm, 0.0, 4.0 * s, w, h, r, C_GREEN, 1.0, id);
-    shapes::fill_rrect(pm, 0.0, 2.0 * s, w, h, r, C_RED, 1.0, id);
-    shapes::fill_rrect(pm, 0.0, 0.0, w, h, r, C_BORDER, 1.0, id);
+    // 由外到内三层半透明叠出一个软阴影（画布下方只多留了 6px）
+    for (inset, dy, a) in [(2.0, 5.5, 0.06), (1.0, 4.0, 0.08), (0.5, 2.5, 0.12)] {
+        shapes::fill_rrect(pm, inset * s, dy * s, w - 2.0 * inset * s, h, r, C_SHADOW, a, id);
+    }
+    shapes::fill_rrect(pm, 0.0, 0.0, w, h, r, C_CARD_EDGE, 1.0, id);
     // 内底：先挖空再填，半透明背景下边框不透出来
     if let Some(p) = shapes::rrect(2.0 * s, 2.0 * s, w - 4.0 * s, h - 4.0 * s, r - 2.0 * s) {
         let mut clear = shapes::paint(0, 1.0);
