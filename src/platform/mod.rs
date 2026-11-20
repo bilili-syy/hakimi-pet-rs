@@ -447,7 +447,7 @@ fn memo_prewarm() {
     let items: Vec<_> = crate::core::memo::pending()
         .into_iter()
         .filter(|i| i.due().is_some_and(|d| d <= soon))
-        .map(|i| crate::behavior::memo_voice(&i.text))
+        .flat_map(|i| crate::behavior::memo_voices(&i.text))
         .collect();
     if !items.is_empty() {
         crate::services::tts::prewarm_now(items);

@@ -4,7 +4,7 @@ pub mod fx;
 pub mod lines;
 pub mod play;
 mod memo;
-pub use memo::memo_voice;
+pub use memo::memo_voices;
 mod emotion;
 mod skin;
 pub mod beat;
@@ -103,6 +103,8 @@ enum Later {
     ChatVoiceTimeout(u64),
     /// 备忘提醒：点她之后确认「知道了」（等等看是不是双击）
     MemoAck,
+    /// 备忘提醒没人理：第 n 次追问
+    MemoNag(u8),
 }
 
 /// 透明度过渡（transition: opacity 0.25s）
@@ -420,6 +422,7 @@ impl Behavior {
                     self.song = None;
                     if self.state == St::Dance { self.end_dance(); }
                 }
+                self.memo_audio_done(token);
                 self.cv_on_audio_done(token);
                 self.emotion_cv_done();
             }
@@ -620,6 +623,7 @@ impl Behavior {
             }
             Later::ChatVoiceTimeout(t) => self.cv_timeout(t),
             Later::MemoAck => self.memo_ack(),
+            Later::MemoNag(n) => self.memo_nag(n),
         }
     }
 
