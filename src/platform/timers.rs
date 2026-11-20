@@ -160,14 +160,14 @@ mod tests {
 
     #[test]
     fn zero_disables() {
-        let c = RemCfg { water: 0, stand_up: 0, off_work: String::new() };
+        let c = RemCfg { water: 0, stand_up: 0, off_work: String::new(), ..Default::default() };
         let r = Reminders::schedule(&c, 0);
         assert_eq!(r.next_deadline(), None);
     }
 
     #[test]
     fn off_work_once_per_weekday() {
-        let c = RemCfg { water: 0, stand_up: 0, off_work: "18:00".into() };
+        let c = RemCfg { water: 0, stand_up: 0, off_work: "18:00".into(), ..Default::default() };
         let mut r = Reminders::schedule(&c, 0);
         assert!(r.poll(20_000, lt(5, 17, 59)).is_empty());
         assert_eq!(r.poll(40_000, lt(5, 18, 0)), vec![RemindKind::OffWork]);
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn no_burst_after_sleep() {
-        let c = RemCfg { water: 45, stand_up: 0, off_work: String::new() };
+        let c = RemCfg { water: 45, stand_up: 0, off_work: String::new(), ..Default::default() };
         let mut r = Reminders::schedule(&c, 0);
         assert_eq!(r.poll(1000 * MIN, lt(1, 1, 0)), vec![RemindKind::Water]);
         assert!(r.poll(1001 * MIN, lt(1, 1, 0)).is_empty());
