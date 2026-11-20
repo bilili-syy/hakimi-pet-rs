@@ -360,28 +360,30 @@ fn chat_voice_waits_for_audio_then_shows_text_and_plays_together() {
     tick(&mut b, 3000);
     ev(&mut b, AppEvent::Menu(MenuAction::Chat), 3000);
     ev(&mut b, AppEvent::ChatSubmit("讲讲天气".into()), 3100);
-    let reply = "今天天气很好喵！我们出去玩吧～记得带伞，下午可能会下雨哦。";
+    let reply = "今天天气很好喵，阳光暖洋洋的，晒得哈基米都想打滚了！我们一起出去散散步吧，顺便买点小鱼干～记得带伞哦，下午可能会下雨，别淋湿了喵。";
     let out = ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, text: reply.into(), need_key: false }), 5000);
     // 回复到了但还在思考：输入框没解锁、气泡里还不是回复
     assert!(!out.contains(&WinCmd::ChatInput(ChatInputCmd::Enable(true))));
     assert_eq!(b.state, St::Think);
-    assert!(b.calls.iter().any(|c| c == "cvspeak:今天天气很好喵！"));
-    assert_ne!(b.scene.bubble.as_ref().map(|x| x.text.as_str()), Some("今天天气很好喵！"));
+    let parts = super::chatvoice::split_sentences(reply);
+    assert_eq!(parts.len(), 3, "{parts:?}");
+    assert!(b.calls.iter().any(|c| *c == format!("cvspeak:{}", parts[0])));
+    assert_ne!(b.scene.bubble.as_ref().map(|x| x.text.clone()), Some(parts[0].clone()));
     let t1 = b.token_seq;
     // 第一句合成好：字出现 + 同时开始念，并预合成第二句
     let out = ev(&mut b, AppEvent::Speech { token: t1, audio: audio() }, 6500);
     assert!(out.contains(&WinCmd::ChatInput(ChatInputCmd::Enable(true))));
     assert_eq!(b.state, St::Happy);
-    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "今天天气很好喵！");
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, parts[0]);
     let p1 = b.voice_playing.expect("playing first sentence");
     assert!(b.calls.iter().any(|c| *c == format!("cvplay:{p1}")));
-    assert!(b.calls.iter().any(|c| c == "cvspeak:我们出去玩吧～"));
+    assert!(b.calls.iter().any(|c| *c == format!("cvspeak:{}", parts[1])));
     let t2 = b.token_seq;
     // 第二句先合成好：等第一句念完才出字
     ev(&mut b, AppEvent::Speech { token: t2, audio: audio() }, 7000);
-    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "今天天气很好喵！");
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, parts[0]);
     ev(&mut b, AppEvent::AudioDone { token: p1 }, 8000);
-    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "今天天气很好喵！我们出去玩吧～");
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, format!("{}{}", parts[0], parts[1]));
     let p2 = b.voice_playing.expect("playing second sentence");
     assert_ne!(p1, p2);
     // 第三句合成失败：第二句念完把剩下的字全显示，不出声
