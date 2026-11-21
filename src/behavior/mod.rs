@@ -513,13 +513,13 @@ impl Behavior {
             self.now = due;
             match k {
                 0 => {
-                    let (_, a) = self.state_timer.take().unwrap();
-                    self.on_state_timer(a);
+                    if let Some((_, a)) = self.state_timer.take() { self.on_state_timer(a); }
                 }
                 1 => {
-                    let i = self.laters.iter().enumerate().min_by_key(|(_, l)| l.0).map(|(i, _)| i).unwrap();
-                    let (_, l) = self.laters.remove(i);
-                    self.on_later(l);
+                    if let Some(i) = self.laters.iter().enumerate().min_by_key(|(_, l)| l.0).map(|(i, _)| i) {
+                        let (_, l) = self.laters.remove(i);
+                        self.on_later(l);
+                    }
                 }
                 2 => self.on_blink(),
                 3 => self.on_tick(),
@@ -992,7 +992,7 @@ impl Behavior {
         self.cmds.push(WinCmd::DragMove { sx, sy });
         // 甩来甩去会晕：统计 1.5 秒内左右换向次数
         let now = self.now;
-        let d = self.down.as_mut().unwrap();
+        let Some(d) = self.down.as_mut() else { return };
         let dx = sx - d.lx.unwrap_or(sx);
         d.lx = Some(sx);
         if (dx.abs() as f32) > 6.0 * s {

@@ -196,7 +196,7 @@ fn start_meter() {
         let mut meter: Option<IAudioMeterInformation> = None;
         let mut tick = 0u32;
         loop {
-            if tick % 5 == 0 {
+            if tick.is_multiple_of(5) {
                 PLAYER.store(player_running(), Ordering::Relaxed);
                 // 换了输出设备（插耳机）就重新拿
                 meter = (|| -> windows::core::Result<IAudioMeterInformation> {

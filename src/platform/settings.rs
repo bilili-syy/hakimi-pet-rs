@@ -147,6 +147,8 @@ const ID_FORGET: i32 = 161;
 const ID_RAWFILE: i32 = 162;
 const ID_RELOAD: i32 = 163;
 const ID_DEFAULTS: i32 = 170;
+const ID_UPDATE: i32 = 171;
+const ID_UPDATE_RESULT: i32 = 172;
 const ID_MEMO_LIST: i32 = 180;
 const ID_MEMO_TEXT: i32 = 181;
 const ID_MEMO_DATE: i32 = 182;
@@ -235,6 +237,7 @@ struct Dlg {
     /// 后台任务代号：窗口关掉/再点一次后旧结果作废
     test_gen: u64,
     play_gen: u64,
+    update_gen: u64,
     /// 备忘录页：列表第 i 行是哪条、选中的那条、上次刷新时的数据版本
     memo_ids: Vec<u64>,
     memo_sel: Option<u64>,
@@ -405,6 +408,7 @@ fn create_inner(page: u8) -> windows::core::Result<()> {
             preset: 0,
             test_gen: 0,
             play_gen: 0,
+            update_gen: 0,
             memo_ids: Vec::new(),
             memo_sel: None,
             memo_ver: 0,
@@ -742,6 +746,8 @@ impl Dlg {
         self.button(p, ID_RAWFILE, "编辑设置文件（高级）", 0, [X0, 356.0, 170.0, 30.0]);
         self.button(p, ID_RELOAD, "重新读取设置文件", 0, [X0 + 182.0, 356.0, 170.0, 30.0]);
         self.hint(p, "高级：摸鱼关键词、进程名等在设置文件里改，改完点「重新读取设置文件」。", [X0, 394.0, W - X0 - 16.0, 40.0]);
+        self.button(p, ID_UPDATE, "检查更新", 0, [X0, 438.0, 170.0, 30.0]);
+        self.add(p, w!("STATIC"), &format!("当前版本 v{}", crate::services::update::CURRENT), SS_CENTERIMAGE, 0, ID_UPDATE_RESULT, [X0 + 182.0, 438.0, W - X0 - 198.0, 30.0]);
 
         // ---------------- 备忘录（改动马上写进 memo.json，不用点「保存」）
         let p = 4;
@@ -1138,6 +1144,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
         }
         (ID_TTS_LINK, _) => super::sys::open_url(MIMO_KEY_URL),
         (ID_TEST, _) => start_test(),
+        (ID_UPDATE, _) => start_update(hwnd),
         (ID_PLAY, _) => start_play(),
         (ID_TTS_ON, _) | (ID_MODE, CBN_SELCHANGE) => {
             with(|d| d.update_tts_enable());
@@ -1276,6 +1283,41 @@ fn destroy(hwnd: HWND) {
     }
 }
 
+fn start_update(hwnd: HWND) {
+    // 已经查到新版本：再点一次就打开下载页
+    if UPDATE_FOUND.load(Ordering::Relaxed) {
+        super::sys::open_url(crate::services::update::RELEASES_URL);
+        return;
+    }
+    let Some(tag) = with(|d| {
+        d.update_gen = GEN.fetch_add(1, Ordering::Relaxed);
+        set_text(d.c(ID_UPDATE_RESULT), "正在检查…");
+        enable(d.c(ID_UPDATE), false);
+        d.update_gen
+    }) else {
+        return;
+    };
+    let h = hwnd.0 as isize;
+    let spawned = std::thread::Builder::new().name("hakimi-update".into()).spawn(move || {
+        let cur = crate::services::update::CURRENT;
+        let (ok, text) = match crate::services::update::check() {
+            Ok((t, true)) => {
+                UPDATE_FOUND.store(true, Ordering::Relaxed);
+                (true, format!("有新版本 {t}！再点一次去下载"))
+            }
+            Ok((_, false)) => (true, format!("v{cur} 已经是最新版")),
+            Err(e) => (false, format!("✘ {e}")),
+        };
+        post_result(h, ID_UPDATE_RESULT, tag, ok, text);
+    });
+    if spawned.is_err() {
+        post_result(h, ID_UPDATE_RESULT, tag, false, "✘ 开不了后台线程".into());
+    }
+}
+
+/// 查到过新版本（按钮变成「去下载」）
+static UPDATE_FOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn start_test() {
     let Some((hwnd, params, tag)) = with(|d| {
         d.test_gen = GEN.fetch_add(1, Ordering::Relaxed);
@@ -1367,6 +1409,14 @@ fn on_results() {
     let rs: Vec<_> = RESULTS.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
     with(|d| {
         for (id, tag, ok, text) in rs {
+            if id == ID_UPDATE_RESULT {
+                if tag == d.update_gen {
+                    set_text(d.c(id), &text);
+                    if UPDATE_FOUND.load(Ordering::Relaxed) { set_text(d.c(ID_UPDATE), "去下载新版本"); }
+                    enable(d.c(ID_UPDATE), true);
+                }
+                continue;
+            }
             let (want, btn, slot) = if id == ID_TEST_RESULT { (d.test_gen, ID_TEST, 0) } else { (d.play_gen, ID_PLAY, 1) };
             if tag != want {
                 continue;
@@ -1495,16 +1545,18 @@ fn aa_round(hdc: HDC, rc: RECT, radius: f32, bg: COLORREF, fill: COLORREF, strok
     }
     // RGBA（不透明，预乘无影响）→ BGRA
     let mut bgra = pm.take();
-    for p in bgra.chunks_exact_mut(4) {
+    for p in bgra.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
     }
-    let mut bi = BITMAPINFO::default();
-    bi.bmiHeader = BITMAPINFOHEADER {
-        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: w as i32,
-        biHeight: -(h as i32),
-        biPlanes: 1,
-        biBitCount: 32,
+    let bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: -(h as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            ..Default::default()
+        },
         ..Default::default()
     };
     unsafe {
@@ -1558,10 +1610,10 @@ fn draw_item(di: &windows::Win32::UI::Controls::DRAWITEMSTRUCT) {
         return;
     };
     let hdc = di.hDC;
-    let state = di.itemState.0 as u32;
+    let state = di.itemState.0;
     let rc = di.rcItem;
     let text = |h: HWND, idx: u32| -> Vec<u16> {
-        if di.CtlType.0 as u32 == ODT_LISTBOX {
+        if di.CtlType.0 == ODT_LISTBOX {
             PAGES.get(idx as usize).map(|s| s.encode_utf16().collect()).unwrap_or_default()
         } else {
             get_text(h).encode_utf16().collect()
@@ -1569,7 +1621,7 @@ fn draw_item(di: &windows::Win32::UI::Controls::DRAWITEMSTRUCT) {
     };
     unsafe {
         SetBkMode(hdc, TRANSPARENT);
-        if di.CtlType.0 as u32 == ODT_LISTBOX {
+        if di.CtlType.0 == ODT_LISTBOX {
             if di.itemID == u32::MAX {
                 return;
             }
@@ -1586,7 +1638,7 @@ fn draw_item(di: &windows::Win32::UI::Controls::DRAWITEMSTRUCT) {
             let mut tr = RECT { left: rc.left + (16.0 * scale) as i32, ..pill };
             DrawTextW(hdc, &mut t, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             SelectObject(hdc, old);
-        } else if di.CtlType.0 as u32 == ODT_BUTTON {
+        } else if di.CtlType.0 == ODT_BUTTON {
             let primary = di.CtlID as i32 == IDOK;
             let down = state & ODS_SELECTED != 0;
             let disabled = state & ODS_DISABLED != 0;

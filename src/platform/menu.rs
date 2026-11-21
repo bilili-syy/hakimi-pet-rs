@@ -218,7 +218,7 @@ thread_local! {
 }
 
 pub(crate) fn push_id(id: String) {
-    MENU_QUEUE.lock().unwrap().push_back(id);
+    MENU_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push_back(id);
     if let Some(h) = main_hwnd() {
         unsafe {
             let _ = PostMessageW(Some(h), WM_APP_MENU, WPARAM(0), LPARAM(0));

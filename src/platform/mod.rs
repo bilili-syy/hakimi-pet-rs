@@ -117,8 +117,10 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
         crate::core::log::log("second instance, exit");
         return;
     };
+    crate::core::session::begin();
     let Some(hwnd) = create_main_window() else {
         crate::core::log::log("create window failed");
+        crate::core::session::end();
         return;
     };
     MAIN_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
@@ -693,6 +695,7 @@ fn do_quit() {
     }
     with(|s| s.quitting = true);
     with_handler(|h| h.quit());
+    crate::core::session::end();
     menu::shutdown();
     let hwnd = with(|s| {
         s.chat = None;

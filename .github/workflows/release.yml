@@ -1,0 +1,33 @@
+name: Release
+
+# 推一个 vX.Y.Z 的 tag 就自动编译，并把 exe 传到同名 Release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check version matches tag
+        shell: bash
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "Cargo.toml version v$v != tag ${GITHUB_REF_NAME}"; exit 1; }
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: bash
+        run: cp target/release/hakimi-pet.exe "hakimi-pet-${GITHUB_REF_NAME}-windows-x64.exe"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: hakimi-pet-${{ github.ref_name }}-windows-x64.exe
+          generate_release_notes: true

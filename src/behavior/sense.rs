@@ -145,8 +145,8 @@ impl Behavior {
         }
         self.sense.next_bob = self.now + 700;
         self.sense.bob_n += 1;
-        self.play(if self.sense.bob_n % 2 == 0 { Shot::Bounce } else { Shot::Squash });
-        if self.sense.bob_n % 9 == 0 { self.fx(FxKind::Note, 1); }
+        self.play(if self.sense.bob_n.is_multiple_of(2) { Shot::Bounce } else { Shot::Squash });
+        if self.sense.bob_n.is_multiple_of(9) { self.fx(FxKind::Note, 1); }
     }
 
     /// 开机问候时：今天是节日 / 主人生日就先说这个（一天一次）

@@ -1,6 +1,8 @@
 [package]
 name = "hakimi-pet"
-version = "0.1.0"
+version = "1.1.0"
+license = "MIT"
+repository = "https://github.com/bilili-syy/hakimi-pet-rs"
 edition = "2024"
 
 [dependencies]
