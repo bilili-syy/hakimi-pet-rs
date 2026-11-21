@@ -32,7 +32,7 @@ pub const WEATHER_RAIN: &[&str] = &["外面在下雨喵，出门记得带伞！"
 pub const WEATHER_THUNDER: &[&str] = &["打、打雷了喵！哈基米要躲起来", "雷雨天，出门一定带伞喵！"];
 pub const WEATHER_SNOW: &[&str] = &["下雪啦！哈基米想去踩雪喵～", "外面在下雪，穿暖和点喵！"];
 pub const WEATHER_HOT: &[&str] = &["好热喵……哈基米要化成一摊了", "热热热！记得多喝水，别中暑喵"];
-pub const WEATHER_COLD: &[&str] = &["好冷喵！哈基米把围巾围上啦", "降温了，多穿点衣服喵～"];
+pub const WEATHER_COLD: &[&str] = &["降温了，多穿点衣服喵～"];
 pub const WEATHER_NICE: &[&str] = &["今天天气真好喵，想出去晒太阳～", "好天气！适合摸鱼……啊不是，适合干活喵"];
 pub const REPORT_WAIT: &[&str] = &["哈基米去窗边看看天气喵……", "等一下，哈基米看看外面～"];
 pub const REPORT_FAIL: &[&str] = &["看不到天气……网络好像不通喵"];
@@ -820,26 +820,6 @@ impl Behavior {
         }
     }
 
-    /// 现在画面上的围巾是不是天冷自动围的（配置里没有）
-    pub(super) fn auto_scarf_shown(&self) -> bool {
-        !self.outfits.iter().any(|x| x == "scarf") && self.weather_outfits().iter().any(|x| x == "scarf")
-    }
-
-    /// 主人在菜单里摘围巾 / 摘掉配件：以后天冷也不自动围了（写进配置）
-    pub(super) fn disable_auto_scarf(&mut self) {
-        if !self.auto_scarf { return; }
-        self.auto_scarf = false;
-        if self.io { crate::core::config::update(|c| c.auto_scarf = false); }
-    }
-
-    /// 冷天自动围上围巾（只改画面，不写配置）
-    pub(super) fn weather_outfits(&self) -> Vec<String> {
-        let mut o = self.outfits.clone();
-        let cold = self.play.weather.as_ref().is_some_and(|w| w.temp_c <= 5.0);
-        if cold && self.auto_scarf && crate::core::costume::is_base(&self.costume) && !o.iter().any(|x| x == "scarf") { o.push("scarf".into()); }
-        o
-    }
-
     pub(super) fn weather_text(&self) -> Option<String> {
         let w = self.play.weather.as_ref()?;
         let desc = if w.desc.is_empty() {
@@ -1151,25 +1131,6 @@ mod tests {
         b.calls.clear();
         ev(&mut b, AppEvent::Menu(MenuAction::WeatherReport), 20000);
         assert!(!b.calls.iter().any(|c| c == "weather"));
-    }
-
-    #[test]
-    fn cold_scarf_can_be_taken_off() {
-        let mut b = mkb();
-        frame(&mut b, 3000);
-        let w = Weather { kind: WeatherKind::Cloudy, temp_c: 2.0, desc: "阴".into(), city: String::new(), high_c: None, low_c: None, rain_chance: None };
-        ev(&mut b, AppEvent::Weather(w), 3000);
-        assert!(b.auto_scarf_shown());
-        // 菜单里围巾没勾，点一下 = 摘掉，而且以后不再自动围
-        ev(&mut b, AppEvent::Menu(MenuAction::Outfit("scarf".into(), true)), 4000);
-        assert!(!b.weather_outfits().iter().any(|x| x == "scarf"));
-        assert!(b.outfits.is_empty());
-        // 自己再戴上：照常
-        ev(&mut b, AppEvent::Menu(MenuAction::Outfit("scarf".into(), true)), 5000);
-        assert_eq!(b.outfits, vec!["scarf".to_string()]);
-        // 摘掉配件：也全清
-        ev(&mut b, AppEvent::Menu(MenuAction::ClearOutfit), 6000);
-        assert!(b.weather_outfits().is_empty());
     }
 
     #[test]

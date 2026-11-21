@@ -92,7 +92,7 @@ pub enum MenuAction {
     PomodoroStart(u32), PomodoroStop,
     /// 整套衣服：core::costume::COSTUMES 里的 id（"sailor" 默认 / "hoodie" 原装卫衣 / …；"" 也当默认）
     Costume(String),
-    /// 配件开关：("santa"|"glasses"|"scarf", on)
+    /// 配件开关：("santa"|"glasses", on)
     Outfit(String, bool),
     ClearOutfit,
     /// 打开设置窗口

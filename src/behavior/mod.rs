@@ -265,8 +265,6 @@ pub struct Behavior {
 
     costume: String,
     outfits: Vec<String>,
-    /// 天冷自动围巾开关（config.auto_scarf）
-    auto_scarf: bool,
 
     /// 新互动（behavior/play.rs）
     play: play::Play,
@@ -290,7 +288,6 @@ impl Behavior {
         let (stats, away) = Stats::load(saved);
         let cfg = crate::core::config::get();
         let mut b = Self::with(tx, stats, existed, away, cfg.costume, cfg.outfit, true);
-        b.auto_scarf = cfg.auto_scarf;
         // 角色包：扫描 skins 目录，按 save.json 的 skin 字段选中（只读清单，图片用到才解码）
         crate::core::skin::init(&crate::core::skin::saved_id(&b.stats.data.extra));
         b.save();
@@ -361,7 +358,6 @@ impl Behavior {
             song: None,
             costume,
             outfits,
-            auto_scarf: true,
             play: play::Play::default(),
             cv: None,
             fake_chat_voice: false,

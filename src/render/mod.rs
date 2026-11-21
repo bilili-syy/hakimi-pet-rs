@@ -80,7 +80,7 @@ pub struct Scene {
     pub face: Face,
     /// core::costume 的 id（"" / "hoodie" = 原装卫衣立绘，"sailor" = 默认水手服）
     pub costume: String,
-    /// santa / glasses / scarf（按配置里的顺序叠）
+    /// santa / glasses（按配置里的顺序叠）
     pub outfits: Vec<String>,
     /// #pet 的动画变换（原点：盒子底边中点）
     pub pet: Xf,
@@ -425,8 +425,7 @@ impl Renderer {
         }
         if let Some((ox, oy)) = layers.outfit_offset {
             for id in &scene.outfits {
-                if sprites::outfit_hidden(id, scene.face) { continue; }
-                let path = sprites::outfit_path(&scene.costume, id);
+                let path = format!("outfits/{id}.png");
                 if let Some(o) = self.sprites.asset(&path, sw, sh) {
                     if let Some((x, y)) = snap {
                         let (dx, dy) = ((ox / 400.0 * sw as f32).round() as i32, (oy / 587.0 * sh as f32).round() as i32);
@@ -708,7 +707,7 @@ mod tests {
         let out = std::env::var("HAKIMI_SNAP").unwrap_or_else(|_| "snap.png".into());
         let mut r = Renderer::new();
         let mut sc = Scene::default();
-        sc.outfits = vec!["scarf".into(), "glasses".into()];
+        sc.outfits = vec!["glasses".into()];
         sc.glow = true;
         sc.star.bright = 1.2;
         sc.tail.rot = 6.0;
@@ -804,7 +803,7 @@ mod tests {
     fn bench() {
         let mut r = Renderer::new();
         let mut sc = Scene::default();
-        sc.outfits = vec!["scarf".into()];
+        sc.outfits = vec!["glasses".into()];
         sc.bubble = Some(BubbleView { text: "哈基米～哈基米～哈基米～哈基米哦南北绿豆～".into(), opacity: 1.0, scroll: 0.0 });
         let t = std::time::Instant::now();
         let n = 300;

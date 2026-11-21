@@ -63,20 +63,11 @@ impl Behavior {
                 self.outfit_changed(true, false);
             }
             MenuAction::Outfit(id, on) => {
-                // 自动围上的围巾在菜单里是没勾的：点它 = 想摘掉
-                if id == "scarf" && (!on || self.auto_scarf_shown()) {
-                    let shown = self.auto_scarf_shown();
-                    self.disable_auto_scarf();
-                    if shown && on { self.outfit_changed(false, false); return; }
-                }
                 let mut l: Vec<String> = self.outfits.iter().filter(|x| **x != id).cloned().collect();
                 if on { l.push(id); }
                 self.set_outfits(l);
             }
-            MenuAction::ClearOutfit => {
-                self.disable_auto_scarf();
-                self.set_outfits(Vec::new());
-            }
+            MenuAction::ClearOutfit => self.set_outfits(Vec::new()),
             MenuAction::ReloadSettings => {
                 let (c, o) = if self.io {
                     let cfg = crate::core::config::reload();

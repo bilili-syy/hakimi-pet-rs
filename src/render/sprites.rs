@@ -47,17 +47,6 @@ pub fn costume_src(costume: &str, face: Face) -> String {
     format!("outfits/{costume}/{f}.png")
 }
 
-/// 抱着碗 / 小鱼干在胸前吃的姿势：围巾会盖住手和鱼，这几帧不画围巾
-pub fn outfit_hidden(id: &str, face: Face) -> bool {
-    id == "scarf" && matches!(face, Face::Eat)
-}
-
-/// 配件图：这套衣服有专门对齐过的版本（outfits/<costume>/<id>.png）就用它，否则用通用的（按原装卫衣画的）
-pub fn outfit_path(costume: &str, id: &str) -> String {
-    let own = format!("outfits/{costume}/{id}.png");
-    if !costume.is_empty() && crate::assets::get(&own).is_some() { own } else { format!("outfits/{id}.png") }
-}
-
 pub fn outfit_offset(face: Face) -> Option<(f32, f32)> {
     match face {
         Face::Sit => Some((0.0, 17.0)),
@@ -240,24 +229,14 @@ mod tests {
     }
 
     #[test]
-    fn outfit_path_prefers_costume_fit() {
-        assert!(outfit_hidden("scarf", Face::Eat));
-        assert!(!outfit_hidden("glasses", Face::Eat));
-        assert!(!outfit_hidden("scarf", Face::Idle));
-        assert_eq!(outfit_path("sailor", "scarf"), "outfits/sailor/scarf.png");
-        assert_eq!(outfit_path("", "scarf"), "outfits/scarf.png");
-        assert_eq!(outfit_path("sailor", "santa"), "outfits/santa.png");
-    }
-
-    #[test]
     fn layers_costume_and_outfit() {
         let l = layers_for(Face::Love, "maid", &["glasses".into()]);
         assert_eq!(l.base, "outfits/maid/happy.png");
         assert!(!l.star && !l.tail);
         assert_eq!(l.outfit_offset, Some((0.0, 0.0)));
         assert_eq!(layers_for(Face::Walk1, "jk", &[]).base, "outfits/jk/idle.png");
-        assert_eq!(layers_for(Face::Sit, "", &["scarf".into()]).outfit_offset, Some((0.0, 17.0)));
-        assert_eq!(layers_for(Face::Sleep, "", &["scarf".into()]).outfit_offset, None);
+        assert_eq!(layers_for(Face::Sit, "", &["glasses".into()]).outfit_offset, Some((0.0, 17.0)));
+        assert_eq!(layers_for(Face::Sleep, "", &["glasses".into()]).outfit_offset, None);
         // 戴圣诞帽时藏星星
         assert!(!layers_for(Face::Idle, "", &["santa".into()]).star);
     }
@@ -272,7 +251,7 @@ mod tests {
                 assert!(crate::assets::get(&l.base).is_some(), "{c} {}", l.base);
             }
         }
-        for p in [TAIL, STAR, "outfits/santa.png", "outfits/glasses.png", "outfits/scarf.png"] {
+        for p in [TAIL, STAR, "outfits/santa.png", "outfits/glasses.png"] {
             assert!(crate::assets::get(p).is_some(), "{p}");
         }
     }

@@ -109,7 +109,7 @@ impl Behavior {
         self.scene = Scene {
             face: self.face,
             costume: self.costume.clone(),
-            outfits: self.weather_outfits(),
+            outfits: self.outfits.clone(),
             pet,
             flip,
             tail,
