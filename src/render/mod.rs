@@ -476,7 +476,8 @@ impl Renderer {
             if f.xf.opacity <= 0.003 { continue; }
             // 元素盒：宽约 1em，高 = 行高（YaHei normal ≈ 1.32em），变换原点在盒中心
             let (bw, bh) = (f.size * 0.9, f.size * 1.32);
-            let (cx, cy) = (f.x + bw / 2.0, f.y + bh / 2.0);
+            // 跟着立绘一起镜像（转身过程中 flip 在 -1..1 之间平滑变化），眼泪/汗滴才贴得住脸
+            let (cx, cy) = (PET_W / 2.0 + (f.x + bw / 2.0 - PET_W / 2.0) * scene.flip, f.y + bh / 2.0);
             let t = pet.pre_concat(xf_matrix(&f.xf, cx, cy)).pre_translate(cx, cy).pre_scale(f.size, f.size);
             shapes::draw_glyph(pm, f.shape, f.color, f.xf.opacity, t, f.size);
         }

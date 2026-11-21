@@ -84,7 +84,8 @@ impl Fx {
             match kind {
                 FxKind::Anger => (x, y) = (140.0, 18.0),
                 FxKind::Sweat => (x, y) = (150.0, 40.0),
-                FxKind::Tear => (x, y) = (if i % 2 == 1 { 72.0 } else { 128.0 }, 100.0),
+                // 眼睛下方：立绘 400x587 里两眼约在 x=125 / 212、下沿 y≈222（盒子坐标减半，再减半个字宽）
+                FxKind::Tear => (x, y) = (if i % 2 == 1 { 55.0 } else { 99.0 }, 100.0),
                 FxKind::Rain | FxKind::Snow => (x, y) = (rand(10.0, 180.0), rand(-50.0, 30.0)),
                 FxKind::Spark => {
                     (x, y) = (96.0, 50.0);
