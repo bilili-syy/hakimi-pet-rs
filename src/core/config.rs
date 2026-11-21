@@ -144,6 +144,8 @@ pub struct Config {
     pub daily_food_cap: u64,
     /// 看屏吐槽：Ctrl+Alt+K 截前台窗口给她看（默认关；截图只在内存里，确认后发给聊天模型）
     pub screen_roast: bool,
+    /// 录屏 / 直播隐私保护（默认开）：检测到 OBS / 直播姬 / 抖音直播伴侣在运行时，暂缓主动提起私人记忆与生日
+    pub stream_privacy: bool,
     /// 聊天「打开程序」安全白名单（键=口令/别名，值=本机 .exe 绝对路径；打开前仍会弹确认框，禁止命令行解释器）
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub allowed_apps: std::collections::BTreeMap<String, String>,
@@ -187,6 +189,7 @@ impl Default for Config {
             fullscreen_hide: true,
             daily_food_cap: 0,
             screen_roast: false,
+            stream_privacy: true,
             allowed_apps: std::collections::BTreeMap::new(),
             extra,
         }

@@ -46,7 +46,23 @@ pub fn costume_face_stem(face: Face) -> &'static str {
     COSTUME_FACES.iter().copied().find(|&c| c == n).unwrap_or("idle")
 }
 
+/// 换装目录 `outfits/<costume>/<stem>.png` 是否存在专属表情立绘（零堆分配探测）
+pub fn costume_has_direct(costume: &str, stem: &str) -> bool {
+    let mut buf = [0u8; 64];
+    let mut n = 0usize;
+    for part in [b"outfits/" as &[u8], costume.as_bytes(), b"/", stem.as_bytes(), b".png"] {
+        if n + part.len() > buf.len() { return false; }
+        buf[n..n + part.len()].copy_from_slice(part);
+        n += part.len();
+    }
+    std::str::from_utf8(&buf[..n]).is_ok_and(|p| crate::assets::get(p).is_some())
+}
+
 pub fn costume_src(costume: &str, face: Face) -> String {
+    let stem = face.stem();
+    if !matches!(face, Face::Walk1 | Face::Walk2 | Face::Blink) && costume_has_direct(costume, stem) {
+        return format!("outfits/{costume}/{stem}.png");
+    }
     format!("outfits/{costume}/{}.png", costume_face_stem(face))
 }
 
@@ -62,15 +78,7 @@ pub fn outfit_offset(face: Face) -> Option<(f32, f32)> {
 const SAILOR_FACES: [&str; 4] = ["drag", "sit", "sleep", "think"];
 
 pub fn sailor_has_direct(stem: &str) -> bool {
-    let mut buf = [0u8; 48];
-    let pfx = b"outfits/sailor/";
-    let sfx = b".png";
-    let n = pfx.len() + stem.len() + sfx.len();
-    if n > buf.len() { return false; }
-    buf[..pfx.len()].copy_from_slice(pfx);
-    buf[pfx.len()..pfx.len() + stem.len()].copy_from_slice(stem.as_bytes());
-    buf[pfx.len() + stem.len()..n].copy_from_slice(sfx);
-    std::str::from_utf8(&buf[..n]).is_ok_and(|p| crate::assets::get(p).is_some())
+    costume_has_direct("sailor", stem)
 }
 
 fn sailor_layers(face: Face) -> (String, Option<(bool, bool)>) {
@@ -307,7 +315,10 @@ mod tests {
         assert_eq!(layers_for(Face::Shy, "hoodie", &[]).base, "sprites/shy.png");
         assert_eq!(layers_for(Face::Wink, "hoodie", &[]).base, "sprites/wink.png");
         assert_eq!(layers_for(Face::Cry, "swim", &[]).base, "outfits/swim/hungry.png");
-        assert_eq!(layers_for(Face::Cheer, "maid", &[]).base, "outfits/maid/happy.png");
+        assert_eq!(layers_for(Face::Cheer, "swim", &[]).base, "outfits/swim/happy.png");
+        assert_eq!(layers_for(Face::Cheer, "maid", &[]).base, "outfits/maid/cheer.png");
+        assert_eq!(layers_for(Face::Wink, "pajama", &[]).base, "outfits/pajama/wink.png");
+        assert_eq!(layers_for(Face::Pout, "jk", &[]).base, "outfits/jk/pout.png");
     }
 
     #[test]

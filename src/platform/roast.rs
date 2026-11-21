@@ -83,7 +83,7 @@ pub fn blocked() -> Option<&'static str> {
     if super::chat::is_busy() {
         return Some(BUSY_MSG);
     }
-    if recorder_running() {
+    if is_recording() {
         return Some(RECORDING);
     }
     None
@@ -98,11 +98,45 @@ fn note_for(why: &str) -> &'static str {
     }
 }
 
-/// 进程名是不是录屏软件（小写、去掉 .exe）
+/// 进程名是不是录屏 / 直播推流软件（小写、去掉 .exe；严格精确匹配主推流程序名，绝不误伤 obsidian 等）
 pub fn is_recorder(exe: &str) -> bool {
-    let e = exe.to_ascii_lowercase();
+    let e = exe.trim().to_ascii_lowercase();
     let stem = e.strip_suffix(".exe").unwrap_or(&e);
-    matches!(stem, "obs64" | "obs32" | "obs" | "obs-studio")
+    matches!(
+        stem,
+        "obs64"
+            | "obs32"
+            | "obs"
+            | "obs-studio"
+            | "streamlabs obs"
+            | "streamlabs desktop"
+            | "livehime"
+            | "webcast_mate"
+            | "直播伴侣"
+            | "xsplit.core"
+            | "bdcam"
+            | "bdcam64"
+            | "evcapture"
+    )
+}
+
+/// 录屏软件探测（带 2 秒缓存，零日常开销；支持 `HAKIMI_FAKE_RECORDING=1` 供真窗 E2E 测试）
+pub fn is_recording() -> bool {
+    use std::sync::atomic::AtomicU64;
+    if std::env::var("HAKIMI_FAKE_RECORDING").ok().as_deref() == Some("1") {
+        return true;
+    }
+    static CACHED_AT: AtomicU64 = AtomicU64::new(0);
+    static CACHED_VAL: AtomicBool = AtomicBool::new(false);
+    let now = super::now_ms();
+    let prev = CACHED_AT.load(Ordering::Relaxed);
+    if prev != 0 && now.saturating_sub(prev) < 2000 {
+        return CACHED_VAL.load(Ordering::Relaxed);
+    }
+    let val = recorder_running();
+    CACHED_VAL.store(val, Ordering::Relaxed);
+    CACHED_AT.store(now, Ordering::Relaxed);
+    val
 }
 
 fn recorder_running() -> bool {
@@ -767,6 +801,10 @@ mod tests {
     fn recorder_names() {
         assert!(is_recorder("obs64.exe"));
         assert!(is_recorder("OBS32.EXE"));
+        assert!(is_recorder("livehime.exe"));
+        assert!(is_recorder("webcast_mate.exe"));
+        assert!(is_recorder("Streamlabs OBS.exe"));
+        assert!(is_recorder("bdcam64.exe"));
         assert!(!is_recorder("obsidian.exe"));
         assert!(!is_recorder("chrome.exe"));
     }

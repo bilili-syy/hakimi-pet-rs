@@ -398,6 +398,11 @@ pub fn open_path(path: &std::path::Path) {
     sys::open_path(path)
 }
 
+/// 当前是否有录屏 / 直播软件在运行（2 秒缓存，供行为层直播隐私保护模式查询）
+pub fn is_recording() -> bool {
+    roast::is_recording()
+}
+
 // ---------------------------------------------------------------- 状态
 
 struct Walk {

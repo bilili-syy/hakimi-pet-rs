@@ -151,6 +151,7 @@ const ID_FS_HIDE: i32 = 166;
 const ID_ROAST: i32 = 173;
 const ID_CODING_HOOK: i32 = 174;
 const ID_CODING_STATUS: i32 = 175;
+const ID_STREAM_PRIVACY: i32 = 176;
 const ID_SCALE: i32 = 151;
 const ID_FPS: i32 = 164;
 const ID_BIRTHDAY: i32 = 165;
@@ -888,7 +889,14 @@ impl Dlg {
         self.button(p, ID_ROAST, ROAST_ON, BS_AUTOCHECKBOX, [X0, 474.0, W - X0 - 16.0, 24.0]);
         // 一键接入编码助手（Claude Code / Codex 通知回调，立即写配置并备份，随时可撤销）
         self.button(p, ID_CODING_HOOK, "接入编码助手", 0, [X0, 504.0, 146.0, 30.0]);
-        self.add(p, w!("STATIC"), "", 0, 0, ID_CODING_STATUS, [X0 + 156.0, 504.0, W - X0 - 172.0, 34.0]);
+        self.add(p, w!("STATIC"), "", 0, 0, ID_CODING_STATUS, [X0 + 156.0, 504.0, W - X0 - 172.0, 32.0]);
+        self.button(
+            p,
+            ID_STREAM_PRIVACY,
+            "录屏/直播隐私保护（检测到 OBS / 直播姬时暂缓主动提起私人记忆与生日）",
+            BS_AUTOCHECKBOX,
+            [X0, 538.0, W - X0 - 16.0, 24.0],
+        );
 
         // ---------------- 备忘录（改动马上写进 memo.json，不用点「保存」）
         let p = 4;
@@ -962,6 +970,7 @@ impl Dlg {
         set_checked(self.c(ID_AUTOSTART), autostart);
         set_checked(self.c(ID_FS_HIDE), c.fullscreen_hide);
         set_checked(self.c(ID_ROAST), c.screen_roast);
+        set_checked(self.c(ID_STREAM_PRIVACY), c.stream_privacy);
         self.update_roast();
         self.update_coding_hooks(None);
         combo_set(self.c(ID_SCALE), nearest_scale(c.scale));
@@ -1146,6 +1155,7 @@ impl Dlg {
         let autostart = checked(self.c(ID_AUTOSTART));
         c.fullscreen_hide = checked(self.c(ID_FS_HIDE));
         c.screen_roast = checked(self.c(ID_ROAST));
+        c.stream_privacy = checked(self.c(ID_STREAM_PRIVACY));
         c.scale = SCALES[combo_sel(self.c(ID_SCALE)).min(SCALES.len() - 1)].0;
         c.fps = FPS[combo_sel(self.c(ID_FPS)).min(FPS.len() - 1)].0;
         c.weather_city = get_text(self.c(ID_CITY)).trim().to_string();
@@ -1226,7 +1236,7 @@ fn differs(a: &Config, b: &Config) -> bool {
             (c.weather_city.clone(), c.birthday.clone()),
             (c.moyu.enabled, c.moyu.minutes, c.moyu.pomodoro_minutes, c.reminders.water, c.reminders.stand_up),
             c.reminders.off_work.clone(),
-            (c.fullscreen_hide, c.daily_food_cap, c.screen_roast),
+            (c.fullscreen_hide, c.daily_food_cap, c.screen_roast, c.stream_privacy),
         )
     };
     pick(a) != pick(b)
@@ -1989,7 +1999,11 @@ mod tests {
         let mut c = a.clone();
         assert!(c.fullscreen_hide, "默认全屏自动隐藏");
         assert!(!c.screen_roast, "看屏吐槽默认关");
+        assert!(c.stream_privacy, "录屏/直播隐私保护默认开");
         c.fullscreen_hide = false;
         assert!(differs(&a, &c));
+        let mut sp = a.clone();
+        sp.stream_privacy = false;
+        assert!(differs(&a, &sp));
     }
 }

@@ -44,10 +44,11 @@ pub struct MindUi {
     care_wait: bool,
     /// 下一次可以问关心的时刻（行为层时钟）
     care_next: u64,
-    /// 测试用：io=false 时的记忆、现在、概率
+    /// 测试用：io=false 时的记忆、现在、概率、录屏隐私拦截
     pub test_book: Option<Book>,
     pub test_now: Option<Dt>,
     pub test_chance: Option<f64>,
+    pub test_stream_privacy: bool,
 }
 
 pub fn emotion_state(e: Emotion) -> St {
@@ -363,6 +364,15 @@ impl Behavior {
     }
 
     // ============================================================ 主动关心
+    /// 当前是否因录屏/直播隐私保护开启且推流软件在跑而暂缓主动暴露私人信息
+    pub(super) fn stream_privacy_active(&self) -> bool {
+        if self.io {
+            crate::core::config::get().stream_privacy && crate::platform::is_recording()
+        } else {
+            self.mind.test_stream_privacy
+        }
+    }
+
     /// 没在聊天、没在响提醒、手上没事、气泡也空着
     fn mind_free(&self) -> bool {
         !self.chatting
@@ -378,7 +388,12 @@ impl Behavior {
         if !self.io && self.mind.test_now.is_none() {
             return;
         }
-        if self.mind.care_wait || self.now < CARE_FIRST_MS || self.now < self.mind.care_next || !self.mind_free() {
+        if self.mind.care_wait
+            || self.now < CARE_FIRST_MS
+            || self.now < self.mind.care_next
+            || !self.mind_free()
+            || self.stream_privacy_active()
+        {
             return;
         }
         let now = self.mind_now();
@@ -404,8 +419,8 @@ impl Behavior {
                     self.mind.care_next = self.now + CARE_RETRY_MS;
                     return;
                 };
-                // 这会儿在忙（开着聊天框、提醒在响……）：这次就不说了，也不算次数
-                if !self.mind_free() {
+                // 这会儿在忙或刚打开 OBS 开始直播：这次就不把私人记忆冒出来了，也不算次数
+                if !self.mind_free() || self.stream_privacy_active() {
                     self.mind.care_next = self.now + 10 * 60_000;
                     return;
                 }
@@ -649,5 +664,31 @@ mod tests {
         ev(&mut b, AppEvent::Mind(MindEv::Care(None)), t);
         b.tick_mind();
         assert_eq!(b.calls.iter().filter(|c| *c == "mind:care").count(), 1);
+    }
+
+    #[test]
+    fn stream_privacy_defers_care_and_birthday() {
+        // 1. 正在直播/录屏时：tick_mind 不发起私人记忆关心
+        let mut b = care_ready();
+        b.mind.test_stream_privacy = true;
+        b.tick_mind();
+        assert!(!b.calls.iter().any(|c| c == "mind:care"));
+
+        // 2. 请求发出时尚未开播，回复到达时刚开播：拦截气泡，不记次数；关播后可正常触发
+        b.mind.test_stream_privacy = false;
+        b.tick_mind();
+        assert!(b.calls.iter().any(|c| c == "mind:care"));
+        b.mind.test_stream_privacy = true;
+        let t = b.now + 1000;
+        ev(&mut b, AppEvent::Mind(MindEv::Care(Some("[happy]面试准备得怎么样喵？".into()))), t);
+        assert!(!b.calls.iter().any(|c| c.starts_with("mind:say")));
+        assert_eq!(b.mind.test_book.as_ref().unwrap().care.count, 0);
+
+        // 3. 直播期间不主动喊出主人生日（防直播间泄露真实生日），下播后再补祝
+        b.sense.test_today = Some("2026-04-03".into());
+        b.sense.test_birthday = Some("04-03".into());
+        assert!(b.festive_line().is_none(), "直播期间暂缓报真实生日");
+        b.mind.test_stream_privacy = false;
+        assert!(b.festive_line().is_some_and(|s| s.contains("生日快乐")), "关播后正常祝贺生日");
     }
 }

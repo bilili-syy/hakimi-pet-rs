@@ -202,7 +202,7 @@ impl Behavior {
         if self.sense.bob_n.is_multiple_of(9) { self.fx(FxKind::Note, 1); }
     }
 
-    /// 开机问候时：今天是节日 / 主人生日就先说这个（一天一次）
+    /// 开机问候时：今天是节日 / 主人生日就先说这个（一天一次；直播隐私保护开启且正在推流时暂缓喊出真实生日）
     pub(super) fn festive_line(&mut self) -> Option<String> {
         let today = self.sense_today();
         if today.len() < 10 || self.sense.festive_day == today { return None; }
@@ -211,7 +211,19 @@ impl Behavior {
             None if self.io => norm_birthday(&crate::core::config::get().birthday),
             None => None,
         };
-        let line = if bday.as_deref() == today.get(5..) { Some(pick(lines::BIRTHDAY)) } else { festival(&today).map(pick) };
+        if bday.as_deref() == today.get(5..) {
+            if self.stream_privacy_active() {
+                // 直播中不报真实生日；若有公共节日可正常说节日，否则留到下播后再祝贺生日
+                let pub_fest = festival(&today).map(pick);
+                if pub_fest.is_some() {
+                    self.sense.festive_day = today;
+                }
+                return pub_fest;
+            }
+            self.sense.festive_day = today;
+            return Some(pick(lines::BIRTHDAY));
+        }
+        let line = festival(&today).map(pick);
         if line.is_some() { self.sense.festive_day = today; }
         line
     }

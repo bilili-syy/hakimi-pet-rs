@@ -336,6 +336,10 @@ fn drawn_stem(face: Face, costume: &str) -> &'static str {
         if crate::render::sprites::sailor_has_direct(face.stem()) {
             return face.stem();
         }
+    } else if !matches!(face, Face::Walk1 | Face::Walk2 | Face::Blink)
+        && crate::render::sprites::costume_has_direct(costume, face.stem())
+    {
+        return face.stem();
     }
     crate::render::sprites::costume_face_stem(face)
 }
@@ -752,13 +756,15 @@ mod tests {
         // 原装卫衣现在的 id 是 "hoodie"，和 "" 用同一套贴片；默认水手服只有待机眨眼
         assert_eq!(builtin_path(Face::Idle, "hoodie", Kind::Mouth), builtin_path(Face::Idle, "", Kind::Mouth));
         assert!(available(Face::Idle, "sailor", Kind::Blink));
-        // 换装：按实际画的那张（shy/love → happy，stare → think，yawn → idle）
+        // 换装：没独立立绘的按别名找贴片（love → happy，stare → think，yawn → idle）；已有独立立绘（如 maid/jk 的 shy）不强套 happy 贴片避免错位
         for c in ["maid", "xmas", "jk"] {
             for f in [Face::Idle, Face::Yawn, Face::Think, Face::Stare, Face::Hungry] { assert!(available(f, c, Kind::Blink), "{c} {f:?}"); }
-            for f in [Face::Idle, Face::Love, Face::Shy, Face::Think] { assert!(available(f, c, Kind::Mouth), "{c} {f:?}"); }
+            for f in [Face::Idle, Face::Love, Face::Think] { assert!(available(f, c, Kind::Mouth), "{c} {f:?}"); }
             for f in [Face::Love, Face::Sleep, Face::Drag] { assert!(!available(f, c, Kind::Blink), "{c} {f:?}"); }
         }
-        assert_eq!(builtin_path(Face::Shy, "maid", Kind::Mouth).as_deref(), Some("sprites/live/maid_happy_mouthOpen.png"));
+        assert_eq!(builtin_path(Face::Love, "maid", Kind::Mouth).as_deref(), Some("sprites/live/maid_happy_mouthOpen.png"));
+        assert_eq!(builtin_path(Face::Shy, "xmas", Kind::Mouth).as_deref(), Some("sprites/live/xmas_happy_mouthOpen.png"));
+        assert!(builtin_path(Face::Shy, "maid", Kind::Mouth).is_none());
         let p = Patches::from_overlays(overlays_for(Face::Idle, ""), 300, 440);
         let b = p.blink.as_ref().unwrap();
         let m = p.mouth.as_ref().unwrap();
