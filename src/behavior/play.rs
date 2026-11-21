@@ -32,7 +32,7 @@ pub const WEATHER_RAIN: &[&str] = &["外面在下雨喵，出门记得带伞！"
 pub const WEATHER_THUNDER: &[&str] = &["打、打雷了喵！哈基米要躲起来", "雷雨天，出门一定带伞喵！"];
 pub const WEATHER_SNOW: &[&str] = &["下雪啦！哈基米想去踩雪喵～", "外面在下雪，穿暖和点喵！"];
 pub const WEATHER_HOT: &[&str] = &["好热喵……哈基米要化成一摊了", "热热热！记得多喝水，别中暑喵"];
-pub const WEATHER_COLD: &[&str] = &["好冷喵！哈基米把围巾围上啦", "降温了，多穿点衣服喵～"];
+pub const WEATHER_COLD: &[&str] = &["降温了，多穿点衣服喵～"];
 pub const WEATHER_NICE: &[&str] = &["今天天气真好喵，想出去晒太阳～", "好天气！适合摸鱼……啊不是，适合干活喵"];
 pub const REPORT_WAIT: &[&str] = &["哈基米去窗边看看天气喵……", "等一下，哈基米看看外面～"];
 pub const REPORT_FAIL: &[&str] = &["看不到天气……网络好像不通喵"];
@@ -818,14 +818,6 @@ impl Behavior {
             _ if cold => { self.react(St::Shy, 2600, Some(pick(WEATHER_COLD))); }
             _ => { self.react(St::Happy, 2200, Some(pick(WEATHER_NICE))); self.fx(FxKind::Spark, 6); }
         }
-    }
-
-    /// 冷天自动围上围巾（只改画面，不写配置）
-    pub(super) fn weather_outfits(&self) -> Vec<String> {
-        let mut o = self.outfits.clone();
-        let cold = self.play.weather.as_ref().is_some_and(|w| w.temp_c <= 5.0);
-        if cold && crate::core::costume::is_base(&self.costume) && !o.iter().any(|x| x == "scarf") { o.push("scarf".into()); }
-        o
     }
 
     pub(super) fn weather_text(&self) -> Option<String> {

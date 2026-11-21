@@ -8,4 +8,5 @@ pub mod mind;
 pub mod net;
 pub mod songs;
 pub mod tts;
+pub mod update;
 pub mod weather;

@@ -15,7 +15,7 @@ use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, KillTimer, PostMessageW, SetTimer};
 
-pub const OUTFITS: [(&str, &str); 3] = [("santa", "🎅 圣诞帽"), ("glasses", "👓 圆眼镜"), ("scarf", "🧣 四色围巾")];
+pub const OUTFITS: [(&str, &str); 2] = [("santa", "🎅 圣诞帽"), ("glasses", "👓 圆眼镜")];
 /// 托盘左键单击的伪菜单 id
 pub const TRAY_LEFT: &str = "tray:left";
 /// 托盘左键单击要等双击时间过了才算（双击 = 打开设置），用主窗口上的这个定时器
@@ -91,7 +91,6 @@ const COSTUME: &[Node] = &[
     Sep,
     Check("outfit:santa", "🎅 圣诞帽"),
     Check("outfit:glasses", "👓 圆眼镜"),
-    Check("outfit:scarf", "🧣 四色围巾"),
     Sep,
     Item("outfit:clear", "摘掉配件"),
     Sep,
@@ -218,7 +217,7 @@ thread_local! {
 }
 
 pub(crate) fn push_id(id: String) {
-    MENU_QUEUE.lock().unwrap().push_back(id);
+    MENU_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push_back(id);
     if let Some(h) = main_hwnd() {
         unsafe {
             let _ = PostMessageW(Some(h), WM_APP_MENU, WPARAM(0), LPARAM(0));
@@ -576,7 +575,7 @@ mod tests {
         assert!(checked("costume:maid", &c));
         assert!(!checked("costume:", &c));
         assert!(checked("outfit:santa", &c));
-        assert!(!checked("outfit:scarf", &c));
+        assert!(!checked("outfit:glasses", &c));
         c.costume = "bogus".into();
         assert!(checked("costume:", &c));
         // 老配置的 "" = 默认水手服；卫衣要单独选

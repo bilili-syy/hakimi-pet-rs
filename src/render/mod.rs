@@ -80,7 +80,7 @@ pub struct Scene {
     pub face: Face,
     /// core::costume 的 id（"" / "hoodie" = 原装卫衣立绘，"sailor" = 默认水手服）
     pub costume: String,
-    /// santa / glasses / scarf（按配置里的顺序叠）
+    /// santa / glasses（按配置里的顺序叠）
     pub outfits: Vec<String>,
     /// #pet 的动画变换（原点：盒子底边中点）
     pub pet: Xf,
@@ -707,7 +707,7 @@ mod tests {
         let out = std::env::var("HAKIMI_SNAP").unwrap_or_else(|_| "snap.png".into());
         let mut r = Renderer::new();
         let mut sc = Scene::default();
-        sc.outfits = vec!["scarf".into(), "glasses".into()];
+        sc.outfits = vec!["glasses".into()];
         sc.glow = true;
         sc.star.bright = 1.2;
         sc.tail.rot = 6.0;
@@ -803,7 +803,7 @@ mod tests {
     fn bench() {
         let mut r = Renderer::new();
         let mut sc = Scene::default();
-        sc.outfits = vec!["scarf".into()];
+        sc.outfits = vec!["glasses".into()];
         sc.bubble = Some(BubbleView { text: "哈基米～哈基米～哈基米～哈基米哦南北绿豆～".into(), opacity: 1.0, scroll: 0.0 });
         let t = std::time::Instant::now();
         let n = 300;
@@ -909,7 +909,7 @@ mod tests {
         let cx = |p: &Pixmap| {
             let w = p.width() as usize;
             let (mut s, mut n) = (0f64, 0f64);
-            for (i, px) in p.data().chunks_exact(4).enumerate() { if px[3] > 128 { s += (i % w) as f64; n += 1.0; } }
+            for (i, px) in p.data().as_chunks::<4>().0.iter().enumerate() { if px[3] > 128 { s += (i % w) as f64; n += 1.0; } }
             s / n
         };
         let mid = (PET_X + PET_W / 2.0) as f64;
@@ -933,7 +933,7 @@ mod tests {
         // 两张不一样的像素上，混合结果落在两者之间
         // （尾巴/星星图层画在上面，那几处不参与混合，所以按比例判断）
         let (mut checked, mut between) = (0, 0);
-        for ((a, b), m) in idle.data().chunks_exact(4).zip(think.data().chunks_exact(4)).zip(mix.data().chunks_exact(4)) {
+        for ((a, b), m) in idle.data().as_chunks::<4>().0.iter().zip(think.data().as_chunks::<4>().0).zip(mix.data().as_chunks::<4>().0) {
             if a[3] == 255 && b[3] == 255 && (a[0] as i32 - b[0] as i32).abs() > 60 {
                 checked += 1;
                 let (lo, hi) = (a[0].min(b[0]) as i32 + 10, a[0].max(b[0]) as i32 - 10);
@@ -965,7 +965,7 @@ mod tests {
         let b = r.pixmap().unwrap().clone();
         // 头顶上方一行（只有光晕，没有立绘）：吸气时光晕跟着上移 → 这一行变了
         let w = a.width() as usize;
-        let top = (0..a.height() as usize).find(|&y| a.data()[y * w * 4..(y + 1) * w * 4].chunks_exact(4).any(|p| p[3] > 0 && p[3] < 200)).unwrap();
+        let top = (0..a.height() as usize).find(|&y| a.data()[y * w * 4..(y + 1) * w * 4].as_chunks::<4>().0.iter().any(|p| p[3] > 0 && p[3] < 200)).unwrap();
         let row = |p: &Pixmap, y: usize| p.data()[y * w * 4..(y + 1) * w * 4].to_vec();
         assert_ne!(row(&a, top + 2), row(&b, top + 2));
         // 脚底的光晕不动

@@ -763,7 +763,7 @@ mod tests {
 
     fn test_img(w: u32, h: u32) -> Pixmap {
         let mut p = Pixmap::new(w, h).unwrap();
-        for (i, px) in p.data_mut().chunks_exact_mut(4).enumerate() {
+        for (i, px) in p.data_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (x, y) = (i as u32 % w, i as u32 / w);
             if (x / 3 + y / 5) % 2 == 0 { px.copy_from_slice(&[(x * 7 % 256) as u8 / 2, (y * 3 % 256) as u8 / 2, 60, 200]); }
         }

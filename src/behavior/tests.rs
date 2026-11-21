@@ -42,6 +42,18 @@ fn greets_on_startup_then_idles() {
 }
 
 #[test]
+fn first_meeting_intro() {
+    let mut b = mk();
+    b.intro = true;
+    tick(&mut b, 600);
+    assert_eq!(b.state, St::Starry);
+    assert!(b.calls.iter().any(|c| c == &format!("speak:{}", lines::INTRO[0])));
+    for t in (1000..20_000).step_by(500) { tick(&mut b, t); }
+    for l in lines::INTRO { assert!(b.calls.iter().any(|c| c == &format!("speak:{l}")), "{l}"); }
+    assert!(!b.intro);
+}
+
+#[test]
 fn five_quick_pokes_make_her_hiss() {
     let mut b = mk();
     tick(&mut b, 3000);

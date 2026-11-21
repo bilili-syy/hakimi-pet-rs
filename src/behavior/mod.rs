@@ -13,6 +13,11 @@ pub mod beat;
 pub mod dance;
 mod live;
 mod chatvoice;
+mod chat;
+mod menu;
+mod mouse;
+mod routine;
+mod scene;
 
 use crate::core::stats::{Act, ActResult, MoodLevel, Stats};
 use crate::render::{BubbleView, Rect, Scene, StatusView, Xf, ZGlyph, anim};
@@ -114,6 +119,8 @@ enum Later {
     MemoAck,
     /// 备忘提醒没人理：第 n 次追问
     MemoNag(u8),
+    /// 第一次见面的开场白：第 n 句
+    Intro(u8),
 }
 
 /// 透明度过渡（transition: opacity 0.25s）
@@ -197,6 +204,8 @@ pub struct Behavior {
 
     stats: Stats,
     saved_existed: bool,
+    /// 第一次见面（没有存档）：开场多说几句，教怎么玩、去哪填 Key
+    intro: bool,
     away_min: f64,
     next_tick: u64,
 
@@ -300,6 +309,7 @@ impl Behavior {
             cmds: Vec::new(),
             stats,
             saved_existed,
+            intro: !saved_existed && io,
             away_min,
             next_tick: 20_000,
             state: St::Idle,
@@ -513,13 +523,13 @@ impl Behavior {
             self.now = due;
             match k {
                 0 => {
-                    let (_, a) = self.state_timer.take().unwrap();
-                    self.on_state_timer(a);
+                    if let Some((_, a)) = self.state_timer.take() { self.on_state_timer(a); }
                 }
                 1 => {
-                    let i = self.laters.iter().enumerate().min_by_key(|(_, l)| l.0).map(|(i, _)| i).unwrap();
-                    let (_, l) = self.laters.remove(i);
-                    self.on_later(l);
+                    if let Some(i) = self.laters.iter().enumerate().min_by_key(|(_, l)| l.0).map(|(i, _)| i) {
+                        let (_, l) = self.laters.remove(i);
+                        self.on_later(l);
+                    }
                 }
                 2 => self.on_blink(),
                 3 => self.on_tick(),
@@ -613,6 +623,22 @@ impl Behavior {
             Later::HoneyFastEnd => {
                 self.glow = false;
                 if self.now >= self.fast_until { self.say(&pick(lines::SLOW), 2000); }
+            }
+            Later::Greet if self.intro => {
+                self.react(St::Starry, 3500, Some(lines::INTRO[0].to_string()));
+                self.fx(FxKind::Heart, 4);
+                self.later(5000, Later::Intro(1));
+            }
+            Later::Intro(n) => {
+                let n = n as usize;
+                // 第三句教填 Key：已经填了就不说
+                let has_key = !self.io || !crate::core::config::get().api_key.trim().is_empty();
+                if n >= lines::INTRO.len() || (n == lines::INTRO.len() - 1 && has_key && self.io) {
+                    self.intro = false;
+                    return;
+                }
+                self.react(St::Happy, 4500, Some(lines::INTRO[n].to_string()));
+                self.later(5500, Later::Intro(n as u8 + 1));
             }
             Later::Greet => {
                 let slot = self.greet_slot_line();
@@ -934,621 +960,6 @@ impl Behavior {
 
     fn fx(&mut self, k: FxKind, n: usize) { self.fx.spawn(k, n, self.now); }
 
-    // ============================================================ 鼠标
-    fn zone(&self, x: f32, y: f32) -> Zone {
-        if self.ui.status.is_some_and(|r| r.contains(x, y)) { return Zone::Status; }
-        if self.ui.bubble.is_some_and(|r| r.contains(x, y)) { return Zone::Bubble; }
-        Zone::Pet
-    }
-
-    fn on_mouse(&mut self, m: MouseEv) {
-        match m {
-            MouseEv::Down { button: Button::Left, x, y, sx, sy } => match self.zone(x, y) {
-                Zone::Status => { self.status_hide_at = None; self.status_fade.set(false, self.now); }
-                Zone::Bubble => {}
-                Zone::Pet => { self.down = Some(Down { sx, sy, lx: None, dir: 0, flips: Vec::new() }); self.dragging = false; }
-            },
-            MouseEv::Wheel { delta, x, y } => {
-                if self.zone(x, y) == Zone::Pet { self.on_wheel(delta); }
-            }
-            MouseEv::Move { x, y, sx, sy } => {
-                if self.down.is_none() { self.on_cursor(x, y); }
-                if self.down.is_some() { self.on_drag_move(sx, sy); } else if self.zone(x, y) == Zone::Pet { self.on_rub(x, y); }
-            }
-            MouseEv::Up { button: Button::Left, .. } => {
-                if self.down.is_none() { return; }
-                if self.dragging {
-                    self.dragging_cls = false;
-                    self.state = St::Fall;
-                    self.land_shaken = self.shaken;
-                    self.shaken = false;
-                    self.cmds.push(WinCmd::DragEnd);
-                } else {
-                    self.on_poke();
-                }
-                self.down = None;
-                self.dragging = false;
-            }
-            // 备忘提醒响着时双击 = 稍后再提醒，否则开聊天
-            MouseEv::DoubleClick { x, y } if self.zone(x, y) == Zone::Pet && !self.memo_double_click() => self.open_chat(),
-            _ => {}
-        }
-    }
-
-    fn on_drag_move(&mut self, sx: i32, sy: i32) {
-        let s = self.scale;
-        let Some(d) = &self.down else { return };
-        let dist = (((sx - d.sx) as f32).powi(2) + ((sy - d.sy) as f32).powi(2)).sqrt();
-        if !self.dragging && dist > 4.0 * s {
-            self.yield_chat();
-            self.dragging = true;
-            self.dragging_cls = true;
-            self.act(Act::Drag);
-            self.drag_started_play();
-            self.set_state(St::Drag, None);
-            self.say(&pick(lines::DRAG), 1500);
-        }
-        if !self.dragging { return; }
-        self.cmds.push(WinCmd::DragMove { sx, sy });
-        // 甩来甩去会晕：统计 1.5 秒内左右换向次数
-        let now = self.now;
-        let d = self.down.as_mut().unwrap();
-        let dx = sx - d.lx.unwrap_or(sx);
-        d.lx = Some(sx);
-        if (dx.abs() as f32) > 6.0 * s {
-            let dir = dx.signum();
-            if dir != d.dir {
-                d.dir = dir;
-                d.flips.retain(|t| now - t < 1500);
-                d.flips.push(now);
-            }
-            if d.flips.len() >= 6 { self.shaken = true; }
-        }
-    }
-
-    /// 摸头不用点：鼠标在她头上来回蹭几下就算
-    fn on_rub(&mut self, x: f32, y: f32) {
-        if self.chatting { return; }
-        if y - PET_TOP > 293.0 * 0.38 { return; }
-        let dx = x - self.rub.last;
-        self.rub.last = x;
-        if dx.abs() < 3.0 { return; }
-        let d = dx.signum() as i32;
-        let now = self.now;
-        if d != self.rub.dir {
-            self.rub.dir = d;
-            self.rub.flips.retain(|t| now - t < 2000);
-            self.rub.flips.push(now);
-        }
-        if self.rub.flips.len() >= 6 && now > self.rub.cool && !matches!(self.state, St::Drag | St::Fall) {
-            self.rub.flips.clear();
-            self.rub.cool = now + 5000;
-            self.act(Act::Pat);
-            if self.state == St::Sleep {
-                self.say(lines::PAT_SLEEPING, 2600);
-                self.fx(FxKind::Heart, 3);
-                return;
-            }
-            self.react(St::Shy, 2200, Some(pick(lines::RUB)));
-            self.fx(FxKind::Heart, 5);
-        }
-    }
-
-    fn on_poke(&mut self) {
-        self.yield_chat();
-        if self.memo_poke() { return; }
-        if self.routine.is_some() { return self.finish_routine(true); }
-        if self.state == St::Sleep {
-            self.act(Act::Wake);
-            self.play(Shot::Shake);
-            self.say(&pick(lines::WAKE), 2600);
-            return self.set_state(St::Sit, Some((8000.0, 15000.0)));
-        }
-        let now = self.now;
-        self.pokes.retain(|t| now - t < 3000);
-        self.pokes.push(now);
-        if self.pokes.len() >= 5 {
-            self.pokes.clear();
-            self.act(Act::Angry);
-            self.play(Shot::Shake);
-            // 一半炸毛哈气，一半鼓脸赌气
-            let puff = fastrand::bool();
-            self.set_state(if puff { St::Puff } else { St::Hiss }, None);
-            let l = if puff { lines::PUFF } else if fastrand::bool() { lines::HISS } else { lines::POKE_MAD };
-            self.say(&pick(l), 2600);
-            self.fx(FxKind::Anger, 1);
-            self.hold_timer(2200, StateAct::Set(St::Idle, Some((5000.0, 10000.0))));
-            return;
-        }
-        self.act(Act::Poke);
-        if self.pomo_running && fastrand::bool() {
-            let left = if self.io { crate::platform::pomodoro_left() } else { Some(25) };
-            if let Some(left) = left { self.say(&pickv(lines::pomo_focus(left)), 2600); }
-            self.play(Shot::Squash);
-            return;
-        }
-        let m = self.stats.mood();
-        match m {
-            MoodLevel::Hungry | MoodLevel::Starving => {
-                self.play(Shot::Bounce);
-                self.say(&pick(lines::POKE_HUNGRY), 2600);
-                return self.set_state(St::Hungry, Some((8000.0, 12000.0)));
-            }
-            MoodLevel::Exhausted => {
-                self.play(Shot::Squash);
-                self.say(&pick(lines::POKE_TIRED), 2600);
-                return self.set_state(St::Sit, Some((8000.0, 12000.0)));
-            }
-            MoodLevel::Sad => {
-                if fastrand::f64() < 0.4 {
-                    self.play(Shot::Shake);
-                    self.fx(FxKind::Tear, 4);
-                    return self.react(St::Cry, 2600, Some(pick(lines::CRY)));
-                }
-                self.play(Shot::Squash);
-                if fastrand::bool() {
-                    return self.react(St::Pout, 2600, Some(pick(lines::POUT)));
-                }
-                self.say(&pick(lines::POKE_SAD), 2600);
-                return self.set_state(St::Sit, Some((8000.0, 12000.0)));
-            }
-            _ => {}
-        }
-        if self.state == St::Walk && fastrand::f64() < 0.6 {
-            self.play(Shot::Bounce);
-            self.fx(FxKind::Exclaim, 1);
-            return self.react(St::Surprised, 1400, Some(pick(lines::SURPRISED)));
-        }
-        self.play(Shot::Bounce);
-        let great = m == MoodLevel::Great;
-        if fastrand::f64() < 0.3 {
-            if great { self.fx(FxKind::Heart, 3) } else { self.fx(FxKind::Spark, 6) }
-        }
-        if let Some(l) = self.affinity_line() { return self.react(St::Love, 2000, Some(l)); }
-        if fastrand::f64() < 0.15 { return self.react(St::Confused, 1600, Some(pick(lines::CONFUSED))); }
-        let l = if great && fastrand::bool() { lines::POKE_GREAT } else { lines::POKE };
-        self.react(St::Happy, 1200, Some(pick(l)));
-    }
-
-    fn on_landed(&mut self, big: bool) {
-        if self.landed_play() { return; }
-        self.play(Shot::Squash);
-        if self.land_shaken {
-            self.land_shaken = false;
-            self.say(&pick(lines::DIZZY), 3000);
-            self.set_state(St::Dizzy, None);
-            self.fx(FxKind::Dizzy, 1);
-            self.hold_timer(3200, StateAct::Set(St::Idle, Some((4000.0, 8000.0))));
-            return;
-        }
-        if big {
-            let scared = fastrand::bool();
-            self.say(&pick(if scared { lines::SCARED } else { lines::LAND_BIG }), 2600);
-            self.set_state(if scared { St::Scared } else { St::Drag }, None);
-            if scared { self.play(Shot::Shake); self.fx(FxKind::Sweat, 1); }
-            self.hold_timer(if scared { 2200 } else { 1200 }, StateAct::Set(St::Idle, Some((4000.0, 8000.0))));
-        } else {
-            self.set_state(St::Idle, Some((4000.0, 8000.0)));
-        }
-    }
-
-    // ============================================================ 菜单
-    fn on_menu(&mut self, a: MenuAction) {
-        if self.io { crate::core::log::trace(&format!("menu {a:?}")); }
-        // 让她做事的菜单项：输入框开着但没打字就顺手关掉；打了字就留着（框跟着她走）
-        if matches!(
-            a,
-            MenuAction::Feed | MenuAction::Pat | MenuAction::Honey | MenuAction::Song | MenuAction::Sleep
-                | MenuAction::Walk | MenuAction::Costume(_) | MenuAction::Outfit(..) | MenuAction::ClearOutfit
-                | MenuAction::Dance(_)
-        ) {
-            self.yield_chat();
-        }
-        match a {
-            MenuAction::Feed => self.toss_food(),
-            MenuAction::Game => self.start_game(),
-            MenuAction::CheckIn => self.do_checkin(true),
-            MenuAction::WeatherReport => self.weather_report(true),
-            MenuAction::Climb => self.start_climb(crate::types::PerchKind::WindowTop, true),
-            MenuAction::FeedNow => {
-                let was_starving = self.stats.data.hunger < 15.0;
-                if self.act(Act::Feed) == ActResult::Full {
-                    self.play(Shot::Shake);
-                    self.say(&pick(lines::FULL), 2600);
-                    return;
-                }
-                if was_starving {
-                    self.react(St::Love, 2800, Some(pick(lines::FEED_STARVING)));
-                    self.fx(FxKind::Heart, 6);
-                } else {
-                    self.react(St::Eat, 2600, Some(pick(lines::FEED)));
-                    self.fx(FxKind::Heart, 2);
-                }
-            }
-            MenuAction::Pat => {
-                self.act(Act::Pat);
-                if self.state == St::Sleep {
-                    self.play(Shot::Squash);
-                    self.say(lines::PAT_SLEEPING, 2600);
-                    return;
-                }
-                let l = if fastrand::bool() { lines::SHY } else { lines::PAT };
-                self.react(St::Shy, 2200, Some(pick(l)));
-                self.fx(FxKind::Heart, 5);
-            }
-            MenuAction::Honey => self.drink_honey(),
-            MenuAction::Song => self.play_song(),
-            MenuAction::Dance(id) => self.start_routine(&id),
-            MenuAction::Sleep => self.go_sleep(),
-            MenuAction::Walk => self.go_walk(),
-            MenuAction::Status => self.show_status(),
-            MenuAction::Chat => self.open_chat(),
-            MenuAction::Costume(id) => {
-                // 「🎭 角色」子菜单（skin:…）
-                if self.on_skin_menu(&id) { return; }
-                let id = crate::core::costume::normalize(&id).to_string();
-                if id == self.costume { return; }
-                if self.io { let v = crate::core::costume::config_value(&id); crate::core::config::update(|c| c.costume = v); }
-                self.costume = id;
-                self.outfit_changed(true, false);
-            }
-            MenuAction::Outfit(id, on) => {
-                let mut l: Vec<String> = self.outfits.iter().filter(|x| **x != id).cloned().collect();
-                if on { l.push(id); }
-                self.set_outfits(l);
-            }
-            MenuAction::ClearOutfit => self.set_outfits(Vec::new()),
-            MenuAction::ReloadSettings => {
-                let (c, o) = if self.io {
-                    let cfg = crate::core::config::reload();
-                    // 设置窗口里关了声音：正在念的停掉
-                    if !cfg.tts.enabled { self.stop_voice(); }
-                    (cfg.costume, cfg.outfit)
-                } else {
-                    (self.costume.clone(), self.outfits.clone())
-                };
-                self.costume = crate::core::costume::normalize(&c).to_string();
-                self.outfits = o;
-                self.say(&pick(lines::RELOADED), 2600);
-            }
-            MenuAction::Tts(on) => {
-                if self.io { crate::core::config::update(|c| c.tts.enabled = on); }
-                if !on { self.stop_voice(); }
-            }
-            MenuAction::TtsChatOnly(on) => {
-                if self.io { crate::core::config::update(|c| c.tts.speak = if on { "chat".into() } else { "all".into() }); }
-            }
-            MenuAction::Moyu(on) => {
-                if self.io { crate::core::config::update(|c| c.moyu.enabled = on); }
-                self.say(&pick(if on { lines::MOYU_ON } else { lines::MOYU_OFF }), 2600);
-            }
-            MenuAction::Memo(m) => self.on_memo_menu(m),
-            MenuAction::Mind(m) => self.on_mind_menu(m),
-            MenuAction::ForgetChat => {
-                if self.io { crate::services::ai::clear_history(); }
-                self.play(Shot::Shake);
-                self.say(&pick(lines::FORGOT), 2600);
-            }
-            // 平台层自己处理：番茄钟（会发 AppEvent::Pomodoro）、显示/隐藏/叫到中间（会发 Peek）、
-            // 打开文件/文件夹、自启、退出（会调 Handler::quit）
-            MenuAction::PomodoroStart(_) | MenuAction::PomodoroStop | MenuAction::OpenSongDir | MenuAction::OpenSettings
-            | MenuAction::OpenConfigFile
-            | MenuAction::OpenDataDir | MenuAction::AutoStart(_) | MenuAction::ToggleVisible | MenuAction::CallToCenter
-            | MenuAction::Quit => {}
-        }
-    }
-
-    fn set_outfits(&mut self, l: Vec<String>) {
-        let added = l.len() > self.outfits.len();
-        if self.io { let v = l.clone(); crate::core::config::update(|c| c.outfit = v); }
-        self.outfits = l;
-        self.outfit_changed(false, added);
-    }
-
-    fn outfit_changed(&mut self, costume_changed: bool, added: bool) {
-        self.play(Shot::Bounce);
-        let l = if costume_changed {
-            pick(lines::costume_line(&self.costume))
-        } else if added {
-            pick(lines::OUTFIT_ON)
-        } else {
-            pick(lines::OUTFIT_OFF)
-        };
-        self.react(St::Happy, 2500, Some(l));
-    }
-
-    // ============================================================ 聊天
-    fn open_chat(&mut self) {
-        if self.state == St::Sleep {
-            self.say(&pick(lines::WAKE), 2600);
-            self.act(Act::Wake);
-        }
-        self.chatting = true;
-        self.state_timer = None;
-        if matches!(self.state, St::Walk | St::Sleep) { self.set_state(St::Idle, None); }
-        self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Open));
-        // 新手：还没填聊天 Key，第一次打开聊天就先告诉她去哪儿填
-        if !self.key_hint_shown && self.io && crate::core::config::ai_key_missing(&crate::core::config::get()) {
-            self.key_hint_shown = true;
-            self.say(crate::services::ai::KEY_HINT, 9000);
-        }
-    }
-
-    /// 输入框里有没有打了字
-    fn chat_typed(&self) -> bool {
-        if self.io { crate::platform::chat_has_text() } else { self.fake_chat_text }
-    }
-
-    /// 聊天框开着且「有内容」：打了字，或者正在等 AI 回复。这时不自己溜达/睡觉，也不被别的动作关掉
-    fn chat_busy(&self) -> bool { self.chatting && (self.waiting || self.chat_typed()) }
-
-    /// 别的动作来了：空输入框直接收起（不改状态，让那个动作自己定）；有内容就留着
-    fn yield_chat(&mut self) {
-        if !self.chatting || self.chat_busy() { return; }
-        self.chatting = false;
-        self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Close));
-    }
-
-    fn close_chat(&mut self) {
-        self.chatting = false;
-        if !self.waiting { self.set_state(St::Idle, Some((5000.0, 9000.0))); }
-    }
-
-    fn on_chat_submit(&mut self, text: String) {
-        let text = text.trim().to_string();
-        if text.is_empty() || self.waiting { return; }
-        // 哈基米梗彩蛋：不走 AI，直接唱跳
-        if ["哈基米", "哈吉米", "南北绿豆", "曼波", "阿西嘎", "奶龙"].iter().any(|k| text.contains(k)) {
-            self.act(Act::Chat);
-            return self.play_song();
-        }
-        if text.contains("蜂蜜") {
-            self.act(Act::Chat);
-            return self.drink_honey();
-        }
-        // 「提醒我…」「记一下…」「我有什么待办」
-        // 「记住…」「忘掉…」「你记得我什么」
-        if self.mind_chat(&text) { return; }
-        if self.memo_chat(&text) { return; }
-        self.waiting = true;
-        self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(false)));
-        self.set_state(St::Think, None);
-        self.say_opts(&pick(lines::THINK), 30_000, false, SpeakKind::Line);
-        let d = &self.stats.data;
-        let ctx = crate::services::ai::ChatCtx {
-            hunger: d.hunger.round() as u32,
-            mood: d.mood.round() as u32,
-            energy: d.energy.round() as u32,
-            level: self.stats.level().1.to_string(),
-            days: self.stats.days(),
-        };
-        self.call(format!("chat:{text}"));
-        if self.io { crate::services::ai::chat(&self.tx, text, ctx); }
-    }
-
-    fn on_chat_reply(&mut self, r: ChatReply) {
-        // 去掉情绪标签（气泡和 TTS 只拿干净文字）
-        let (r, emo) = self.emotion_split(r);
-        // 语音回答：先合成，字和声音一起出来（chatvoice.rs）；这期间保持思考中
-        if r.ok && self.chat_voice_on() {
-            self.cv_start(&r.text, emo);
-            if self.cv.is_some() {
-                // 第一段出字时再换表情（emotion_cv_reveal），整段念完 2 秒后回平时
-                self.emotion_cv_pending(emo, r.text.chars().count());
-                self.mind_after_reply(true);
-                return;
-            }
-        }
-        self.waiting = false;
-        self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(true)));
-        if r.ok {
-            self.act(Act::Chat);
-            self.play(Shot::Bounce);
-            self.set_state(St::Happy, None);
-            self.emotion_face(emo);
-        } else {
-            self.play(Shot::Shake);
-            self.set_state(if r.need_key { St::Sit } else { St::Drag }, None);
-        }
-        // 字多就多停一会儿：2.5 秒起，每字 +0.15 秒，最多 20 秒
-        let ms = (2500 + r.text.encode_utf16().count() as u64 * 150).min(20_000);
-        // 语音回答关了：聊天回复只出字
-        let voice = !(r.ok && self.chat_voice_disabled_by_user());
-        self.say_opts(&r.text, ms, voice, if r.ok { SpeakKind::Chat } else { SpeakKind::Line });
-        self.hold_timer(2500, StateAct::ChatIdle);
-        self.emotion_hold(emo);
-        self.mind_after_reply(r.ok);
-    }
-
-    // ============================================================ 提醒 / 番茄钟 / 摸鱼
-    fn on_remind(&mut self, k: RemindKind) {
-        if self.chatting || self.waiting { return; }
-        if self.state == St::Sleep && k != RemindKind::OffWork { return; }
-        self.play(Shot::Bounce);
-        let l = match k { RemindKind::Water => lines::WATER, RemindKind::StandUp => lines::STAND_UP, RemindKind::OffWork => lines::OFF_WORK };
-        self.react(St::Happy, 2500, Some(pick(l)));
-    }
-
-    fn on_pomodoro(&mut self, p: PomodoroEv) {
-        match p {
-            PomodoroEv::Start { minutes } => {
-                self.pomo_running = true;
-                self.react(St::Think, 2500, Some(pickv(lines::pomo_start(minutes))));
-            }
-            PomodoroEv::Done { .. } => {
-                self.pomo_running = false;
-                self.play(Shot::Bounce);
-                if fastrand::bool() {
-                    self.react(St::Smug, 3500, Some(pick(lines::SMUG)));
-                } else {
-                    self.react(St::Happy, 3500, Some(pick(lines::POMO_DONE)));
-                }
-                self.act(Act::Pat);
-            }
-            PomodoroEv::Cancel => {
-                self.pomo_running = false;
-                self.say(&pick(lines::POMO_CANCEL), 2600);
-            }
-        }
-    }
-
-    fn on_moyu(&mut self, ev: MoyuEv) {
-        if self.chatting || self.waiting { return; }
-        match ev {
-            MoyuEv::Back { .. } => {
-                self.play(Shot::Bounce);
-                self.act(Act::Pat);
-                self.react(if fastrand::bool() { St::Smug } else { St::Happy }, 3000, Some(pick(lines::MOYU_BACK)));
-            }
-            MoyuEv::Nag { level, minutes, what, pomodoro } => {
-                let what = lines::moyu_name(&what);
-                if self.state == St::Sleep { self.set_state(St::Idle, None); }
-                if pomodoro {
-                    self.play(Shot::Shake);
-                    return self.react(St::Drag, 3000, Some(pickv(lines::moyu_pomo(&what))));
-                }
-                match level {
-                    1 => {
-                        self.play(Shot::Bounce);
-                        self.fx(FxKind::Sweat, 1);
-                        self.react(St::Stare, 3500, Some(pickv(lines::moyu1(&what, minutes))));
-                    }
-                    2 => {
-                        self.play(Shot::Shake);
-                        self.react(St::Pout, 3500, Some(pickv(lines::moyu2(&what, minutes))));
-                    }
-                    _ => {
-                        self.play(Shot::Shake);
-                        self.fx(FxKind::Anger, 1);
-                        self.react(St::Hiss, 4000, Some(pickv(lines::moyu3(&what, minutes))));
-                    }
-                }
-            }
-        }
-    }
-
-    // ============================================================ 场景
-    fn current_pet_anim(&self) -> PetAnim {
-        let now = self.now;
-        if let Some((s, t)) = self.shot && now < t + s.dur() { return PetAnim::Shot(s); }
-        if self.chase.is_some_and(|t| now < t + 1800) { return PetAnim::Chase; }
-        if self.dragging_cls { return PetAnim::Wiggle; }
-        match self.state {
-            St::Walk => PetAnim::Walk(now < self.fast_until && self.glow),
-            St::Sleep => PetAnim::BreatheSlow,
-            St::Dance => PetAnim::Still,
-            St::Hiss => PetAnim::Hiss,
-            St::Dizzy => PetAnim::Dizzy,
-            _ => PetAnim::Breathe,
-        }
-    }
-
-    fn pet_xf(&mut self) -> Xf {
-        let want = self.current_pet_anim();
-        if want != self.pet_anim.0 {
-            // 一次性动画用自己的起点（play() 的时刻），循环动画从切换时重新开始
-            let start = match want {
-                PetAnim::Shot(_) => self.shot.map(|s| s.1).unwrap_or(self.now),
-                PetAnim::Chase => self.chase.unwrap_or(self.now),
-                _ => self.now,
-            };
-            self.pet_anim = (want, start);
-        }
-        let e = self.now.saturating_sub(self.pet_anim.1) as f32;
-        let run = |dur: f32, n: Option<u32>, f: fn(f32) -> Xf| anim::cycle(e, dur, n).map(f).unwrap_or(Xf::ID);
-        match want {
-            PetAnim::Shot(Shot::Bounce) => run(450.0, Some(1), anim::bounce),
-            PetAnim::Shot(Shot::Squash) => run(400.0, Some(1), anim::squash),
-            PetAnim::Shot(Shot::Shake) => run(400.0, Some(1), anim::shake),
-            PetAnim::Shot(Shot::Jump) => run(700.0, Some(1), anim::jump),
-            PetAnim::Chase => run(600.0, Some(3), anim::chase),
-            PetAnim::Wiggle => run(350.0, None, anim::wiggle),
-            PetAnim::Walk(fast) => run(if fast { 250.0 } else { 500.0 }, None, anim::walk),
-            PetAnim::BreatheSlow => run(4000.0, None, anim::breathe_slow),
-            PetAnim::Still => Xf::ID,
-            PetAnim::Hiss => run(250.0, Some(4), anim::shake),
-            PetAnim::Dizzy => run(600.0, Some(5), anim::wiggle),
-            PetAnim::Breathe => run(2600.0, None, anim::breathe),
-        }
-    }
-
-    fn tail_star(&self) -> (Xf, Xf) {
-        let now = self.now as f32;
-        let m = self.mood_cls;
-        let sad = m == MoodLevel::Sad;
-        let tired = m == MoodLevel::Exhausted;
-        let p = |dur: f32| (now % dur) / dur;
-        let tail = if self.state == St::Happy {
-            anim::tail_wag(p(450.0))
-        } else if sad || tired {
-            anim::tail_droop(p(4000.0))
-        } else {
-            let dur = if m == MoodLevel::Great { 1300.0 } else if self.state == St::Walk { 900.0 } else { 2400.0 };
-            anim::tail_sway(p(dur))
-        };
-        let star = if sad {
-            anim::star_droop(p(4000.0))
-        } else if matches!(self.state, St::Happy | St::Eat) {
-            anim::star_spin(p(1200.0))
-        } else {
-            anim::star_bob(p(3200.0))
-        };
-        (tail, star)
-    }
-
-    fn build_scene(&mut self) {
-        let now = self.now;
-        let live = self.live_view();
-        let mut pet = self.pet_xf();
-        if self.live_replaces_breathe() && matches!(self.pet_anim.0, PetAnim::Breathe | PetAnim::BreatheSlow) { pet = Xf::ID; }
-        let mut pet = self.blend_pet(pet);
-        let (lean, tilt) = self.play.lean_at(now);
-        pet.rot += tilt;
-        let (tail, star) = self.tail_star();
-        let bubble = self.bubble.as_ref().and_then(|b| {
-            let op = self.bubble_fade.value(now);
-            if op <= 0.0 { return None; }
-            // 超出 max-height 时慢慢往下滚（原版可以用滚轮，这里自动滚）
-            let scroll = if self.ui.bubble_overflow {
-                let span = b.dur.saturating_sub(3000).max(1000) as f32;
-                ((now.saturating_sub(b.shown) as f32 - 1500.0) / span).clamp(0.0, 1.0)
-            } else { 0.0 };
-            let scroll = (scroll * 100.0).round() / 100.0;
-            Some(BubbleView { text: b.text.clone(), opacity: op, scroll })
-        });
-        let status = self.status.as_ref().and_then(|s| {
-            let op = self.status_fade.value(now);
-            (op > 0.0).then(|| StatusView { opacity: op, ..s.clone() })
-        });
-        let mut zzz = Vec::new();
-        if let (St::Sleep, Some(since)) = (self.state, self.sleep_since) {
-            const Z: [(char, f32, u32); 3] = [('z', 14.0, 0x4285f4), ('z', 18.0, 0x34a853), ('Z', 24.0, 0xea4335)];
-            for (i, (ch, size, color)) in Z.iter().enumerate() {
-                let t = now as i64 - since as i64 - i as i64 * 1000;
-                if t < 0 { continue; }
-                let xf = anim::zfloat((t % 3000) as f32 / 3000.0);
-                zzz.push(ZGlyph { ch: *ch, size: *size, color: *color, x: xf.tx, y: xf.ty, opacity: xf.opacity });
-            }
-        }
-        let flip = self.flip_value();
-        self.scene = Scene {
-            face: self.face,
-            costume: self.costume.clone(),
-            outfits: self.weather_outfits(),
-            pet,
-            flip,
-            tail,
-            star,
-            glow: self.glow,
-            lean,
-            bubble,
-            status,
-            zzz,
-            fx: self.fx.sprites(now),
-            live,
-        };
-        self.apply_dance_scene();
-    }
 }
 
 #[cfg(test)]

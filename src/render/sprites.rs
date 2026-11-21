@@ -235,8 +235,8 @@ mod tests {
         assert!(!l.star && !l.tail);
         assert_eq!(l.outfit_offset, Some((0.0, 0.0)));
         assert_eq!(layers_for(Face::Walk1, "jk", &[]).base, "outfits/jk/idle.png");
-        assert_eq!(layers_for(Face::Sit, "", &["scarf".into()]).outfit_offset, Some((0.0, 17.0)));
-        assert_eq!(layers_for(Face::Sleep, "", &["scarf".into()]).outfit_offset, None);
+        assert_eq!(layers_for(Face::Sit, "", &["glasses".into()]).outfit_offset, Some((0.0, 17.0)));
+        assert_eq!(layers_for(Face::Sleep, "", &["glasses".into()]).outfit_offset, None);
         // 戴圣诞帽时藏星星
         assert!(!layers_for(Face::Idle, "", &["santa".into()]).star);
     }
@@ -251,7 +251,7 @@ mod tests {
                 assert!(crate::assets::get(&l.base).is_some(), "{c} {}", l.base);
             }
         }
-        for p in [TAIL, STAR, "outfits/santa.png", "outfits/glasses.png", "outfits/scarf.png"] {
+        for p in [TAIL, STAR, "outfits/santa.png", "outfits/glasses.png"] {
             assert!(crate::assets::get(p).is_some(), "{p}");
         }
     }

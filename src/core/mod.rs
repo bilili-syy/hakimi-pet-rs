@@ -7,5 +7,6 @@ pub mod memo;
 pub mod memory;
 pub mod paths;
 pub mod save;
+pub mod session;
 pub mod skin;
 pub mod stats;

@@ -1,5 +1,5 @@
 // 哈基米桌宠 · Rust 版 —— 入口
-// 模块归属见 docs/TASKS.md；跨模块类型在 types.rs（冻结）
+// 模块结构见 docs/ARCHITECTURE.md；跨模块类型在 types.rs
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;

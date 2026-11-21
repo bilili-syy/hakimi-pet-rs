@@ -35,8 +35,6 @@ pub fn config_value(id: &str) -> String {
     if id == DEFAULT { String::new() } else { id.to_string() }
 }
 
-/// 穿的是不是「本体」衣服（默认水手服或原装卫衣）：天冷自动围围巾之类只在这两套上做
-pub fn is_base(id: &str) -> bool { matches!(normalize(id), "sailor" | "hoodie") }
 
 #[cfg(test)]
 mod tests {
@@ -71,11 +69,5 @@ mod tests {
         assert_eq!(normalize(&c.costume), "maid");
         let c = crate::core::config::parse(r#"{}"#);
         assert_eq!(normalize(&c.costume), "sailor");
-    }
-
-    #[test]
-    fn base_outfits() {
-        assert!(is_base("") && is_base("sailor") && is_base("hoodie"));
-        assert!(!is_base("idol") && !is_base("xmas"));
     }
 }
