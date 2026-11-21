@@ -114,6 +114,8 @@ pub struct Config {
     pub costume: String,
     /// santa / glasses / scarf
     pub outfit: Vec<String>,
+    /// 天冷（≤5°C）自动围围巾；在菜单里摘掉围巾 / 摘掉配件会把它关掉
+    pub auto_scarf: bool,
     pub moyu: MoyuConfig,
     /// 天气城市（wttr.in 认的名字，如「北京」「Shanghai」）；空 = 按出口 IP 自动定位
     pub weather_city: String,
@@ -154,6 +156,7 @@ impl Default for Config {
             tts: TtsConfig::default(),
             costume: String::new(),
             outfit: Vec::new(),
+            auto_scarf: true,
             moyu: MoyuConfig::default(),
             weather_city: String::new(),
             scale: 1.0,

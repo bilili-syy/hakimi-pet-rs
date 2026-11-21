@@ -820,11 +820,23 @@ impl Behavior {
         }
     }
 
+    /// 现在画面上的围巾是不是天冷自动围的（配置里没有）
+    pub(super) fn auto_scarf_shown(&self) -> bool {
+        !self.outfits.iter().any(|x| x == "scarf") && self.weather_outfits().iter().any(|x| x == "scarf")
+    }
+
+    /// 主人在菜单里摘围巾 / 摘掉配件：以后天冷也不自动围了（写进配置）
+    pub(super) fn disable_auto_scarf(&mut self) {
+        if !self.auto_scarf { return; }
+        self.auto_scarf = false;
+        if self.io { crate::core::config::update(|c| c.auto_scarf = false); }
+    }
+
     /// 冷天自动围上围巾（只改画面，不写配置）
     pub(super) fn weather_outfits(&self) -> Vec<String> {
         let mut o = self.outfits.clone();
         let cold = self.play.weather.as_ref().is_some_and(|w| w.temp_c <= 5.0);
-        if cold && crate::core::costume::is_base(&self.costume) && !o.iter().any(|x| x == "scarf") { o.push("scarf".into()); }
+        if cold && self.auto_scarf && crate::core::costume::is_base(&self.costume) && !o.iter().any(|x| x == "scarf") { o.push("scarf".into()); }
         o
     }
 
@@ -1139,6 +1151,25 @@ mod tests {
         b.calls.clear();
         ev(&mut b, AppEvent::Menu(MenuAction::WeatherReport), 20000);
         assert!(!b.calls.iter().any(|c| c == "weather"));
+    }
+
+    #[test]
+    fn cold_scarf_can_be_taken_off() {
+        let mut b = mkb();
+        frame(&mut b, 3000);
+        let w = Weather { kind: WeatherKind::Cloudy, temp_c: 2.0, desc: "阴".into(), city: String::new(), high_c: None, low_c: None, rain_chance: None };
+        ev(&mut b, AppEvent::Weather(w), 3000);
+        assert!(b.auto_scarf_shown());
+        // 菜单里围巾没勾，点一下 = 摘掉，而且以后不再自动围
+        ev(&mut b, AppEvent::Menu(MenuAction::Outfit("scarf".into(), true)), 4000);
+        assert!(!b.weather_outfits().iter().any(|x| x == "scarf"));
+        assert!(b.outfits.is_empty());
+        // 自己再戴上：照常
+        ev(&mut b, AppEvent::Menu(MenuAction::Outfit("scarf".into(), true)), 5000);
+        assert_eq!(b.outfits, vec!["scarf".to_string()]);
+        // 摘掉配件：也全清
+        ev(&mut b, AppEvent::Menu(MenuAction::ClearOutfit), 6000);
+        assert!(b.weather_outfits().is_empty());
     }
 
     #[test]
