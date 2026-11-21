@@ -101,6 +101,26 @@ impl Behavior {
         if self.io { crate::services::ai::chat(&self.tx, text, ctx); }
     }
 
+    /// 看屏吐槽：主人确认过的截图。和聊天一样等回复（Esc 也能取消），回复走 on_chat_reply
+    pub(super) fn on_roast(&mut self, png: Vec<u8>) {
+        if self.waiting { return; }
+        self.waiting = true;
+        self.act(Act::Chat);
+        self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(false)));
+        self.set_state(St::Think, None);
+        self.say_opts(&pick(lines::ROAST_LOOK), 30_000, false, SpeakKind::Line);
+        let d = &self.stats.data;
+        let ctx = crate::services::ai::ChatCtx {
+            hunger: d.hunger.round() as u32,
+            mood: d.mood.round() as u32,
+            energy: d.energy.round() as u32,
+            level: self.stats.level().1.to_string(),
+            days: self.stats.days(),
+        };
+        self.call(format!("roast:{}", png.len()));
+        if self.io { crate::services::ai::roast(&self.tx, png, ctx); }
+    }
+
     /// 等回复时按 Esc：不等了。回复到了丢掉、不进历史；正在合成第一段语音的也停
     pub(super) fn chat_stop(&mut self) {
         if !self.waiting {

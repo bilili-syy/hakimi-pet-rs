@@ -17,6 +17,7 @@ mod menu;
 mod perch;
 mod power;
 mod report;
+mod roast;
 mod sense;
 mod settings;
 mod sys;
@@ -224,6 +225,7 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
         })
     });
     menu::init();
+    roast::sync_hotkey(hwnd);
     hrtimer::init();
     rearm();
 
@@ -670,6 +672,9 @@ fn on_menu(a: MenuAction) {
         // 先读一遍文件，Handler 拿到的就是新配置
         MenuAction::ReloadSettings => {
             crate::core::config::reload();
+            if let Some(h) = main_hwnd() {
+                roast::sync_hotkey(h);
+            }
         }
         // 原版：win.show(); win.focus(); 再通知渲染进程开聊天
         MenuAction::Chat => {
@@ -751,6 +756,7 @@ fn after(a: MenuAction) {
         MenuAction::Memo(crate::types::MemoAct::OpenFile) => open_path(&crate::core::memo::ensure_file()),
         MenuAction::Memo(crate::types::MemoAct::OpenWindow) => settings::open(3),
         MenuAction::Report => settings::open(4),
+        MenuAction::Roast => roast::trigger(),
         MenuAction::ExportChat => {
             let r = report::export_chat();
             match &r {
@@ -1424,6 +1430,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     on_menu(a);
                     pump();
                 }
+                LRESULT(0)
+            }
+            WM_HOTKEY if wp.0 as i32 == roast::HOTKEY_ID => {
+                roast::trigger();
+                pump();
                 LRESULT(0)
             }
             WM_COPYDATA => {

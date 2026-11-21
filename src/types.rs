@@ -123,6 +123,8 @@ pub enum MenuAction {
     Report,
     /// 「💬 导出聊天记录」：平台层存成 Markdown，完了发 ChatExported
     ExportChat,
+    /// 「👀 看屏吐槽」：平台层截前台窗口、弹确认框，确认了发 ScreenRoast
+    Roast,
 }
 
 // ---------------------------------------------------------------- 事件
@@ -251,6 +253,10 @@ pub enum AppEvent {
     ChatStop,
     /// 导出聊天记录的结果（true = 存好了）
     ChatExported(bool),
+    /// 看屏吐槽：主人确认后的截图（PNG，只在内存里）
+    ScreenRoast(Vec<u8>),
+    /// 看屏吐槽没法看（录屏中 / 模型不支持 / 没截到）：她说这一句
+    RoastNote(String),
     ChatReply(ChatReply),
     /// tts::speak 的结果；None = 不念（关了/没 key/失败/限流）
     Speech { token: u64, audio: Option<Audio> },

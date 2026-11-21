@@ -435,6 +435,11 @@ impl Behavior {
             }
             AppEvent::ChatCancel => self.close_chat(),
             AppEvent::ChatStop => self.chat_stop(),
+            AppEvent::ScreenRoast(png) => self.on_roast(png),
+            AppEvent::RoastNote(t) => {
+                self.play(Shot::Shake);
+                self.say_opts(&t, 3200, false, SpeakKind::Line);
+            }
             AppEvent::ChatExported(ok) => {
                 let l = if ok { "聊天记录导出好啦，在「文档\\哈基米」里～" } else { "还没有聊天记录可以导出喵" };
                 self.say_opts(l, 3200, false, SpeakKind::Line);

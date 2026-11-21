@@ -138,6 +138,8 @@ pub struct Config {
     pub fullscreen_hide: bool,
     /// 每天最多吃多少「粮食」（云端聊天 token + MiMo 语音字数）；0 = 不限。到了先降级，不直接停
     pub daily_food_cap: u64,
+    /// 看屏吐槽：Ctrl+Alt+K 截前台窗口给她看（默认关；截图只在内存里，确认后发给聊天模型）
+    pub screen_roast: bool,
     /// 未知字段（_说明 之类）原样保留
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -177,6 +179,7 @@ impl Default for Config {
             fps: 60,
             fullscreen_hide: true,
             daily_food_cap: 0,
+            screen_roast: false,
             extra,
         }
     }

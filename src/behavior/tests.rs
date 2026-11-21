@@ -601,3 +601,20 @@ fn esc_while_waiting_drops_the_reply() {
     ev(&mut b, AppEvent::ChatStop, 20_000);
     assert!(!b.chatting);
 }
+
+#[test]
+fn screen_roast_waits_like_chat() {
+    let mut b = mk();
+    tick(&mut b, 3000);
+    ev(&mut b, AppEvent::ScreenRoast(vec![1, 2, 3]), 3500);
+    assert_eq!(b.state, St::Think);
+    assert!(b.calls.iter().any(|c| c == "roast:3"));
+    assert!(b.scene.bubble.as_ref().is_some_and(|x| lines::ROAST_LOOK.contains(&x.text.as_str())));
+    // 等着时再来一张不理
+    ev(&mut b, AppEvent::ScreenRoast(vec![1]), 4000);
+    assert!(!b.calls.iter().any(|c| c == "roast:1"));
+    ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, text: "又在摸鱼！".into(), need_key: false }), 8000);
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "又在摸鱼！");
+    ev(&mut b, AppEvent::RoastNote("你在录屏呢".into()), 20_000);
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "你在录屏呢");
+}

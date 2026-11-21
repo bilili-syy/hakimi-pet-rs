@@ -145,6 +145,7 @@ const ID_FOOD_CAP: i32 = 168;
 const ID_USAGE: i32 = 169;
 const ID_AUTOSTART: i32 = 150;
 const ID_FS_HIDE: i32 = 166;
+const ID_ROAST: i32 = 173;
 const ID_SCALE: i32 = 151;
 const ID_FPS: i32 = 164;
 const ID_BIRTHDAY: i32 = 165;
@@ -801,6 +802,8 @@ impl Dlg {
         self.hint(p, "高级：摸鱼关键词、进程名等在设置文件里改，改完点「重新读取设置文件」。", [X0, 394.0, W - X0 - 16.0, 40.0]);
         self.button(p, ID_UPDATE, "检查更新", 0, [X0, 438.0, 170.0, 30.0]);
         self.add(p, w!("STATIC"), &format!("当前版本 v{}", crate::services::update::CURRENT), SS_CENTERIMAGE, 0, ID_UPDATE_RESULT, [X0 + 182.0, 438.0, W - X0 - 198.0, 30.0]);
+        // 看屏吐槽（默认关）：模型不能看图时灰掉，文字说明原因
+        self.button(p, ID_ROAST, ROAST_ON, BS_AUTOCHECKBOX, [X0, 474.0, W - X0 - 16.0, 24.0]);
 
         // ---------------- 备忘录（改动马上写进 memo.json，不用点「保存」）
         let p = 4;
@@ -873,6 +876,8 @@ impl Dlg {
 
         set_checked(self.c(ID_AUTOSTART), autostart);
         set_checked(self.c(ID_FS_HIDE), c.fullscreen_hide);
+        set_checked(self.c(ID_ROAST), c.screen_roast);
+        self.update_roast();
         combo_set(self.c(ID_SCALE), nearest_scale(c.scale));
         combo_set(self.c(ID_FPS), FPS.iter().position(|x| x.0 == crate::core::config::clamp_fps(c.fps)).unwrap_or(1));
         set_text(self.c(ID_CITY), &c.weather_city);
@@ -912,6 +917,14 @@ impl Dlg {
         cue(base, if p.provider == "gemini" { "留空 = 用官方地址（一般不用改）" } else { "https://…/v1" });
     }
 
+    /// 看屏吐槽勾选框：按 AI 页现在选的模型判断能不能看图，不能就灰掉
+    fn update_roast(&self) {
+        let ok = crate::services::ai::vision_ok(PRESETS[self.preset].provider, get_text(self.c(ID_MODEL)).trim());
+        let h = self.c(ID_ROAST);
+        enable(h, ok);
+        set_text(h, if ok { ROAST_ON } else { ROAST_NO });
+    }
+
     fn update_volume_label(&self) {
         let v = send(self.c(ID_VOLUME), TBM_GETPOS, 0, 0);
         set_text(self.c(ID_VOLUME_LABEL), &format!("{v}%"));
@@ -946,6 +959,9 @@ impl Dlg {
 
     fn show_page(&mut self, idx: u8) {
         self.page = idx + 1;
+        if self.page == 3 {
+            self.update_roast();
+        }
         send(self.c(ID_LIST), LB_SETCURSEL, idx as usize, 0);
         for c in &self.ctls {
             let show = c.page == 0 || c.page == self.page;
@@ -1010,6 +1026,7 @@ impl Dlg {
 
         let autostart = checked(self.c(ID_AUTOSTART));
         c.fullscreen_hide = checked(self.c(ID_FS_HIDE));
+        c.screen_roast = checked(self.c(ID_ROAST));
         c.scale = SCALES[combo_sel(self.c(ID_SCALE)).min(SCALES.len() - 1)].0;
         c.fps = FPS[combo_sel(self.c(ID_FPS)).min(FPS.len() - 1)].0;
         c.weather_city = get_text(self.c(ID_CITY)).trim().to_string();
@@ -1076,12 +1093,14 @@ fn differs(a: &Config, b: &Config) -> bool {
             (c.weather_city.clone(), c.birthday.clone()),
             (c.moyu.enabled, c.moyu.minutes, c.moyu.pomodoro_minutes, c.reminders.water, c.reminders.stand_up),
             c.reminders.off_work.clone(),
-            (c.fullscreen_hide, c.daily_food_cap),
+            (c.fullscreen_hide, c.daily_food_cap, c.screen_roast),
         )
     };
     pick(a) != pick(b)
 }
 
+const ROAST_ON: &str = "看屏吐槽（Ctrl+Alt+K，先看缩略图确认才发，不存盘）";
+const ROAST_NO: &str = "看屏吐槽（当前模型不能看图，换 Gemini 等）";
 const X0: f32 = 140.0;
 const LW: f32 = 84.0;
 const FX: f32 = 228.0;
@@ -1713,6 +1732,7 @@ mod tests {
         assert!(differs(&a, &b));
         let mut c = a.clone();
         assert!(c.fullscreen_hide, "默认全屏自动隐藏");
+        assert!(!c.screen_roast, "看屏吐槽默认关");
         c.fullscreen_hide = false;
         assert!(differs(&a, &c));
     }

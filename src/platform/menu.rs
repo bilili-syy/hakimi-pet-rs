@@ -79,6 +79,7 @@ const TOOLS: &[Node] = &[
     Item("weather", "🌦️ 天气播报"),
     Item("report", "📊 本周陪伴报告"),
     Item("chatexport", "💬 导出聊天记录"),
+    Item("roast", "👀 看屏吐槽（Ctrl+Alt+K）"),
 ];
 const COSTUME: &[Node] = &[
     // 和 core::costume::COSTUMES 一一对应（table_integrity 会检查）
@@ -123,6 +124,8 @@ pub struct Ctx {
     pub visible: bool,
     /// 番茄钟还剩几分钟（没开 = None）
     pub pomo_left: Option<u32>,
+    /// 看屏吐槽现在不能用的原因（None = 能用）
+    pub roast_block: Option<&'static str>,
 }
 
 /// 勾选项现在该不该勾
@@ -139,6 +142,10 @@ pub fn checked(id: &str, c: &Ctx) -> bool {
 /// 要换文字的项（None = 用表里的）
 pub fn label(id: &str, c: &Ctx) -> Option<String> {
     match id {
+        "roast" => Some(match c.roast_block {
+            Some(why) => format!("👀 看屏吐槽（{why}）"),
+            None => "👀 看屏吐槽（Ctrl+Alt+K）".into(),
+        }),
         "visible" => Some(if c.visible { "🙈 先藏起来" } else { "👀 叫她出来" }.into()),
         "pomo:stop" => Some(match c.pomo_left {
             Some(m) => format!("结束番茄钟（还剩 {m} 分钟）"),
@@ -156,6 +163,9 @@ pub fn label(id: &str, c: &Ctx) -> Option<String> {
 pub fn enabled(id: &str, c: &Ctx) -> bool {
     if id == "pomo:stop" {
         return c.pomo_left.is_some();
+    }
+    if id == "roast" {
+        return c.roast_block.is_none();
     }
     if id.starts_with("pomo:") {
         return c.pomo_left.is_none();
@@ -364,6 +374,7 @@ fn ctx_now() -> Ctx {
         outfits: cfg.outfit,
         visible: main_hwnd().is_some_and(|h| unsafe { IsWindowVisible(h).as_bool() }),
         pomo_left: pomodoro_left(),
+        roast_block: super::roast::blocked(),
     }
 }
 
@@ -453,6 +464,7 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
         "weather" => A::WeatherReport,
         "report" => A::Report,
         "chatexport" => A::ExportChat,
+        "roast" => A::Roast,
         "climb" => A::Climb,
         "pat" => A::Pat,
         "honey" => A::Honey,
@@ -575,7 +587,7 @@ mod tests {
 
     #[test]
     fn dynamic_state() {
-        let mut c = Ctx { costume: "maid".into(), outfits: vec!["santa".into()], visible: true, pomo_left: None };
+        let mut c = Ctx { costume: "maid".into(), outfits: vec!["santa".into()], visible: true, pomo_left: None, roast_block: None };
         assert!(checked("costume:maid", &c));
         assert!(!checked("costume:", &c));
         assert!(checked("outfit:santa", &c));

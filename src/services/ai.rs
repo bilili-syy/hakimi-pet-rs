@@ -138,6 +138,89 @@ pub fn clear_history() {
     let _ = std::fs::remove_file(log_file());
 }
 
+// ------------------------------------------------------------------ 看屏吐槽
+
+/// 当前模型能不能看图（猜的：Gemini 全系能看；OpenAI 兼容接口看模型名）
+pub fn vision_ok(provider: &str, model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    if m.is_empty() {
+        return provider == "gemini";
+    }
+    if ["embedding", "tts", "whisper", "audio", "image-gen", "dall-e"].iter().any(|k| m.contains(k)) {
+        return false;
+    }
+    if provider == "gemini" || m.contains("gemini") || m.contains("gemma-3") || m.contains("gemma3") {
+        return true;
+    }
+    const VISION: [&str; 16] = [
+        "gpt-4o", "gpt-4.1", "gpt-5", "vision", "-vl", "vl-", "qvq", "llava", "minicpm-v", "glm-4v", "glm-4.5v",
+        "claude", "pixtral", "llama3.2-vision", "omni", "4v",
+    ];
+    if VISION.iter().any(|k| m.contains(k)) {
+        return true;
+    }
+    let tail = m.rsplit('/').next().unwrap_or(&m);
+    ["o3", "o4-mini"].iter().any(|p| tail == *p || tail.starts_with(&format!("{p}-")))
+}
+
+const ROAST_ASK: &str = "（主人把 TA 现在屏幕上的窗口截图给你看）你瞧瞧我在干嘛？";
+const ROAST_NOTE: &str = "\n\n【看屏吐槽】这一轮主人给你看了一张 TA 当前窗口的截图。用哈基米的口吻吐槽或点评一两句（60 字以内），可以调侃，别刻薄；看不清就说看不清。不要念出截图里的账号、密码、聊天对象名字、金额、地址等隐私。";
+const ROAST_NO_VISION: &str = "现在用的模型看不了图片喵…换个能看图的（比如 Gemini）再给我看～";
+
+/// 看屏吐槽：png 只在内存里，发完就丢。结果走 ChatReply
+pub fn roast(tx: &EventSender, png: Vec<u8>, ctx: ChatCtx) {
+    let worker_tx = tx.clone();
+    let spawned = std::thread::Builder::new().name("hakimi-roast".into()).spawn(move || {
+        let r = roast_blocking(&png, &ctx);
+        worker_tx.send(AppEvent::ChatReply(r));
+    });
+    if spawned.is_err() {
+        tx.send(AppEvent::ChatReply(ChatReply { ok: false, need_key: false, text: ERR_GENERIC.into() }));
+    }
+}
+
+pub fn roast_blocking(png: &[u8], ctx: &ChatCtx) -> ChatReply {
+    use base64::Engine;
+    let c = crate::core::config::get();
+    if crate::core::config::ai_key_missing(&c) {
+        return ChatReply { ok: false, need_key: true, text: NEED_KEY.into() };
+    }
+    if !vision_ok(&c.provider, &c.model) {
+        return ChatReply { ok: false, need_key: false, text: ROAST_NO_VISION.into() };
+    }
+    if !crate::core::config::ai_is_local(&c) && crate::core::usage::over_cap() {
+        return ChatReply { ok: true, need_key: false, text: FULL_LINES[fastrand::usize(..FULL_LINES.len())].into() };
+    }
+    let _net_guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let cancel_gen = CANCEL_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    let img = base64::engine::general_purpose::STANDARD.encode(png);
+    let ask = [json!({ "role": "user", "text": ROAST_ASK, "image": img })];
+    let mut system = crate::core::skin::with_persona(persona(&c, ctx));
+    system.push_str(ROAST_NOTE);
+    crate::core::log::log(&format!("ai roast, image {} KB", png.len() / 1024));
+    let r = if c.provider == "openai" { call_openai(&c, &system, &ask, false) } else { call_gemini(&c, &system, &ask, false) };
+    match r {
+        Ok(reply) => {
+            let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            if CANCEL_GEN.load(std::sync::atomic::Ordering::SeqCst) == cancel_gen {
+                // 图不进历史，只记一句「给她看了屏幕」，下一句聊天她还接得上
+                let u = json!({ "role": "user", "text": "（给你看了一眼我的屏幕）", "t": now_ms() });
+                let a = json!({ "role": "model", "text": reply, "t": now_ms() });
+                append_log(&[u.clone(), a.clone()]);
+                let mut h = load_history();
+                h.push(u);
+                h.push(a);
+                save_history(&h);
+            }
+            ChatReply { ok: true, need_key: false, text: reply }
+        }
+        Err(e) => {
+            crate::core::log::log(&format!("ai roast error {}", redact(&e.detail, &c.api_key)));
+            ChatReply { ok: false, need_key: false, text: e.user_text().into() }
+        }
+    }
+}
+
 /// 取消在途的这一轮聊天（Esc）：回复到了也不进历史
 static CANCEL_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn cancel_current() { CANCEL_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
@@ -362,7 +445,14 @@ const REASONING_MAX_TOKENS: u32 = 2048;
 pub fn gemini_body(model: &str, system: &str, history: &[Value]) -> Value {
     let contents: Vec<Value> = history
         .iter()
-        .map(|m| json!({ "role": if is_user(m) { "user" } else { "model" }, "parts": [{ "text": msg_text(m) }] }))
+        .map(|m| {
+            let mut parts = vec![json!({ "text": msg_text(m) })];
+            // 看屏吐槽：图片（base64 PNG）放在文字前面
+            if let Some(img) = m.get("image").and_then(Value::as_str) {
+                parts.insert(0, json!({ "inline_data": { "mime_type": "image/png", "data": img } }));
+            }
+            json!({ "role": if is_user(m) { "user" } else { "model" }, "parts": parts })
+        })
         .collect();
     let flash25 = is_gemini_25_flash(model);
     let max_tokens = if is_reasoning_model(model) && !flash25 { REASONING_MAX_TOKENS } else { CHAT_MAX_TOKENS };
@@ -450,7 +540,16 @@ pub fn parse_gemini(json: &Value) -> Result<String, AiError> {
 pub fn openai_body(model: &str, system: &str, history: &[Value]) -> Value {
     let mut messages = vec![json!({ "role": "system", "content": system })];
     messages.extend(
-        history.iter().map(|m| json!({ "role": if is_user(m) { "user" } else { "assistant" }, "content": msg_text(m) })),
+        history.iter().map(|m| {
+            let role = if is_user(m) { "user" } else { "assistant" };
+            match m.get("image").and_then(Value::as_str) {
+                Some(img) => json!({ "role": role, "content": [
+                    { "type": "text", "text": msg_text(m) },
+                    { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{img}") } },
+                ] }),
+                None => json!({ "role": role, "content": msg_text(m) }),
+            }
+        }),
     );
     let max_tokens = if is_reasoning_model(model) { REASONING_MAX_TOKENS } else { CHAT_MAX_TOKENS };
     json!({ "model": model, "temperature": 0.9, "max_tokens": max_tokens, "messages": messages })
@@ -671,6 +770,36 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vision_guess() {
+        use super::vision_ok;
+        assert!(vision_ok("gemini", "gemini-2.5-flash"));
+        assert!(vision_ok("gemini", ""));
+        assert!(vision_ok("openai", "gpt-4o-mini"));
+        assert!(vision_ok("openai", "qwen2.5-vl:7b"));
+        assert!(vision_ok("openai", "llava:13b"));
+        assert!(vision_ok("openai", "gemma3:12b"));
+        assert!(vision_ok("openai", "openai/o4-mini"));
+        assert!(!vision_ok("openai", "deepseek-chat"));
+        assert!(!vision_ok("openai", "qwen2.5:7b"));
+        assert!(!vision_ok("openai", "gpt-3.5-turbo"));
+        assert!(!vision_ok("openai", ""));
+        assert!(!vision_ok("gemini", "gemini-2.5-flash-preview-tts"));
+    }
+
+    #[test]
+    fn image_parts_in_bodies() {
+        use serde_json::json;
+        let h = [json!({"role":"user","text":"看","image":"QUJD"})];
+        let g = super::gemini_body("gemini-2.5-flash", "s", &h);
+        assert_eq!(g["contents"][0]["parts"][0]["inline_data"]["data"], "QUJD");
+        assert_eq!(g["contents"][0]["parts"][1]["text"], "看");
+        let o = super::openai_body("gpt-4o", "s", &h);
+        assert_eq!(o["messages"][1]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        let plain = super::openai_body("gpt-4o", "s", &[json!({"role":"user","text":"hi"})]);
+        assert_eq!(plain["messages"][1]["content"], "hi");
+    }
+
     #[test]
     fn chat_log_to_markdown() {
         use serde_json::json;
