@@ -736,7 +736,9 @@ name = "hakimi-pet"
 version = "1.2.0"
 dependencies = [
  "base64",
+ "crc32fast",
  "fastrand",
+ "flate2",
  "include_dir",
  "rodio",
  "serde",

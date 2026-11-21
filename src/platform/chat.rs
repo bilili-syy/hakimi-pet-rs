@@ -295,6 +295,7 @@ fn fit_lines(host: HWND, edit: HWND) {
 /// ↑/↓ 翻发过的话（纯逻辑，可测）
 #[derive(Default)]
 pub struct InputHistory {
+    skin_id: String,
     items: Vec<String>,
     /// 正在看第几条；None = 没在翻
     pos: Option<usize>,
@@ -306,6 +307,16 @@ impl InputHistory {
     pub fn new(items: Vec<String>) -> Self {
         let start = items.len().saturating_sub(HIST_MAX);
         Self { items: items[start..].to_vec(), ..Self::default() }
+    }
+    fn load_for_skin(skin_id: String) -> Self {
+        let mine = crate::services::ai::load_log()
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .filter_map(|m| m.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            .collect();
+        let mut h = Self::new(mine);
+        h.skin_id = skin_id;
+        h
     }
     pub fn push(&mut self, s: &str) {
         self.pos = None;
@@ -346,21 +357,18 @@ impl InputHistory {
 
 fn with_hist<R>(f: impl FnOnce(&mut InputHistory) -> R) -> R {
     let mut g = HIST.lock().unwrap_or_else(|e| e.into_inner());
-    let h = g.get_or_insert_with(|| {
-        // 第一次用：从完整聊天记录里拿主人说过的话
-        let mine = crate::services::ai::load_log()
-            .iter()
-            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            .filter_map(|m| m.get("text").and_then(|t| t.as_str()).map(str::to_string))
-            .collect();
-        InputHistory::new(mine)
-    });
-    f(h)
+    let active = crate::core::skin::active_id();
+    let need_reload = g.as_ref().is_none_or(|h| h.skin_id != active);
+    if need_reload {
+        *g = Some(InputHistory::load_for_skin(active));
+    }
+    f(g.as_mut().unwrap())
 }
 
 /// 清空输入框的 ↑/↓ 历史缓存（「忘掉聊天记录」时同步调用）
 pub fn clear_input_history() {
-    *HIST.lock().unwrap_or_else(|e| e.into_inner()) = Some(InputHistory::default());
+    let active = crate::core::skin::active_id();
+    *HIST.lock().unwrap_or_else(|e| e.into_inner()) = Some(InputHistory { skin_id: active, ..Default::default() });
 }
 
 /// 同步多行 Edit 的字数标志、框高度和灰色提示字（ES_MULTILINE 在 SetWindowTextW 时不会发 EN_CHANGE，必须显式同步）

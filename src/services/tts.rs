@@ -91,10 +91,13 @@ fn sha1_hex(s: &str) -> String { sha1_smol::Sha1::from(s.as_bytes()).digest().to
 fn mood_key(m: Option<VoiceMood>) -> &'static str { m.map(VoiceMood::key).unwrap_or("") }
 
 /// 原版 cacheKey：sha1([mode, voice, mode==clone ? '' : style, mood, text].join('|'))；
-/// sovits 模式把参考音频路径与参考文本编进键里，换参考音频不会串旧缓存
+/// sovits 模式把参考音频路径与参考文本编进键里；角色包自定义了 clone_ref 时也编进键里避免与哈基米原声撞缓存
 pub fn cache_key(t: &TtsConfig, text: &str, mood: Option<VoiceMood>) -> String {
     if t.mode == "sovits" {
         return sha1_hex(&["sovits", t.sovits_ref.trim(), t.sovits_prompt.trim(), mood_key(mood), text].join("|"));
+    }
+    if t.mode == "clone" && !t.clone_ref.trim().is_empty() {
+        return sha1_hex(&["clone-skin", t.clone_ref.trim(), mood_key(mood), text].join("|"));
     }
     let style = if t.mode == "clone" { "" } else { t.style.as_str() };
     sha1_hex(&[t.mode.as_str(), t.voice.as_str(), style, mood_key(mood), text].join("|"))
@@ -104,6 +107,9 @@ pub fn cache_key(t: &TtsConfig, text: &str, mood: Option<VoiceMood>) -> String {
 pub fn text_key(t: &TtsConfig, text: &str) -> String {
     if t.mode == "sovits" {
         return format!("T{}", sha1_hex(&["sovits", t.sovits_ref.trim(), t.sovits_prompt.trim(), text].join("|")));
+    }
+    if t.mode == "clone" && !t.clone_ref.trim().is_empty() {
+        return format!("T{}", sha1_hex(&["clone-skin", t.clone_ref.trim(), text].join("|")));
     }
     if t.mode == "design" {
         return format!("T{}", sha1_hex(&["design", t.voice.as_str(), t.style.as_str(), text].join("|")));
@@ -128,9 +134,10 @@ pub fn bundled_playable() -> bool {
     })
 }
 
-/// 内置台词（哈基米默认声线：clone 模式，或未自定义 sovitsRef 的默认 GPT-SoVITS 模式）
+/// 内置台词（仅在哈基米默认声线下启用：未指定自定义 clone_ref 的 clone 模式，或未指定 sovitsRef 的默认 GPT-SoVITS 模式）
 pub fn bundled(t: &TtsConfig, text: &str) -> Option<&'static [u8]> {
-    let default_hakimi = t.mode == "clone" || (t.mode == "sovits" && t.sovits_ref.trim().is_empty());
+    let default_hakimi = (t.mode == "clone" && t.clone_ref.trim().is_empty())
+        || (t.mode == "sovits" && t.sovits_ref.trim().is_empty());
     if !default_hakimi { return None; }
     crate::assets::get(&format!("voice/lines/{}.ogg", &sha1_hex(text)[..16]))
 }
@@ -275,8 +282,27 @@ fn ref_voice() -> Option<String> {
         .map(|b| format!("data:audio/mpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(b)))
 }
 
+fn ref_voice_for(t: &TtsConfig) -> Option<String> {
+    if !t.clone_ref.trim().is_empty() {
+        let p = std::path::Path::new(t.clone_ref.trim());
+        if let Ok(bytes) = std::fs::read(p)
+            && !bytes.is_empty()
+            && bytes.len() as u64 <= crate::core::skin::MAX_VOICE_BYTES
+        {
+            let mime = match p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+                "wav" => "audio/wav",
+                "ogg" => "audio/ogg",
+                "flac" => "audio/flac",
+                _ => "audio/mpeg",
+            };
+            return Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)));
+        }
+    }
+    ref_voice()
+}
+
 pub fn build_body(t: &TtsConfig, text: &str, mood: Option<VoiceMood>) -> Value {
-    build_body_with(t, text, mood, ref_voice)
+    build_body_with(t, text, mood, || ref_voice_for(t))
 }
 
 fn build_body_with(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, refv: impl FnOnce() -> Option<String>) -> Value {
@@ -395,7 +421,7 @@ pub fn speak_prefetch(tx: &EventSender, token: u64, text: String, mood: Option<V
 }
 
 fn speak_inner(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMood>, kind: SpeakKind, prefetch: bool) {
-    let t = crate::core::config::get().tts;
+    let t = crate::core::skin::effective_tts(crate::core::config::get().tts);
     lat::begin(token);
     let (seq, old) = {
         let mut st = state();
@@ -485,7 +511,7 @@ fn worker() {
                         // 在锁外读配置，避免持有 STATE 锁期间触发磁盘 I/O
                         drop(st);
                         let cfg = crate::core::config::get();
-                        let t = cfg.tts;
+                        let t = crate::core::skin::effective_tts(cfg.tts);
                         st = state();
                         if let Some(job) = st.fg.take() {
                             st.last_fg = Some(Instant::now());

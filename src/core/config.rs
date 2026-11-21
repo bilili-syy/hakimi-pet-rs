@@ -48,6 +48,9 @@ pub struct TtsConfig {
     pub sovits_ref: String,
     /// 参考音频里说的话；空 = 无参考文本模式
     pub sovits_prompt: String,
+    /// 运行期角色包覆盖的 MiMo 克隆参考音频文件（仅内存态，不写回 config.json）
+    #[serde(skip)]
+    pub clone_ref: String,
     /// 未知字段原样保留
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -70,6 +73,7 @@ impl Default for TtsConfig {
             sovits_url: "http://127.0.0.1:9880".into(),
             sovits_ref: String::new(),
             sovits_prompt: String::new(),
+            clone_ref: String::new(),
             extra: Map::new(),
         }
     }

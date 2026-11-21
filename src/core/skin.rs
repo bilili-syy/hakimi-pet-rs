@@ -36,12 +36,16 @@ pub const MENU_PREFIX: &str = "skin:";
 pub const MENU_OPEN: &str = "skin:@open";
 /// 「刷新皮肤列表」
 pub const MENU_RELOAD: &str = "skin:@reload";
+/// 「导入角色包 (.zip)…」
+pub const MENU_IMPORT: &str = "skin:@import";
+/// 当前支持的 skin.json 清单格式版本
+pub const CURRENT_FORMAT_VERSION: u32 = 1;
 
-/// 状态名 = assets/sprites 的文件名（不含 .png，和 types::Face::ALL 保持一致）
-pub const STATES: [&str; 27] = [
+/// 状态名 = assets/sprites 的文件名（不含 .png，和 types::Face::ALL 一一对应，共 32 个）
+pub const STATES: [&str; 32] = [
     "idle", "blink", "happy", "drag", "sit", "sleep", "eat", "hungry", "think", "walk1", "walk2", "shy", "dizzy",
     "surprised", "cry", "yawn", "love", "hiss", "stare", "dance", "honey", "pout", "smug", "confused", "scared",
-    "starry", "puff",
+    "starry", "puff", "wink", "drool", "sweat", "cheer", "sleepy",
 ];
 /// 支持的叠加层
 pub const OVERLAYS: [&str; 2] = ["blink", "mouthOpen"];
@@ -49,9 +53,9 @@ pub const OVERLAYS: [&str; 2] = ["blink", "mouthOpen"];
 pub const VOICE_EXTS: [&str; 4] = ["ogg", "wav", "mp3", "flac"];
 
 /// skin.json 最大多大（再大肯定不是正常的清单）
-const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+pub const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 /// 单个语音文件上限
-const MAX_VOICE_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_VOICE_BYTES: u64 = 8 * 1024 * 1024;
 /// persona 最多多少字（太长会挤掉聊天上下文）
 pub const MAX_PERSONA_CHARS: usize = 2000;
 pub const SCALE_MIN: f32 = 0.2;
@@ -59,24 +63,63 @@ pub const SCALE_MAX: f32 = 2.0;
 
 // ------------------------------------------------------------------ 清单
 
+/// 角色包专属声线配置（`skin.json` 的 `"tts"` 对象，全部字段可选；只允许引用包内相对路径参考音频，严禁改写外部 URL）
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkinTts {
+    /// "clone" | "preset" | "design" | "sovits"
+    pub mode: Option<String>,
+    /// 预置音色名（如 "蜜桃"、"冰糖"）
+    pub voice: Option<String>,
+    /// 音色描述 / 情绪风格提示词
+    pub style: Option<String>,
+    /// 包内参考音频相对路径（用于 clone 或 sovits 模式，经 safe_join 校验）
+    pub ref_audio: Option<String>,
+    /// GPT-SoVITS 参考音频对应的台词文本
+    pub sovits_prompt: Option<String>,
+}
+
+impl SkinTts {
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none()
+            && self.voice.is_none()
+            && self.style.is_none()
+            && self.ref_audio.is_none()
+            && self.sovits_prompt.is_none()
+    }
+}
+
 /// 解析后的 skin.json。解析是宽松的：缺字段 = 默认值；某个字段类型不对只丢这一个字段并记一条 warning。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SkinSpec {
+    /// 清单规范版本（未写时按 1 处理）
+    pub format_version: Option<u32>,
+    /// 清单中声明的唯一角色 ID（供平铺 zip 导入命名，可选）
+    pub manifest_id: String,
     pub name: String,
     pub author: String,
     pub version: String,
     pub persona: String,
     /// None = 自动缩放（按比例塞进内置 200×293 的框里）
     pub scale: Option<f32>,
+    /// 缺失表情是否回退到内置哈基米（默认 false = 只要包里有 idle 就回退到角色自己的 idle，避免闪回哈基米）
+    pub fallback_builtin: bool,
     /// 状态名（小写）→ 相对包目录的图片路径
     pub sprites: BTreeMap<String, String>,
     /// "blink" / "mouthOpen" → 图片路径
     pub overlays: BTreeMap<String, String>,
     pub voice_dir: Option<String>,
+    /// 角色专属 TTS 声线覆盖
+    pub tts: Option<SkinTts>,
     /// 原台词全文 或 台词分类名（小写）→ 可选的替换台词（随机挑一句）
     pub lines: BTreeMap<String, Vec<String>>,
     /// 解析时忽略掉的东西（给日志 / 菜单提示用）
     pub warnings: Vec<String>,
+}
+
+impl SkinSpec {
+    pub fn format_version_or_default(&self) -> u32 {
+        self.format_version.unwrap_or(CURRENT_FORMAT_VERSION)
+    }
 }
 
 fn str_field(m: &Map<String, Value>, key: &str, warn: &mut Vec<String>) -> String {
@@ -112,11 +155,73 @@ fn path_map(m: &Map<String, Value>, key: &str, lower_keys: bool, warn: &mut Vec<
     out
 }
 
+fn parse_tts(m: &Map<String, Value>, warn: &mut Vec<String>) -> Option<SkinTts> {
+    let o = match m.get("tts") {
+        None | Some(Value::Null) => return None,
+        Some(Value::Object(o)) => o,
+        Some(_) => {
+            warn.push("tts 不是对象，忽略".into());
+            return None;
+        }
+    };
+    let opt = |k: &str, w: &mut Vec<String>| Some(str_field(o, k, w)).filter(|s| !s.is_empty());
+    let mode = opt("mode", warn).and_then(|s| {
+        let lower = s.to_ascii_lowercase();
+        if ["clone", "preset", "design", "sovits"].contains(&lower.as_str()) {
+            Some(lower)
+        } else {
+            warn.push(format!("tts.mode \"{s}\" 不支持（仅限 clone / preset / design / sovits），忽略"));
+            None
+        }
+    });
+    let voice = opt("voice", warn);
+    let mut style = opt("style", warn);
+    if let Some(st) = &mut style
+        && st.chars().count() > 300
+    {
+        *st = st.chars().take(300).collect();
+        warn.push("tts.style 超过 300 字，已截断".into());
+    }
+    let ref_audio = opt("refAudio", warn).or_else(|| opt("sovitsRef", warn));
+    let mut sovits_prompt = opt("sovitsPrompt", warn);
+    if let Some(sp) = &mut sovits_prompt
+        && sp.chars().count() > 200
+    {
+        *sp = sp.chars().take(200).collect();
+    }
+    if o.contains_key("sovitsUrl") || o.contains_key("apiUrl") {
+        warn.push("tts 不允许由角色包指定外部服务器地址，已忽略".into());
+    }
+    let out = SkinTts { mode, voice, style, ref_audio, sovits_prompt };
+    (!out.is_empty()).then_some(out)
+}
+
 /// 解析 skin.json 文本。不是 JSON 对象 → Err（这个包整个不认）
 pub fn parse(text: &str) -> Result<SkinSpec, String> {
     let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("skin.json 不是合法 JSON：{e}"))?;
     let Value::Object(m) = v else { return Err("skin.json 顶层必须是 { … } 对象".into()) };
     let mut w = Vec::new();
+    let format_version = match m.get("formatVersion") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(fv) if (1..=999).contains(&fv) => {
+                let fv = fv as u32;
+                if fv > CURRENT_FORMAT_VERSION {
+                    w.push(format!("formatVersion {fv} 高于当前支持的 {CURRENT_FORMAT_VERSION}，部分新字段可能被忽略"));
+                }
+                Some(fv)
+            }
+            _ => {
+                w.push("formatVersion 必须是正整数，按 1 处理".into());
+                None
+            }
+        },
+        Some(_) => {
+            w.push("formatVersion 不是整数，按 1 处理".into());
+            None
+        }
+    };
+    let manifest_id = str_field(&m, "id", &mut w);
     let name = str_field(&m, "name", &mut w);
     let author = str_field(&m, "author", &mut w);
     let version = str_field(&m, "version", &mut w);
@@ -143,6 +248,21 @@ pub fn parse(text: &str) -> Result<SkinSpec, String> {
             None
         }
     };
+    let fallback_builtin = match m.get("fallback") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "idle" | "" => false,
+            "builtin" | "hakimi" => true,
+            other => {
+                w.push(format!("fallback \"{other}\" 不认识（仅支持 idle / builtin），按 idle 处理"));
+                false
+            }
+        },
+        Some(_) => {
+            w.push("fallback 不是字符串，按 idle 处理".into());
+            false
+        }
+    };
     let sprites = path_map(&m, "sprites", true, &mut w);
     for k in sprites.keys() {
         if !STATES.contains(&k.as_str()) { w.push(format!("sprites.{k} 不是已知状态（会被忽略）")); }
@@ -152,6 +272,7 @@ pub fn parse(text: &str) -> Result<SkinSpec, String> {
         if !OVERLAYS.contains(&k.as_str()) { w.push(format!("overlays.{k} 不认识（只支持 blink / mouthOpen）")); }
     }
     let voice_dir = Some(str_field(&m, "voiceDir", &mut w)).filter(|s| !s.is_empty());
+    let tts = parse_tts(&m, &mut w);
     let mut lines = BTreeMap::new();
     match m.get("lines") {
         None | Some(Value::Null) => {}
@@ -172,7 +293,22 @@ pub fn parse(text: &str) -> Result<SkinSpec, String> {
         }
         Some(_) => w.push("lines 不是对象，忽略".into()),
     }
-    Ok(SkinSpec { name, author, version, persona, scale, sprites, overlays, voice_dir, lines, warnings: w })
+    Ok(SkinSpec {
+        format_version,
+        manifest_id,
+        name,
+        author,
+        version,
+        persona,
+        scale,
+        fallback_builtin,
+        sprites,
+        overlays,
+        voice_dir,
+        tts,
+        lines,
+        warnings: w,
+    })
 }
 
 /// 台词表的键：去首尾空白；纯 ASCII 的（分类名）不分大小写
@@ -185,12 +321,19 @@ fn line_key(k: &str) -> String {
 /// 绝对路径、盘符、`..` 一律拒绝，别人分享的包没法读到包外的文件。
 pub fn safe_join(dir: &Path, rel: &str) -> Option<PathBuf> {
     let rel = rel.trim().replace('\\', "/");
-    if rel.is_empty() || rel.starts_with('/') { return None; }
+    if rel.is_empty() || rel.starts_with('/') || rel.contains(':') || rel.chars().any(char::is_control) {
+        return None;
+    }
     let mut out = dir.to_path_buf();
     let mut any = false;
     for c in Path::new(&rel).components() {
         match c {
             Component::Normal(p) => {
+                let s = p.to_str()?;
+                let stem = s.split('.').next().unwrap_or(s);
+                if is_win_reserved_stem(stem) {
+                    return None;
+                }
                 out.push(p);
                 any = true;
             }
@@ -199,6 +342,29 @@ pub fn safe_join(dir: &Path, rel: &str) -> Option<PathBuf> {
         }
     }
     any.then_some(out)
+}
+
+/// 校验单个合法的角色 ID（文件夹名）：不允许路径分隔符、`..`、控制字符、Windows 保留字、`@`/`.` 开头或 `hakimi`
+pub fn safe_single_id(raw: &str) -> Option<String> {
+    let s = raw.trim().trim_end_matches(['.', ' ']);
+    if s.is_empty()
+        || s.chars().count() > 64
+        || s.starts_with('.')
+        || s.starts_with('@')
+        || s.eq_ignore_ascii_case(BUILTIN_ID)
+        || s.chars().any(|c| "\\/:*?\"<>|".contains(c) || c.is_control())
+    {
+        return None;
+    }
+    let stem = s.split('.').next().unwrap_or(s);
+    if is_win_reserved_stem(stem) {
+        return None;
+    }
+    let mut comps = Path::new(s).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(_)), None) => Some(s.to_string()),
+        _ => None,
+    }
 }
 
 // ------------------------------------------------------------------ 一个角色包
@@ -217,7 +383,7 @@ impl SkinInfo {
     /// 0.2–2.0，None = 1
     pub fn scale(&self) -> f32 { self.spec.scale.unwrap_or(1.0) }
 
-    /// 某个状态的图片文件（没写 / 文件不在 → None，调用方回退内置）
+    /// 某个状态的图片文件（没写 / 文件不在 → None，调用方回退 idle 或内置）
     pub fn sprite_file(&self, state: &str) -> Option<PathBuf> {
         let rel = self.spec.sprites.get(state)?;
         safe_join(&self.dir, rel).filter(|p| p.is_file())
@@ -229,6 +395,44 @@ impl SkinInfo {
     }
 
     pub fn voice_dir(&self) -> Option<PathBuf> { safe_join(&self.dir, self.spec.voice_dir.as_deref()?).filter(|p| p.is_dir()) }
+
+    /// 角色包内的参考音频（仅允许包内相对路径 + 合法音频后缀 + 大小上限）
+    pub fn ref_audio_file(&self) -> Option<PathBuf> {
+        let rel = self.spec.tts.as_ref()?.ref_audio.as_deref()?;
+        let p = safe_join(&self.dir, rel)?;
+        let ext = p.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+        if !VOICE_EXTS.contains(&ext.as_str()) {
+            return None;
+        }
+        let meta = std::fs::metadata(&p).ok()?;
+        (meta.is_file() && meta.len() > 0 && meta.len() <= MAX_VOICE_BYTES).then_some(p)
+    }
+
+    /// 把角色包的声线配置叠加到用户当前的 TtsConfig 上（保留用户的开关、音量、API Key 与本机服务地址）
+    pub fn apply_tts(&self, mut base: crate::core::config::TtsConfig) -> crate::core::config::TtsConfig {
+        let Some(st) = &self.spec.tts else { return base };
+        if let Some(m) = &st.mode {
+            base.mode = m.clone();
+        }
+        if let Some(v) = &st.voice {
+            base.voice = v.clone();
+        }
+        if let Some(s) = &st.style {
+            base.style = s.clone();
+        }
+        if let Some(p) = &st.sovits_prompt {
+            base.sovits_prompt = p.clone();
+        }
+        if let Some(ref_file) = self.ref_audio_file() {
+            let full = ref_file.to_string_lossy().into_owned();
+            if base.mode == "sovits" {
+                base.sovits_ref = full;
+            } else {
+                base.clone_ref = full;
+            }
+        }
+        base
+    }
 
     /// 台词语音文件。文件名规则和 assets/voice/lines 一样：`sha1(台词) 前 16 位.ogg`；
     /// 另外也认直接用台词当文件名（`喵？找哈基米有事吗～.wav`，Windows 不能用的 \/:*?"<>| 换成 _）。
@@ -261,7 +465,7 @@ impl SkinInfo {
     }
 }
 
-fn is_win_reserved_stem(s: &str) -> bool {
+pub(crate) fn is_win_reserved_stem(s: &str) -> bool {
     let u = s.to_ascii_uppercase();
     matches!(u.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || ((u.starts_with("COM") || u.starts_with("LPT")) && u.len() == 4 && matches!(u.as_bytes()[3], b'1'..=b'9'))
@@ -440,6 +644,14 @@ pub fn voice_line(text: &str) -> Option<Vec<u8>> {
     let f = active()?.voice_file(text)?;
     if std::fs::metadata(&f).ok()?.len() > MAX_VOICE_BYTES { return None; }
     std::fs::read(f).ok()
+}
+
+/// TTS 配置钩子：把当前角色包的 `tts` 声线设置叠加到全局 TtsConfig 上（内置哈基米原样返回）
+pub fn effective_tts(base: crate::core::config::TtsConfig) -> crate::core::config::TtsConfig {
+    match active() {
+        Some(s) => s.apply_tts(base),
+        None => base,
+    }
 }
 
 /// 台词钩子
@@ -645,5 +857,62 @@ mod tests {
         // 类型不对 → 内置
         let d = crate::core::save::parse(r#"{"skin":5}"#).unwrap();
         assert_eq!(saved_id(&d.extra), BUILTIN_ID);
+    }
+
+    #[test]
+    fn states_match_all_faces_and_manifest_v1_tts() {
+        assert_eq!(STATES.len(), crate::types::Face::ALL.len());
+        for f in crate::types::Face::ALL {
+            assert!(STATES.contains(&f.stem()), "missing state in skin::STATES: {}", f.stem());
+        }
+        let d = tmp("v1tts");
+        write(&d.join("voice").join("ref.mp3"), b"ID3fake");
+        let spec = parse(r#"{
+            "formatVersion": 1,
+            "id": "mint_cat",
+            "name": "小薄荷",
+            "fallback": "builtin",
+            "sprites": { "idle": "idle.png", "wink": "wink.png", "sleepy": "sleepy.png" },
+            "tts": {
+                "mode": "clone",
+                "voice": "蜜桃",
+                "style": "清冷少女音",
+                "refAudio": "voice/ref.mp3",
+                "sovitsPrompt": "早安喵",
+                "sovitsUrl": "http://evil.example/tts"
+            }
+        }"#).unwrap();
+        assert_eq!(spec.format_version, Some(1));
+        assert_eq!(spec.manifest_id, "mint_cat");
+        assert!(spec.fallback_builtin);
+        assert!(spec.sprites.contains_key("wink") && spec.sprites.contains_key("sleepy"));
+        assert!(spec.warnings.iter().any(|w| w.contains("外部服务器地址")), "{:?}", spec.warnings);
+        let info = SkinInfo { id: "mint_cat".into(), dir: d.clone(), spec };
+        let eff = info.apply_tts(crate::core::config::TtsConfig::default());
+        assert_eq!(eff.voice, "蜜桃");
+        assert_eq!(eff.style, "清冷少女音");
+        assert!(eff.clone_ref.ends_with("ref.mp3"), "clone_ref={}", eff.clone_ref);
+        assert_eq!(eff.sovits_url, "http://127.0.0.1:9880", "sovitsUrl must never be overridden by skin");
+
+        // 路径穿越的 refAudio 必须被忽略
+        let bad_spec = parse(r#"{"tts":{"mode":"sovits","refAudio":"../secret.wav"}}"#).unwrap();
+        let bad_info = SkinInfo { id: "x".into(), dir: d.clone(), spec: bad_spec };
+        let eff2 = bad_info.apply_tts(crate::core::config::TtsConfig::default());
+        assert!(eff2.sovits_ref.is_empty());
+
+        // 高版本 formatVersion 只记 warning，不拒读
+        let future = parse(r#"{"formatVersion": 2, "name": "未来角色"}"#).unwrap();
+        assert_eq!(future.format_version_or_default(), 2);
+        assert!(future.warnings.iter().any(|w| w.contains("formatVersion 2")));
+
+        // safe_single_id 校验
+        assert_eq!(safe_single_id("小薄荷"), Some("小薄荷".into()));
+        assert_eq!(safe_single_id("hakimi"), None);
+        assert_eq!(safe_single_id("@open"), None);
+        assert_eq!(safe_single_id(".hidden"), None);
+        assert_eq!(safe_single_id("CON"), None);
+        assert_eq!(safe_single_id("a/b"), None);
+        assert_eq!(safe_single_id(".."), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -58,11 +58,26 @@ pub(crate) const WM_APP_MENU: u32 = WM_APP + 2;
 pub(crate) const WM_APP_SECOND: u32 = WM_APP + 3;
 const WM_APP_DPI: u32 = WM_APP + 4;
 const WM_APP_CLEAR_MIND: u32 = WM_APP + 5;
+const WM_APP_IMPORT_SKIN: u32 = WM_APP + 6;
 /// 自动化/自测用：PostMessage(hwnd, WM_APP+9, i, 0) 等于点了 DEBUG_MENU[i] 那个菜单项
 const WM_APP_DEBUG_MENU: u32 = WM_APP + 9;
-/// 10 = 打开设置窗口，11 = 打开聊天框
-const DEBUG_MENU: [&str; 12] =
-    ["feed", "feednow", "game", "climb", "weather", "checkin", "status", "walk", "pat", "dance:", "settings", "chat"];
+/// 10 = 打开设置窗口，11 = 打开聊天框，12 = 导入角色包(.zip)，13 = 切回内置哈基米
+const DEBUG_MENU: [&str; 14] = [
+    "feed",
+    "feednow",
+    "game",
+    "climb",
+    "weather",
+    "checkin",
+    "status",
+    "walk",
+    "pat",
+    "dance:",
+    "settings",
+    "chat",
+    "skin:@import",
+    "skin:hakimi",
+];
 /// 自测用：PostMessage(hwnd, WM_APP+10, 0, 0) = 在她身上弹出右键菜单（截图用）
 const WM_APP_DEBUG_POPUP: u32 = WM_APP + 10;
 const TIMER_ID: usize = 1;
@@ -881,9 +896,64 @@ fn after(a: MenuAction) {
         }
         // 「🎭 角色」→「打开皮肤文件夹」（不存在先建）
         MenuAction::Costume(c) if c == crate::core::skin::MENU_OPEN => open_path(&crate::core::skin::ensure_dir()),
+        // 「🎭 角色」→「导入角色包 (.zip)…」：推迟到 pump() 外弹系统文件选择框
+        MenuAction::Costume(c) if c == crate::core::skin::MENU_IMPORT => {
+            if let Some(h) = main_hwnd() {
+                unsafe { let _ = PostMessageW(Some(h), WM_APP_IMPORT_SKIN, WPARAM(0), LPARAM(0)); }
+            }
+        }
         _ => {}
     }
     menu::refresh();
+}
+
+/// 弹出 .zip 选择框（支持测试环境变量 `HAKIMI_IMPORT_ZIP_PATH` 免弹窗注入）
+fn pick_skin_zip(owner: Option<HWND>) -> Option<std::path::PathBuf> {
+    if let Ok(test_path) = std::env::var("HAKIMI_IMPORT_ZIP_PATH") {
+        let t = test_path.trim();
+        if !t.is_empty() {
+            return Some(std::path::PathBuf::from(t));
+        }
+    }
+    unsafe {
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+        use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+        use windows::Win32::UI::Shell::{
+            FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
+        };
+        let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let _ = dlg.SetTitle(w!("选择角色包压缩文件 (.zip)"));
+        let filters = [COMDLG_FILTERSPEC { pszName: w!("角色包 (.zip)"), pszSpec: w!("*.zip") }];
+        let _ = dlg.SetFileTypes(&filters);
+        if let Ok(opts) = dlg.GetOptions() {
+            let _ = dlg.SetOptions(opts | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM);
+        }
+        dlg.Show(owner).ok()?;
+        let item = dlg.GetResult().ok()?;
+        let pwstr = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path_str = pwstr.to_string().ok();
+        CoTaskMemFree(Some(pwstr.0 as *const _));
+        path_str.map(std::path::PathBuf::from)
+    }
+}
+
+/// 安全校验解压 `.zip` 角色包并立即切换激活，气泡弹出检查报告（失败则弹汗滴提示气泡）
+fn import_skin_zip_and_activate(path: &std::path::Path) {
+    match crate::core::skin_import::import_zip(path, &crate::core::skin::ensure_dir()) {
+        Ok(report) => {
+            let id = report.id.clone();
+            crate::core::skin_import::store_last_report(report);
+            let _ = crate::core::skin::rescan();
+            on_menu(MenuAction::Costume(format!("{}{id}", crate::core::skin::MENU_PREFIX)));
+            pump();
+            menu::refresh();
+        }
+        Err(err) => {
+            crate::core::log::log(&format!("skin import failed ({}): {err}", path.display()));
+            emit(AppEvent::RoastNote(format!("导入角色包失败喵：{err}")));
+            pump();
+        }
+    }
 }
 
 fn do_quit() {
@@ -1507,7 +1577,7 @@ fn create_main_window() -> Option<HWND> {
         if RegisterClassExW(&wc) == 0 {
             return None;
         }
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             sys::WINDOW_CLASS,
             w!("哈基米"),
@@ -1521,7 +1591,9 @@ fn create_main_window() -> Option<HWND> {
             Some(hinst),
             None,
         )
-        .ok()
+        .ok()?;
+        windows::Win32::UI::Shell::DragAcceptFiles(hwnd, true);
+        Some(hwnd)
     }
 }
 
@@ -1560,6 +1632,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if mind_menu::confirm_clear(main_hwnd()) {
                     on_menu(MenuAction::Mind(crate::types::MindAct::Clear));
                     pump();
+                }
+                LRESULT(0)
+            }
+            WM_APP_IMPORT_SKIN => {
+                if let Some(p) = pick_skin_zip(main_hwnd()) {
+                    import_skin_zip_and_activate(&p);
+                }
+                LRESULT(0)
+            }
+            WM_DROPFILES => {
+                use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
+                let hdrop = HDROP(wp.0 as *mut _);
+                let count = DragQueryFileW(hdrop, 0xffff_ffff, None);
+                let mut picked = None;
+                if count > 0 {
+                    let len = DragQueryFileW(hdrop, 0, None);
+                    if len > 0 && len < 4096 {
+                        let mut buf = vec![0u16; len as usize + 1];
+                        let got = DragQueryFileW(hdrop, 0, Some(&mut buf));
+                        if got > 0 {
+                            picked = Some(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..got as usize])));
+                        }
+                    }
+                }
+                DragFinish(hdrop);
+                if let Some(p) = picked {
+                    import_skin_zip_and_activate(&p);
                 }
                 LRESULT(0)
             }

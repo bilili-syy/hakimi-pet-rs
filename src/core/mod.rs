@@ -9,5 +9,6 @@ pub mod paths;
 pub mod save;
 pub mod session;
 pub mod skin;
+pub mod skin_import;
 pub mod stats;
 pub mod usage;

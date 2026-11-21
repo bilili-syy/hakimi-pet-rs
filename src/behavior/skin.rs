@@ -47,8 +47,8 @@ pub fn line_override(text: &str) -> Option<String> { skin::line_override(text, c
 impl Behavior {
     /// `Costume("skin:…")` 交到这里；不是皮肤动作返回 false，交还给原来的换装逻辑
     pub(super) fn on_skin_menu(&mut self, id: &str) -> bool {
-        if id == skin::MENU_OPEN {
-            // 平台层负责打开文件夹
+        if id == skin::MENU_OPEN || id == skin::MENU_IMPORT {
+            // 平台层在 after() 里负责打开文件夹或弹出 .zip 选择框
             return true;
         }
         if id == skin::MENU_RELOAD {
@@ -70,14 +70,27 @@ impl Behavior {
         };
         match switched {
             Ok(name) => {
+                // 切换角色后取消上一名角色尚未返回的聊天请求，避免气泡串角
+                if self.waiting {
+                    if self.io {
+                        crate::services::ai::cancel_current();
+                    }
+                    self.waiting = false;
+                    self.active_chat_req = 0;
+                    self.cmds.push(crate::types::WinCmd::ChatInput(crate::types::ChatInputCmd::Enable(true)));
+                }
                 skin::stamp(&mut self.stats.data.extra, target);
                 self.save();
                 self.call(format!("skin:{target}"));
-                let name = name.unwrap_or_else(|| "哈基米".into());
-                let line = skin::line_override("", Some("skin_on"))
-                    .unwrap_or_else(|| super::pick(SKIN_ON))
-                    .replace("{name}", &name);
-                self.react(St::Happy, 2500, Some(line));
+                if let Some(report) = crate::core::skin_import::take_last_report(target) {
+                    self.react(St::Happy, 4500, Some(report.summary_bubble()));
+                } else {
+                    let name = name.unwrap_or_else(|| "哈基米".into());
+                    let line = skin::line_override("", Some("skin_on"))
+                        .unwrap_or_else(|| super::pick(SKIN_ON))
+                        .replace("{name}", &name);
+                    self.react(St::Happy, 2500, Some(line));
+                }
             }
             Err(()) => self.say(SKIN_MISSING, 3000),
         }

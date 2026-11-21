@@ -65,6 +65,7 @@ pub fn refresh(popup_open: bool) {
                 let _ = m.sub.append(&MenuItem::new(format!("（{bad} 个角色包读不了，见 hakimi.log）"), false, None));
             }
             let _ = m.sub.append(&PredefinedMenuItem::separator());
+            let _ = m.sub.append(&MenuItem::with_id(skin::MENU_IMPORT, "📦 导入角色包 (.zip)…", true, None));
             let _ = m.sub.append(&MenuItem::with_id(skin::MENU_OPEN, "📂 打开皮肤文件夹", true, None));
             let _ = m.sub.append(&MenuItem::with_id(skin::MENU_RELOAD, "🔄 刷新皮肤列表", true, None));
         }
@@ -100,6 +101,7 @@ mod tests {
     fn ids() {
         assert_eq!(parse("skin:小薄荷"), Some(MenuAction::Costume("skin:小薄荷".into())));
         assert_eq!(parse("skin:hakimi"), Some(MenuAction::Costume("skin:hakimi".into())));
+        assert_eq!(parse(skin::MENU_IMPORT), Some(MenuAction::Costume(skin::MENU_IMPORT.into())));
         assert_eq!(parse(skin::MENU_OPEN), Some(MenuAction::Costume(skin::MENU_OPEN.into())));
         assert_eq!(parse(skin::MENU_RELOAD), Some(MenuAction::Costume(skin::MENU_RELOAD.into())));
         assert_eq!(parse("skin:"), None);

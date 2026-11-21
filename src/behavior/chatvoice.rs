@@ -148,7 +148,7 @@ impl Behavior {
         if !self.io {
             return self.fake_chat_voice;
         }
-        let t = crate::core::config::get().tts;
+        let t = crate::core::skin::effective_tts(crate::core::config::get().tts);
         t.enabled && t.chat_voice_reply && t.speak != "off" && crate::services::tts::online_ok(&t)
     }
 
@@ -179,7 +179,11 @@ impl Behavior {
     }
 
     fn cv_wait_ms(&self) -> u64 {
-        if self.io && crate::core::config::get().tts.mode == "sovits" { 65_000 } else { CV_WAIT_MS }
+        if self.io && crate::core::skin::effective_tts(crate::core::config::get().tts).mode == "sovits" {
+            65_000
+        } else {
+            CV_WAIT_MS
+        }
     }
 
     /// 给第 shown 段发合成请求，并挂一个超时

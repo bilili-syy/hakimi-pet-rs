@@ -118,12 +118,13 @@ pub fn chat_blocking_id(req_id: u64, user_text: &str, ctx: &ChatCtx) -> ChatRepl
     if is_cancelled(req_id) {
         return ChatReply { ok: false, need_key: false, text: String::new() };
     }
-    let (hist_gen, mut history) = {
+    let (hist_gen, skin_id, mut history) = {
         let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let g = HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst);
+        let sid = crate::core::skin::active_id();
         let mut h = load_history();
         h.push(json!({ "role": "user", "text": user_text, "t": now_ms() }));
-        (g, h)
+        (g, sid, h)
     };
     let start = history.len().saturating_sub(MAX_HISTORY);
     let system = persona(&c, ctx);
@@ -142,8 +143,11 @@ pub fn chat_blocking_id(req_id: u64, user_text: &str, ctx: &ChatCtx) -> ChatRepl
     match r {
         Ok(reply) => {
             let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // 主人按了 Esc 取消，或期间点了「忘记聊天记录」：这一轮不进历史
-            if HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst) == hist_gen && !is_cancelled(req_id) {
+            // 主人按了 Esc 取消、点了「忘记聊天记录」，或期间切换了另一个角色包：这一轮不写进新角色的历史
+            if HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst) == hist_gen
+                && crate::core::skin::active_id() == skin_id
+                && !is_cancelled(req_id)
+            {
                 if let Some(u) = history.last().cloned() {
                     append_log(&[u, json!({ "role": "model", "text": reply, "t": now_ms() })]);
                 }
@@ -222,9 +226,9 @@ pub fn roast_blocking_id(req_id: u64, png: &[u8], ctx: &ChatCtx) -> ChatReply {
     if is_cancelled(req_id) {
         return ChatReply { ok: false, need_key: false, text: String::new() };
     }
-    let hist_gen = {
+    let (hist_gen, skin_id) = {
         let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst)
+        (HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst), crate::core::skin::active_id())
     };
     let img = base64::engine::general_purpose::STANDARD.encode(png);
     let ask = [json!({ "role": "user", "text": ROAST_ASK, "image": img })];
@@ -235,7 +239,10 @@ pub fn roast_blocking_id(req_id: u64, png: &[u8], ctx: &ChatCtx) -> ChatReply {
     match r {
         Ok(reply) => {
             let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            if HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst) == hist_gen && !is_cancelled(req_id) {
+            if HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst) == hist_gen
+                && crate::core::skin::active_id() == skin_id
+                && !is_cancelled(req_id)
+            {
                 // 图不进历史，只记一句「给她看了屏幕」，下一句聊天她还接得上
                 let u = json!({ "role": "user", "text": "（给你看了一眼我的屏幕）", "t": now_ms() });
                 let a = json!({ "role": "model", "text": reply, "t": now_ms() });
@@ -264,8 +271,8 @@ pub fn roast_blocking_id(req_id: u64, png: &[u8], ctx: &ChatCtx) -> ChatReply {
 /// 完整聊天记录最大保留体积（约几万轮对话；超限自动截留后半段，防 UI 线程读取大文件卡顿）
 const MAX_CHAT_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
-/// 完整聊天记录（导出用；chat.json 只留最近 20 条给模型当上下文）：一行一条 JSON
-pub fn log_file() -> std::path::PathBuf { crate::core::paths::data_dir().join("chat-log.jsonl") }
+/// 完整聊天记录（导出用；chat.json 只留最近 20 条给模型当上下文）：按当前激活的角色目录隔离
+pub fn log_file() -> std::path::PathBuf { crate::core::paths::active_skin_data_dir().join("chat-log.jsonl") }
 
 fn append_log(items: &[Value]) {
     use std::io::Write;
@@ -324,7 +331,8 @@ pub fn load_log() -> Vec<Value> {
 
 /// 聊天记录 → Markdown。time(ms) 把时间戳变成「11-21 14:05」
 pub fn log_markdown(items: &[Value], title_time: &str, time: impl Fn(f64) -> String) -> String {
-    let mut out = format!("# 和哈基米的聊天记录\n\n导出于 {title_time}，共 {} 条\n", items.len());
+    let pet_name = crate::core::skin::active().map_or_else(|| "哈基米".to_string(), |s| s.display_name().to_string());
+    let mut out = format!("# 和{pet_name}的聊天记录\n\n导出于 {title_time}，共 {} 条\n", items.len());
     let mut last_day = String::new();
     for m in items {
         let t = m.get("t").and_then(Value::as_f64).map(&time).unwrap_or_default();
@@ -333,7 +341,7 @@ pub fn log_markdown(items: &[Value], title_time: &str, time: impl Fn(f64) -> Str
             out.push_str(&format!("\n## {day}\n"));
             last_day = day;
         }
-        let who = if is_user(m) { "你" } else { "哈基米" };
+        let who = if is_user(m) { "你" } else { pet_name.as_str() };
         let text = if is_user(m) {
             msg_text(m).to_string()
         } else {

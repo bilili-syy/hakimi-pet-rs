@@ -45,9 +45,18 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path).inspect_err(|_| { let _ = std::fs::remove_file(&tmp); })
 }
 
-/// 启动时清理上次异常退出遗留的孤儿 `.tmp` 文件（单实例锁之后调用）
+/// 启动时清理上次异常退出遗留的孤儿 `.tmp` 文件与皮肤导入临时目录（单实例锁之后调用）
 pub fn cleanup_stale_tmps() {
-    cleanup_tmps_in(&super::paths::data_dir());
+    let base = super::paths::data_dir();
+    cleanup_tmps_in(&base);
+    if let Ok(rd) = std::fs::read_dir(base.join("skins-data")) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                cleanup_tmps_in(&e.path());
+            }
+        }
+    }
+    super::skin_import::cleanup_staging(&super::skin::skins_dir());
 }
 
 fn cleanup_tmps_in(dir: &Path) {

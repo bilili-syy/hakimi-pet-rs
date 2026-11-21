@@ -366,6 +366,7 @@ impl Book {
 // ---------------------------------------------------------------- 全局存储
 
 struct Store {
+    path: PathBuf,
     book: Book,
     mtime: Option<std::time::SystemTime>,
     checked_at: std::time::Instant,
@@ -376,46 +377,74 @@ static CLEAR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 pub fn clear_gen() -> u64 { CLEAR_GEN.load(std::sync::atomic::Ordering::SeqCst) }
 
-pub fn file() -> PathBuf { super::paths::data_dir().join("memory.json") }
+pub fn file() -> PathBuf { super::paths::active_skin_data_dir().join("memory.json") }
 
-fn mtime() -> Option<std::time::SystemTime> { std::fs::metadata(file()).and_then(|m| m.modified()).ok() }
+fn mtime_of(p: &std::path::Path) -> Option<std::time::SystemTime> { std::fs::metadata(p).and_then(|m| m.modified()).ok() }
 
-fn read_file() -> Book {
-    let p = file();
-    let Ok(s) = std::fs::read_to_string(&p) else { return Book::default() };
+fn read_file_at(p: &std::path::Path) -> Book {
+    let Ok(s) = std::fs::read_to_string(p) else { return Book::default() };
     match Book::parse(&s) {
         Some(b) => b,
         None => {
             // 整个文件坏了：留个备份再从空的开始
             let mut bak = p.as_os_str().to_owned();
             bak.push(".broken");
-            let _ = std::fs::copy(&p, PathBuf::from(bak));
+            let _ = std::fs::copy(p, PathBuf::from(bak));
             super::log::log("memory.json unreadable, backed up to memory.json.broken");
             Book::default()
         }
     }
 }
 
-fn with<R>(f: impl FnOnce(&mut Store) -> R) -> R {
-    let mut g = STORE.lock().unwrap_or_else(|e| e.into_inner());
-    let s = g.get_or_insert_with(|| Store { book: read_file(), mtime: mtime(), checked_at: std::time::Instant::now() });
-    if s.checked_at.elapsed().as_secs() >= 5 {
-        s.checked_at = std::time::Instant::now();
-        let m = mtime();
-        if m != s.mtime {
-            s.book = read_file();
-            s.mtime = m;
+impl Store {
+    fn open(p: PathBuf) -> Self {
+        let book = read_file_at(&p);
+        let mtime = mtime_of(&p);
+        Self { path: p, book, mtime, checked_at: std::time::Instant::now() }
+    }
+
+    /// 切换角色后路径变化时自动重读对应角色的记忆本，并递增代数丢弃跨角色的后台提取
+    fn sync_path(&mut self, cur: PathBuf) {
+        if self.path != cur {
+            CLEAR_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.book = read_file_at(&cur);
+            self.mtime = mtime_of(&cur);
+            self.path = cur;
+            self.checked_at = std::time::Instant::now();
+        } else if self.checked_at.elapsed().as_secs() >= 5 {
+            self.checked_at = std::time::Instant::now();
+            let m = mtime_of(&self.path);
+            if m != self.mtime {
+                self.book = read_file_at(&self.path);
+                self.mtime = m;
+            }
         }
     }
-    f(s)
+}
+
+fn with<R>(f: impl FnOnce(&mut Store) -> R) -> R {
+    let mut g = STORE.lock().unwrap_or_else(|e| e.into_inner());
+    let cur = file();
+    match g.as_mut() {
+        Some(s) => {
+            s.sync_path(cur);
+            f(s)
+        }
+        None => {
+            let mut s = Store::open(cur);
+            let r = f(&mut s);
+            *g = Some(s);
+            r
+        }
+    }
 }
 
 fn save(s: &mut Store) {
     let json = s.book.to_json();
-    if let Err(e) = super::save::write_atomic(&file(), json.as_bytes()) {
+    if let Err(e) = super::save::write_atomic(&s.path, json.as_bytes()) {
         super::log::log(&format!("memory write failed {e}"));
     }
-    s.mtime = mtime();
+    s.mtime = mtime_of(&s.path);
 }
 
 /// 改数据，f 返回 (结果, 有没有变)；变了就写盘
@@ -607,5 +636,37 @@ mod tests {
         assert!(b.items.is_empty());
         assert_eq!(b.extracted_at, 1000);
         assert_eq!(b.recall(5).len(), 0);
+    }
+
+    #[test]
+    fn per_skin_store_isolates_memories_and_bumps_clear_gen() {
+        let root = std::env::temp_dir().join(format!("hakimi-mem-iso-{}-{}", std::process::id(), fastrand::u32(..)));
+        let _ = std::fs::remove_dir_all(&root);
+        let hakimi_mem = super::super::paths::skin_data_dir_in(&root, "hakimi").join("memory.json");
+        let mint_mem = super::super::paths::skin_data_dir_in(&root, "小薄荷").join("memory.json");
+        assert_eq!(hakimi_mem, root.join("memory.json"), "内置哈基米保持根目录兼容");
+        assert_eq!(mint_mem, root.join("skins-data").join("小薄荷").join("memory.json"));
+
+        let mut st = Store::open(hakimi_mem.clone());
+        st.book.merge(&[f(Kind::Like, "主人喜欢小鱼干")], at(1, 9), true);
+        save(&mut st);
+
+        let g0 = clear_gen();
+        st.sync_path(mint_mem.clone());
+        assert!(clear_gen() > g0, "切换角色应递增代数，阻止旧角色的后台记忆提取串入新角色");
+        assert!(st.book.items.is_empty(), "新角色初始记忆应为空");
+
+        st.book.merge(&[f(Kind::Like, "主人喜欢薄荷糖")], at(1, 10), true);
+        save(&mut st);
+
+        // 切回哈基米：各自记忆互不覆盖
+        st.sync_path(hakimi_mem);
+        assert_eq!(st.book.items.len(), 1);
+        assert!(st.book.items[0].text.contains("小鱼干"));
+
+        st.sync_path(mint_mem);
+        assert_eq!(st.book.items.len(), 1);
+        assert!(st.book.items[0].text.contains("薄荷糖"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

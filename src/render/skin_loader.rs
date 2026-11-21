@@ -69,8 +69,9 @@ pub fn load_fit(path: &Path, bw: u32, bh: u32, scale: f32) -> Option<Pixmap> {
     Some(out)
 }
 
-/// 这个表情用皮肤里的哪个状态图。瞬间帧（眨眼、走路两帧）没画就借待机图，免得一闪变回哈基米；
-/// 其它没画的状态返回 None，回退内置哈基米。
+/// 这个表情用皮肤里的哪个状态图：
+/// - 默认（`fallback_builtin = false`）：如果角色包提供了自己的 `idle`，任何没画的状态都回退到角色自己的 `idle`（避免做表情时突然闪回哈基米）；
+/// - 换色皮肤（`skin.json` 写 `"fallback": "builtin"`）或连 `idle` 都没提供：瞬间帧借 `idle`，其余回退内置哈基米。
 pub fn state_for(s: &SkinInfo, face: Face) -> Option<&'static str> {
     let stem = face.stem();
     let has = |st: &str| s.sprite_file(st).is_some();
@@ -79,6 +80,7 @@ pub fn state_for(s: &SkinInfo, face: Face) -> Option<&'static str> {
         Face::Blink => &["idle"],
         Face::Walk1 => &["walk2", "idle"],
         Face::Walk2 => &["walk1", "idle"],
+        _ if !s.spec.fallback_builtin => &["idle"],
         _ => &[],
     };
     alias.iter().copied().find(|a| has(a))
@@ -316,9 +318,15 @@ mod tests {
         assert!(k.ends_with("idle+blink"));
         // 走路帧也借待机
         assert_eq!(state_for(&s, Face::Walk2), Some("idle"));
-        // happy 的文件是坏的 / sleep 没写 → 回退内置
+        // happy 显式指向了损坏的图 → 解码失败返回 None；sleep 没写 → 默认回退到角色自己的 idle（不闪回哈基米）
         assert!(base_of(&mut c, &s, Face::Happy, 200, 293).is_none());
-        assert!(base_of(&mut c, &s, Face::Sleep, 200, 293).is_none());
+        assert_eq!(state_for(&s, Face::Sleep), Some("idle"));
+        let (ks, _) = base_of(&mut c, &s, Face::Sleep, 200, 293).unwrap();
+        assert!(ks.ends_with(":idle"));
+        // 若 skin.json 显式声明 "fallback": "builtin"（换色皮肤），没画的状态才回退内置哈基米
+        let mut s_builtin = s.clone();
+        s_builtin.spec.fallback_builtin = true;
+        assert!(base_of(&mut c, &s_builtin, Face::Sleep, 200, 293).is_none());
         // 叠加层同样对齐：上半不透明部分落在贴底的 100×100 区域的上半
         let o = overlay_of(&mut c, &s, "blink", 200, 293).unwrap();
         assert_eq!(alpha(&o, 100, 200), 255);
