@@ -47,6 +47,17 @@ pub fn costume_src(costume: &str, face: Face) -> String {
     format!("outfits/{costume}/{f}.png")
 }
 
+/// 抱着碗 / 小鱼干在胸前吃的姿势：围巾会盖住手和鱼，这几帧不画围巾
+pub fn outfit_hidden(id: &str, face: Face) -> bool {
+    id == "scarf" && matches!(face, Face::Eat)
+}
+
+/// 配件图：这套衣服有专门对齐过的版本（outfits/<costume>/<id>.png）就用它，否则用通用的（按原装卫衣画的）
+pub fn outfit_path(costume: &str, id: &str) -> String {
+    let own = format!("outfits/{costume}/{id}.png");
+    if !costume.is_empty() && crate::assets::get(&own).is_some() { own } else { format!("outfits/{id}.png") }
+}
+
 pub fn outfit_offset(face: Face) -> Option<(f32, f32)> {
     match face {
         Face::Sit => Some((0.0, 17.0)),
@@ -226,6 +237,16 @@ mod tests {
         let l = layers_for(Face::Shy, "", &[]);
         assert_eq!(l.base, "sprites/shy.png");
         assert!(!l.star && !l.tail);
+    }
+
+    #[test]
+    fn outfit_path_prefers_costume_fit() {
+        assert!(outfit_hidden("scarf", Face::Eat));
+        assert!(!outfit_hidden("glasses", Face::Eat));
+        assert!(!outfit_hidden("scarf", Face::Idle));
+        assert_eq!(outfit_path("sailor", "scarf"), "outfits/sailor/scarf.png");
+        assert_eq!(outfit_path("", "scarf"), "outfits/scarf.png");
+        assert_eq!(outfit_path("sailor", "santa"), "outfits/santa.png");
     }
 
     #[test]

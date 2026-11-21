@@ -425,7 +425,8 @@ impl Renderer {
         }
         if let Some((ox, oy)) = layers.outfit_offset {
             for id in &scene.outfits {
-                let path = format!("outfits/{id}.png");
+                if sprites::outfit_hidden(id, scene.face) { continue; }
+                let path = sprites::outfit_path(&scene.costume, id);
                 if let Some(o) = self.sprites.asset(&path, sw, sh) {
                     if let Some((x, y)) = snap {
                         let (dx, dy) = ((ox / 400.0 * sw as f32).round() as i32, (oy / 587.0 * sh as f32).round() as i32);
