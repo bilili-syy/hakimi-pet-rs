@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod ai;
 pub mod audio;
+pub mod coding_hooks;
 pub mod emotion;
 pub mod livebeat;
 pub mod memo_parse;

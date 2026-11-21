@@ -17,6 +17,10 @@ pub(super) fn ctl_color(hdc: HDC, ctl: HWND) -> LRESULT {
         ID_KEY_LINK | ID_TTS_LINK => LINK,
         ID_NOTE => GREY,
         ID_MEMO_MSG => if MEMO_MSG_ERR.with(|c| c.get()) { ERR_RED } else { OK_GREEN },
+        ID_CODING_STATUS => {
+            let v = CODING_STATUS_COLOR.with(|c| c.get());
+            if v > 0 { OK_GREEN } else if v < 0 { ERR_RED } else { GREY }
+        }
         ID_TEST_RESULT | ID_PLAY_RESULT => {
             let v = colors[if id == ID_TEST_RESULT { 0 } else { 1 }];
             if v > 0 { OK_GREEN } else if v < 0 { ERR_RED } else { GREY }

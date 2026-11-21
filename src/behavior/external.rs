@@ -5,6 +5,7 @@
 use super::fx::FxKind;
 use super::{Behavior, Shot, St, lines, pick};
 use crate::types::{ExtEvent, ExtKind, SpeakKind};
+use std::collections::BTreeMap;
 
 /// 忙的时候最多攒几条（同一来源只留最新一条）
 const MAX_PENDING: usize = 4;
@@ -12,10 +13,14 @@ const MAX_PENDING: usize = 4;
 const PENDING_TTL: u64 = 10 * 60_000;
 /// 气泡里 msg 最多显示多少字
 const SHOW_MSG: usize = 60;
+/// 同一编码助手距上次互动 ≥ 90 秒后完成，算作「长任务收工」，触发专属夸奖台词
+const LONG_TASK_MS: u64 = 90_000;
 
 #[derive(Debug, Default)]
 pub struct ExtUi {
     pending: Vec<(ExtEvent, u64)>,
+    /// 各来源最近一次事件时刻（用于识别长耗时任务完成）
+    last_source_ms: BTreeMap<String, u64>,
 }
 
 fn short(s: &str) -> String {
@@ -65,11 +70,20 @@ impl Behavior {
 
     fn ext_show(&mut self, e: ExtEvent) {
         let src = if e.source.is_empty() { "那边".to_string() } else { e.source.clone() };
-        let (st, pool, fx, n) = match e.kind {
-            ExtKind::Done => (St::Starry, Some(lines::EXT_DONE), FxKind::Spark, 6),
-            ExtKind::Error => (St::Scared, Some(lines::EXT_ERROR), FxKind::Sweat, 3),
-            ExtKind::Wait => (St::Confused, Some(lines::EXT_WAIT), FxKind::Question, 1),
-            ExtKind::Info => (St::Happy, None, FxKind::Note, 1),
+        let prev_ms = self.ext.last_source_ms.insert(src.clone(), self.now);
+        if self.ext.last_source_ms.len() > 32
+            && let Some(oldest_k) = self.ext.last_source_ms.iter().min_by_key(|(_, t)| *t).map(|(k, _)| k.clone())
+        {
+            self.ext.last_source_ms.remove(&oldest_k);
+        }
+        let long_run = e.kind == ExtKind::Done
+            && prev_ms.is_some_and(|t| self.now.saturating_sub(t) >= LONG_TASK_MS && self.now.saturating_sub(t) <= 2 * 3_600_000);
+        let (st, shot, pool, fx, n) = match e.kind {
+            ExtKind::Done if long_run => (St::Starry, Shot::Jump, Some(lines::EXT_DONE_LONG), FxKind::Spark, 10),
+            ExtKind::Done => (St::Starry, Shot::Jump, Some(lines::EXT_DONE), FxKind::Spark, 6),
+            ExtKind::Error => (St::Scared, Shot::Shake, Some(lines::EXT_ERROR), FxKind::Sweat, 3),
+            ExtKind::Wait => (St::Confused, Shot::Bounce, Some(lines::EXT_WAIT), FxKind::Question, 2),
+            ExtKind::Info => (St::Happy, Shot::Bounce, None, FxKind::Note, 1),
         };
         let line = pool.map(|p| pick(p).replace("{}", &src));
         let text = match (line, e.msg.is_empty()) {
@@ -79,12 +93,12 @@ impl Behavior {
             (None, true) => return,
         };
         if self.state == St::Sleep { self.set_state(St::Idle, None); }
-        self.play(Shot::Jump);
+        self.react(st, 3400, None);
+        self.play(shot);
         self.fx(fx, n);
-        self.react(st, 3200, None);
         // 只有固定台词才念；带了 msg 的只看不念
         let voice = pool.is_some() && e.msg.is_empty();
-        self.say_opts(&text, if e.msg.is_empty() { 3000 } else { 5500 }, voice, SpeakKind::Line);
+        self.say_opts(&text, if e.msg.is_empty() { 3400 } else { 5500 }, voice, SpeakKind::Line);
     }
 }
 
@@ -161,5 +175,28 @@ mod tests {
         tick(&mut b, 4000 + PENDING_TTL + 1);
         assert!(b.ext.pending.is_empty());
         assert_ne!(b.state, St::Starry);
+    }
+
+    #[test]
+    fn long_run_done_praises_and_error_shakes() {
+        let mut b = mk();
+        tick(&mut b, 3000);
+        b.set_state(St::Idle, None);
+        ev(&mut b, ext(ExtKind::Wait, "Claude Code", ""), 4000);
+        assert_eq!(b.shot.map(|s| s.0), Some(Shot::Bounce));
+        b.bubble = None;
+        b.set_state(St::Idle, None);
+        // 超过 90 秒后完成：触发长任务夸奖台词池 EXT_DONE_LONG
+        ev(&mut b, ext(ExtKind::Done, "Claude Code", ""), 4000 + LONG_TASK_MS + 5000);
+        assert_eq!(b.state, St::Starry);
+        let txt = &b.bubble.as_ref().unwrap().text;
+        assert!(
+            lines::EXT_DONE_LONG.iter().any(|tpl| &tpl.replace("{}", "Claude Code") == txt),
+            "expected EXT_DONE_LONG praise, got: {txt}"
+        );
+        b.bubble = None;
+        b.set_state(St::Idle, None);
+        ev(&mut b, ext(ExtKind::Error, "Codex", ""), 200_000);
+        assert_eq!(b.shot.map(|s| s.0), Some(Shot::Shake));
     }
 }

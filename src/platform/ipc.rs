@@ -40,14 +40,15 @@ fn clean(ev: ExtEvent) -> ExtEvent {
 }
 
 fn is_ipc_flag(s: &str) -> bool {
-    matches!(s, "--event" | "--source" | "--msg")
+    matches!(s, "--event" | "--source" | "--msg" | "--quiet")
         || s.starts_with("--event=")
         || s.starts_with("--source=")
         || s.starts_with("--msg=")
 }
 
-/// 解析命令行。没有 `--event`（含 `--event=...`）返回 None（正常启动宠物）；有但写错了返回 Some(Err)。
-pub fn parse_args(args: &[String]) -> Option<Result<ExtEvent, String>> {
+/// 解析命令行（完整版，额外返回是否带 `--quiet` 静默退出标记）。
+/// `--quiet` 用于 Claude Code / Codex 的回调 Hook：宠物没开时静默返回 0 避免刷终端报错，同时把 Codex 追加在末尾的 JSON 参数隔开不污染 `--source`。
+pub fn parse_args_ext(args: &[String]) -> Option<Result<(ExtEvent, bool), String>> {
     let tail = args.get(1..)?;
     let raw_kind = tail.iter().enumerate().find_map(|(i, a)| {
         if a == "--event" {
@@ -56,9 +57,10 @@ pub fn parse_args(args: &[String]) -> Option<Result<ExtEvent, String>> {
             a.strip_prefix("--event=")
         }
     })?;
-    let Some(kind) = kind_of(raw_kind) else {
-        return Some(Err("用法：--event done|error|wait|info [--source 名字] [--msg 内容]".into()));
+    let Some(mut kind) = kind_of(raw_kind) else {
+        return Some(Err("用法：--event done|error|wait|info [--source 名字] [--msg 内容] [--quiet]".into()));
     };
+    let quiet = tail.iter().any(|a| a == "--quiet");
     // 值支持 `--flag 值`（多词自动拼接，直到遇到下一个已知 IPC 开关）和 `--flag=值`（保留以 `--` 开头的消息正文）
     let val = |flag: &str| -> String {
         let eq = format!("{flag}=");
@@ -74,7 +76,21 @@ pub fn parse_args(args: &[String]) -> Option<Result<ExtEvent, String>> {
         }
         String::new()
     };
-    Some(Ok(clean(ExtEvent { kind, source: val("--source"), msg: val("--msg") })))
+    // 若 Codex 在 `--quiet` 后追加了 JSON 通知载荷且标记了 error，自动升级为出错反应
+    if let Some(qi) = tail.iter().position(|a| a == "--quiet")
+        && let Some(extra) = tail.get(qi + 1)
+        && extra.trim_start().starts_with('{')
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(extra)
+        && v.get("type").and_then(|t| t.as_str()).is_some_and(|t| t.contains("error"))
+    {
+        kind = ExtKind::Error;
+    }
+    Some(Ok((clean(ExtEvent { kind, source: val("--source"), msg: val("--msg") }), quiet)))
+}
+
+/// 解析命令行。没有 `--event`（含 `--event=...`）返回 None（正常启动宠物）；有但写错了返回 Some(Err)。
+pub fn parse_args(args: &[String]) -> Option<Result<ExtEvent, String>> {
+    parse_args_ext(args).map(|r| r.map(|(ev, _)| ev))
 }
 
 pub fn encode(ev: &ExtEvent) -> Vec<u8> {
@@ -161,6 +177,10 @@ mod tests {
         let ev = parse_args(&a(&["pet.exe", "--event=done", "--source=Claude Code", "--msg", "--release check passed"])).unwrap().unwrap();
         assert_eq!((ev.kind, ev.source.as_str(), ev.msg.as_str()), (ExtKind::Done, "Claude Code", "--release check passed"));
         assert!(parse_args(&a(&["pet.exe", "--event="])).unwrap().is_err());
+        // Codex notify 在 `--quiet` 后面追加的 JSON 参数不会污染 `--source`
+        let (ev, q) = parse_args_ext(&a(&["pet.exe", "--event", "done", "--source", "Codex", "--quiet", r#"{"type":"agent-turn-complete","turn-id":"1"}"#])).unwrap().unwrap();
+        assert!(q);
+        assert_eq!((ev.kind, ev.source.as_str(), ev.msg.as_str()), (ExtKind::Done, "Codex", ""));
     }
 
     #[test]

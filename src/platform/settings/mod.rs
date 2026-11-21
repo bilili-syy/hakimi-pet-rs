@@ -46,7 +46,7 @@ use paint::*;
 const CLASS: PCWSTR = w!("HakimiPetRsSettings");
 /// 客户区逻辑尺寸（96 DPI 下的像素）
 const W: f32 = 540.0;
-const H: f32 = 560.0;
+const H: f32 = 626.0;
 /// 后台结果回窗口
 const WM_RESULT: u32 = WM_APP + 20;
 /// 试听用的音频 token（行为层不认识它，AudioDone 会被忽略）
@@ -149,6 +149,8 @@ const ID_USAGE: i32 = 169;
 const ID_AUTOSTART: i32 = 150;
 const ID_FS_HIDE: i32 = 166;
 const ID_ROAST: i32 = 173;
+const ID_CODING_HOOK: i32 = 174;
+const ID_CODING_STATUS: i32 = 175;
 const ID_SCALE: i32 = 151;
 const ID_FPS: i32 = 164;
 const ID_BIRTHDAY: i32 = 165;
@@ -286,6 +288,8 @@ thread_local! {
     static RESULT_COLOR: Cell<[i8; 2]> = const { Cell::new([0, 0]) };
     /// 备忘录页提示文字是否为报错（⚠️ 开头标红，其余标绿）
     pub(super) static MEMO_MSG_ERR: Cell<bool> = const { Cell::new(false) };
+    /// 编码助手接入状态文字颜色：0 灰 / 1 绿 / -1 红
+    pub(super) static CODING_STATUS_COLOR: Cell<i8> = const { Cell::new(0) };
 }
 static HWND_ATOMIC: AtomicIsize = AtomicIsize::new(0);
 static GEN: AtomicU64 = AtomicU64::new(1);
@@ -882,6 +886,9 @@ impl Dlg {
         self.add(p, w!("STATIC"), &format!("当前版本 v{}", crate::services::update::CURRENT), SS_CENTERIMAGE, 0, ID_UPDATE_RESULT, [X0 + 182.0, 438.0, W - X0 - 198.0, 30.0]);
         // 看屏吐槽（默认关）：模型不能看图时灰掉，文字说明原因
         self.button(p, ID_ROAST, ROAST_ON, BS_AUTOCHECKBOX, [X0, 474.0, W - X0 - 16.0, 24.0]);
+        // 一键接入编码助手（Claude Code / Codex 通知回调，立即写配置并备份，随时可撤销）
+        self.button(p, ID_CODING_HOOK, "接入编码助手", 0, [X0, 504.0, 146.0, 30.0]);
+        self.add(p, w!("STATIC"), "", 0, 0, ID_CODING_STATUS, [X0 + 156.0, 504.0, W - X0 - 172.0, 34.0]);
 
         // ---------------- 备忘录（改动马上写进 memo.json，不用点「保存」）
         let p = 4;
@@ -956,6 +963,7 @@ impl Dlg {
         set_checked(self.c(ID_FS_HIDE), c.fullscreen_hide);
         set_checked(self.c(ID_ROAST), c.screen_roast);
         self.update_roast();
+        self.update_coding_hooks(None);
         combo_set(self.c(ID_SCALE), nearest_scale(c.scale));
         combo_set(self.c(ID_FPS), FPS.iter().position(|x| x.0 == crate::core::config::clamp_fps(c.fps)).unwrap_or(1));
         set_text(self.c(ID_CITY), &c.weather_city);
@@ -1011,6 +1019,24 @@ impl Dlg {
         set_text(h, text);
     }
 
+    fn update_coding_hooks(&self, err: Option<&str>) {
+        let st = crate::services::coding_hooks::status();
+        let installed = st.any_installed();
+        set_text(self.c(ID_CODING_HOOK), if installed { "撤销编码助手接入" } else { "接入编码助手" });
+        match err {
+            Some(e) => {
+                CODING_STATUS_COLOR.with(|c| c.set(-1));
+                set_text(self.c(ID_CODING_STATUS), &format!("⚠️ {e}"));
+            }
+            None => {
+                CODING_STATUS_COLOR.with(|c| c.set(if installed { 1 } else { 0 }));
+                set_text(self.c(ID_CODING_STATUS), &st.summary_text());
+            }
+        }
+        repaint(self.c(ID_CODING_HOOK));
+        repaint(self.c(ID_CODING_STATUS));
+    }
+
     fn update_volume_label(&self) {
         let v = send(self.c(ID_VOLUME), TBM_GETPOS, 0, 0);
         set_text(self.c(ID_VOLUME_LABEL), &format!("{v}%"));
@@ -1047,6 +1073,7 @@ impl Dlg {
         self.page = idx + 1;
         if self.page == 3 {
             self.update_roast();
+            self.update_coding_hooks(None);
         }
         send(self.c(ID_LIST), LB_SETCURSEL, idx as usize, 0);
         for c in &self.ctls {
@@ -1308,6 +1335,18 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
         }
         (ID_ROAST, 0) => {
             with(|d| d.update_roast());
+        }
+        (ID_CODING_HOOK, 0) => {
+            let currently_on = crate::services::coding_hooks::status().any_installed();
+            let res = if currently_on {
+                crate::services::coding_hooks::uninstall()
+            } else {
+                crate::services::coding_hooks::install()
+            };
+            with(|d| match res {
+                Ok(_) => d.update_coding_hooks(None),
+                Err(e) => d.update_coding_hooks(Some(&e)),
+            });
         }
         (ID_DATADIR, 0) => menu("datadir"),
         (ID_RAWFILE, 0) => menu("settings:file"),
