@@ -139,7 +139,7 @@ impl Stats {
         let mut s = saved.unwrap_or_default();
         // 离线补算：关掉期间按「睡着」的速率算，哈基米在你不在时会睡觉
         let last = if s.last_tick != 0.0 && !s.last_tick.is_nan() { s.last_tick } else { now };
-        let away = (now - last) / 60000.0;
+        let away = ((now - last) / 60000.0).max(0.0);
         let mins = away.min(OFFLINE_CAP_MIN);
         if mins > 1.0 {
             s.hunger = clamp(s.hunger + rate::HUNGER_SLEEP * mins);
@@ -155,7 +155,7 @@ impl Stats {
 
     pub fn tick_at(&mut self, sleeping: bool, now: f64) {
         let s = &mut self.data;
-        let mins = ((now - s.last_tick) / 60000.0).min(5.0);
+        let mins = ((now - s.last_tick) / 60000.0).clamp(0.0, 5.0);
         s.last_tick = now;
         s.hunger = clamp(s.hunger + if sleeping { rate::HUNGER_SLEEP } else { rate::HUNGER_AWAKE } * mins);
         s.energy = clamp(s.energy + if sleeping { rate::ENERGY_SLEEP } else { rate::ENERGY_AWAKE } * mins);
@@ -458,5 +458,19 @@ mod tests {
         assert_eq!(s.days_at(T0 + 86_399_999.0), 1);
         assert_eq!(s.days_at(T0 + 86_400_000.0), 2);
         assert_eq!(s.days_at(T0 + 10.5 * 86_400_000.0), 11);
+    }
+
+    #[test]
+    fn clock_backward_does_not_reverse_decay() {
+        let (s, away) = Stats::load_at(Some(data(60.0, 60.0, 60.0, 0.0)), T0 - 30.0 * MIN);
+        approx(away, 0.0);
+        approx(s.data.hunger, 60.0);
+        approx(s.data.energy, 60.0);
+        approx(s.data.mood, 60.0);
+        let (mut s, _) = Stats::load_at(Some(data(60.0, 60.0, 60.0, 0.0)), T0);
+        s.tick_at(false, T0 - 10.0 * MIN);
+        approx(s.data.hunger, 60.0);
+        approx(s.data.energy, 60.0);
+        approx(s.data.mood, 60.0);
     }
 }

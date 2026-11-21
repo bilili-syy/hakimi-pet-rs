@@ -127,6 +127,7 @@ impl Fx {
             out.push(FxSprite { shape: p.shape, x: p.x, y: p.y, size: p.size, xf, color: p.color });
         }
         for o in &self.orbits {
+            if now < o.start { continue; }
             for (i, color) in FX_COLORS[..3].iter().enumerate() {
                 // rotate(θ) translateX(44px) rotate(-θ)：绕自身中心转圈，字形本身不转
                 let t = (now - o.start + i as u64 * 330) % 1000;

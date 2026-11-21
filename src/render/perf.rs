@@ -16,6 +16,7 @@ pub struct Perf {
     drawn: u32,
     live: u32,
     renders: Vec<f32>,
+    gap_count: u32,
     gap_sum: f32,
     gap_max: f32,
     cpu0: u64,
@@ -24,7 +25,7 @@ pub struct Perf {
 impl Perf {
     pub fn new() -> Self {
         let on = std::env::var_os("HAKIMI_TRACE").is_some_and(|v| !v.is_empty() && v != "0");
-        Self { on, start: None, last_call: None, ticks: 0, drawn: 0, live: 0, renders: Vec::new(), gap_sum: 0.0, gap_max: 0.0, cpu0: 0 }
+        Self { on, start: None, last_call: None, ticks: 0, drawn: 0, live: 0, renders: Vec::new(), gap_count: 0, gap_sum: 0.0, gap_max: 0.0, cpu0: 0 }
     }
 
     /// 关着时返回 None，调用方就不计时
@@ -40,6 +41,7 @@ impl Perf {
         });
         if let Some(prev) = self.last_call {
             let g = (t0 - prev).as_secs_f32() * 1000.0;
+            self.gap_count += 1;
             self.gap_sum += g;
             self.gap_max = self.gap_max.max(g);
         }
@@ -58,7 +60,7 @@ impl Perf {
         }
     }
 
-    fn new_off() -> Self { Self { on: false, start: None, last_call: None, ticks: 0, drawn: 0, live: 0, renders: Vec::new(), gap_sum: 0.0, gap_max: 0.0, cpu0: 0 } }
+    fn new_off() -> Self { Self { on: false, start: None, last_call: None, ticks: 0, drawn: 0, live: 0, renders: Vec::new(), gap_count: 0, gap_sum: 0.0, gap_max: 0.0, cpu0: 0 } }
 
     /// 一行统计（纯函数部分，方便测试）
     fn report(&self, el: Duration, cpu_100ns: u64, scale: f32) -> String {
@@ -68,7 +70,7 @@ impl Perf {
         let avg = if r.is_empty() { 0.0 } else { r.iter().sum::<f32>() / r.len() as f32 };
         let p95 = r.get(((r.len() as f32 * 0.95) as usize).min(r.len().saturating_sub(1))).copied().unwrap_or(0.0);
         let max = r.last().copied().unwrap_or(0.0);
-        let gaps = self.ticks.saturating_sub(1).max(1) as f32;
+        let gaps = self.gap_count.max(1) as f32;
         let core = cpu_100ns as f32 / 1e4 / (s * 1000.0) * 100.0;
         let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         format!(
@@ -123,6 +125,7 @@ mod tests {
         p.ticks = 151;
         p.drawn = 150;
         p.renders = (0..150).map(|i| if i < 140 { 0.5 } else { 2.0 }).collect();
+        p.gap_count = 150;
         p.gap_sum = 150.0 * 33.0;
         p.gap_max = 47.0;
         p.live = 150;

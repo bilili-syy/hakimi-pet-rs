@@ -4,11 +4,45 @@ use super::*;
 impl Behavior {
     // ============================================================ 提醒 / 番茄钟 / 摸鱼
     pub(super) fn on_remind(&mut self, k: RemindKind) {
-        if self.chatting || self.waiting { return; }
+        if self.chatting || self.waiting || self.is_busy_for_interruption() || self.sense.quiet {
+            // 喝水/站立丢了无妨；下班提醒一天只有一次，全屏开会或忙碌时推迟到空闲/退全屏后再补说
+            if k == RemindKind::OffWork {
+                self.pending_off_work = Some(self.now + 2 * 3_600_000);
+                if !self.laters.iter().any(|l| l.1 == Later::OffWorkRetry) {
+                    self.later(5_000, Later::OffWorkRetry);
+                }
+            }
+            return;
+        }
         if self.state == St::Sleep && k != RemindKind::OffWork { return; }
+        if k == RemindKind::OffWork {
+            self.pending_off_work = None;
+            self.laters.retain(|l| l.1 != Later::OffWorkRetry);
+        }
         self.play(Shot::Bounce);
         let l = match k { RemindKind::Water => lines::WATER, RemindKind::StandUp => lines::STAND_UP, RemindKind::OffWork => lines::OFF_WORK };
         self.react(St::Happy, 2500, Some(pick(l)));
+    }
+
+    /// 检查是否有推迟的下班提醒可以补说；若刚刚说出返回 true
+    pub(super) fn flush_off_work(&mut self) -> bool {
+        let Some(deadline) = self.pending_off_work else { return false };
+        if self.now > deadline {
+            self.pending_off_work = None;
+            self.laters.retain(|l| l.1 != Later::OffWorkRetry);
+            return false;
+        }
+        if self.chatting || self.waiting || self.is_busy_for_interruption() || self.sense.quiet {
+            if !self.laters.iter().any(|l| l.1 == Later::OffWorkRetry) {
+                self.later(5_000, Later::OffWorkRetry);
+            }
+            return false;
+        }
+        self.pending_off_work = None;
+        self.laters.retain(|l| l.1 != Later::OffWorkRetry);
+        self.play(Shot::Bounce);
+        self.react(St::Happy, 2500, Some(pick(lines::OFF_WORK)));
+        true
     }
 
     pub(super) fn on_pomodoro(&mut self, p: PomodoroEv) {
@@ -35,7 +69,7 @@ impl Behavior {
     }
 
     pub(super) fn on_moyu(&mut self, ev: MoyuEv) {
-        if self.chatting || self.waiting { return; }
+        if self.chatting || self.waiting || self.is_busy_for_interruption() || self.sense.quiet { return; }
         match ev {
             MoyuEv::Back { .. } => {
                 self.play(Shot::Bounce);

@@ -9,7 +9,9 @@
 //! 解码后立刻缩放到当前 DPI 并裁成最小外接矩形，缓存几张小图，原图不留。
 use crate::types::Face;
 use std::rc::Rc;
-use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
+use tiny_skia::Pixmap;
+#[cfg(test)]
+use tiny_skia::{PixmapPaint, Transform};
 
 /// 活动时的帧间隔（≈60fps；原来 60ms≈16fps，呼吸/发梢摆动看着一顿一顿的。实测 12 核机器上整机 CPU 约 0.13%）。待机呼吸、口型都按这个节奏，眨眼那一下用 BLINK_FRAME_MS
 /// 运行时按 config::frame_ms()（设置里 30/60/120，默认 60）；这里是默认值，测试用
@@ -114,13 +116,29 @@ pub fn offset_at(l: &LiveView, u: f32, v: f32) -> (f32, f32) {
 }
 
 // ---------------------------------------------------------------- 扭曲（逐行重采样）
-/// 复用的扭曲缓冲（一张立绘大小）+ 列权重表 + 直接画进窗口时用的一行暂存
 #[derive(Default)]
-pub struct Warper {
+struct WarpSlot {
     buf: Option<Pixmap>,
     /// 列权重表对应的 (宽, 外扩)
     cols_key: (u32, u32),
     cols: Vec<(f32, f32)>,
+}
+
+impl WarpSlot {
+    fn ensure_cols(&mut self, w: u32, pad: u32) {
+        if self.cols_key != (w, pad) || self.cols.len() != w as usize {
+            let inner = (w as f32 - 2.0 * pad as f32).max(1.0);
+            self.cols = (0..w).map(|x| hair_cols((x as f32 + 0.5 - pad as f32) / inner)).collect();
+            self.cols_key = (w, pad);
+        }
+    }
+}
+
+/// 逐行扭曲器：分普通/外扩(光晕)两槽缓存，避免开光晕时每帧反复重建列权重表和 Pixmap
+#[derive(Default)]
+pub struct Warper {
+    plain: WarpSlot,
+    padded: WarpSlot,
     row: Vec<u8>,
 }
 
@@ -133,12 +151,8 @@ fn row_params(l: &LiveView, y: usize, h: usize, pad: u32, k: f32) -> (f32, f32, 
 }
 
 impl Warper {
-    fn ensure_cols(&mut self, w: u32, pad: u32) {
-        if self.cols_key != (w, pad) || self.cols.len() != w as usize {
-            let inner = (w as f32 - 2.0 * pad as f32).max(1.0);
-            self.cols = (0..w).map(|x| hair_cols((x as f32 + 0.5 - pad as f32) / inner)).collect();
-            self.cols_key = (w, pad);
-        }
+    fn slot(&mut self, pad: u32) -> &mut WarpSlot {
+        if pad == 0 { &mut self.plain } else { &mut self.padded }
     }
 
     /// 把 src 按 l 扭曲进内部缓冲。box_h = src 对应的逻辑高度（#pet 盒子 293）
@@ -147,18 +161,20 @@ impl Warper {
     /// 同 warp，但 src 四周比立绘多 pad 像素（光晕图）：扭曲场按里面那张立绘的位置算，光晕跟着身子一起动
     pub fn warp_padded(&mut self, src: &Pixmap, l: &LiveView, box_h: f32, pad: u32) -> Option<&Pixmap> {
         let (w, h) = (src.width(), src.height());
-        if self.buf.as_ref().is_none_or(|b| b.width() != w || b.height() != h) {
-            self.buf = Pixmap::new(w, h);
+        let slot = self.slot(pad);
+        if slot.buf.as_ref().is_none_or(|b| b.width() != w || b.height() != h) {
+            slot.buf = Pixmap::new(w, h);
         }
-        self.ensure_cols(w, pad);
+        slot.ensure_cols(w, pad);
         let k = (h as f32 - 2.0 * pad as f32) / box_h;
-        let dst = self.buf.as_mut()?;
+        let cols = &slot.cols;
+        let dst = slot.buf.as_mut()?;
         let stride = w as usize * 4;
         let (wu, hu) = (w as usize, h as usize);
         for (y, out) in dst.data_mut().chunks_exact_mut(stride).enumerate() {
-            warp_row(src.data(), out, wu, hu, &self.cols, y, row_params(l, y, hu, pad, k));
+            warp_row(src.data(), out, wu, hu, cols, y, row_params(l, y, hu, pad, k));
         }
-        self.buf.as_ref()
+        slot.buf.as_ref()
     }
 
     /// 快速路径：扭曲后直接 src-over 画进 dst 的整数像素位置 (x, y)，mirror = 水平镜像，opacity = 整体不透明度。
@@ -168,7 +184,8 @@ impl Warper {
         let a = (opacity.clamp(0.0, 1.0) * 256.0).round() as u32;
         if a == 0 { return; }
         let (w, h) = (src.width() as usize, src.height() as usize);
-        self.ensure_cols(w as u32, pad);
+        let slot = if pad == 0 { &mut self.plain } else { &mut self.padded };
+        slot.ensure_cols(w as u32, pad);
         self.row.resize(w * 4, 0);
         let k = (h as f32 - 2.0 * pad as f32) / box_h;
         let (dw, dh) = (dst.width() as i32, dst.height() as i32);
@@ -182,7 +199,7 @@ impl Warper {
             let row: &[u8] = if p == (0.0, 0.0, 0.0, 0.0) {
                 &src.data()[sy * stride..(sy + 1) * stride]
             } else {
-                warp_row(src.data(), &mut self.row, w, h, &self.cols, sy, p);
+                warp_row(src.data(), &mut self.row, w, h, &slot.cols, sy, p);
                 &self.row
             };
             let drow = &mut dd[dy as usize * dstride..(dy as usize + 1) * dstride];
@@ -195,9 +212,16 @@ impl Warper {
 /// 不透明/全透明像素走捷径
 pub fn blend_row(drow: &mut [u8], dw: i32, row: &[u8], x: i32, mirror: bool, a: u32) {
     let w = (row.len() / 4) as i32;
-    for i in 0..w {
+    let (i0, i1) = if mirror {
+        // 0 <= x + w - 1 - i < dw  <=>  x + w - dw <= i <= x + w - 1
+        ((x + w - dw).max(0), (x + w).min(w))
+    } else {
+        // 0 <= x + i < dw  <=>  -x <= i < dw - x
+        ((-x).max(0), (dw - x).min(w))
+    };
+    if i0 >= i1 { return; }
+    for i in i0..i1 {
         let dx = if mirror { x + w - 1 - i } else { x + i };
-        if dx < 0 || dx >= dw { continue; }
         let s = &row[i as usize * 4..i as usize * 4 + 4];
         if s[3] == 0 { continue; }
         let s = if a >= 256 { [s[0], s[1], s[2], s[3]] } else { [0, 1, 2, 3].map(|c| ((s[c] as u32 * a + 128) >> 8) as u8) };
@@ -226,6 +250,10 @@ fn warp_row(src: &[u8], out: &mut [u8], w: usize, h: usize, cols: &[(f32, f32)],
     let fy = sy - y0f;
     let y0 = y0f as isize;
     let (ra, rb) = (src_row(y0), src_row(y0 + 1));
+    if ra.is_empty() && rb.is_empty() {
+        out.fill(0);
+        return;
+    }
     let wy = (fy * 256.0 + 0.5) as u32;
     let horiz = hem != 0.0 || hl != 0.0 || hr != 0.0;
     if !horiz {
@@ -233,6 +261,7 @@ fn warp_row(src: &[u8], out: &mut [u8], w: usize, h: usize, cols: &[(f32, f32)],
         return;
     }
     let px = |r: &[u8], x: isize, c: usize| -> f32 { if r.is_empty() || x < 0 || x >= w as isize { 0.0 } else { r[x as usize * 4 + c] as f32 } };
+    let px_a = |r: &[u8], x: isize| -> u8 { if r.is_empty() || x < 0 || x >= w as isize { 0 } else { r[x as usize * 4 + 3] } };
     for x in 0..w {
         let (cl, cr) = cols[x];
         let dx = hem + hl * cl + hr * cr;
@@ -245,6 +274,10 @@ fn warp_row(src: &[u8], out: &mut [u8], w: usize, h: usize, cols: &[(f32, f32)],
         let x0f = sx.floor();
         let fx = sx - x0f;
         let x0 = x0f as isize;
+        if (px_a(ra, x0) | px_a(ra, x0 + 1) | px_a(rb, x0) | px_a(rb, x0 + 1)) == 0 {
+            o.fill(0);
+            continue;
+        }
         for (c, oc) in o.iter_mut().enumerate() {
             let top = px(ra, x0, c) + (px(ra, x0 + 1, c) - px(ra, x0, c)) * fx;
             let bot = px(rb, x0, c) + (px(rb, x0 + 1, c) - px(rb, x0, c)) * fx;
@@ -289,12 +322,11 @@ pub struct Overlays {
 pub enum Kind { Blink, Mouth }
 
 /// 实际画出来的那张立绘的名字（贴片按它找）：原装 walk1/walk2 的头和 idle 一样；换装按 sprites 的别名映射
-fn drawn_stem(face: Face, costume: &str) -> String {
+fn drawn_stem(face: Face, costume: &str) -> &'static str {
     if is_original(costume) {
-        return match face { Face::Walk1 | Face::Walk2 => "idle", f => f.stem() }.to_string();
+        return match face { Face::Walk1 | Face::Walk2 => "idle", f => f.stem() };
     }
-    let src = crate::render::sprites::costume_src(costume, face);
-    src.rsplit('/').next().unwrap_or("").trim_end_matches(".png").to_string()
+    crate::render::sprites::costume_face_stem(face)
 }
 
 /// 原装卫衣立绘（"" 或 "hoodie"）：贴片在 sprites/live/<立绘>_…，不带衣服前缀
@@ -309,8 +341,29 @@ pub fn builtin_path(face: Face, costume: &str, kind: Kind) -> Option<String> {
     crate::assets::get(&p).is_some().then_some(p)
 }
 
-/// 这个表情（在这套衣服下）有没有某种贴片
-pub fn available(face: Face, costume: &str, kind: Kind) -> bool { builtin_path(face, costume, kind).is_some() }
+/// 这个表情（在这套衣服下）有没有某种贴片（零堆分配热路径）
+pub fn available(face: Face, costume: &str, kind: Kind) -> bool {
+    let k = match kind { Kind::Blink => "blink", Kind::Mouth => "mouthOpen" };
+    let stem = drawn_stem(face, costume);
+    let mut buf = [0u8; 96];
+    let mut len = 0usize;
+    let mut push = |s: &str| -> bool {
+        let b = s.as_bytes();
+        if len + b.len() > buf.len() { return false; }
+        buf[len..len + b.len()].copy_from_slice(b);
+        len += b.len();
+        true
+    };
+    let ok = if is_original(costume) {
+        push("sprites/live/") && push(stem) && push("_") && push(k) && push(".png")
+    } else {
+        push("sprites/live/") && push(costume) && push("_") && push(stem) && push("_") && push(k) && push(".png")
+    };
+    if !ok {
+        return builtin_path(face, costume, kind).is_some();
+    }
+    std::str::from_utf8(&buf[..len]).is_ok_and(|p| crate::assets::get(p).is_some())
+}
 
 /// 取一个表情的贴片（解码，未缩放）。唯一入口：皮肤包以后在这里按皮肤读文件
 pub fn overlays_for(face: Face, costume: &str) -> Overlays {
@@ -365,29 +418,9 @@ fn patch(src: Pixmap, w: u32, h: u32) -> Option<Patch> {
     Some(Patch { pm, x: x0 as i32, y: y0 as i32 })
 }
 
-/// 和 sprites::load_scaled 同样的思路：先 2× 盒式降采样，再双三次
-fn scale_to(mut src: Pixmap, w: u32, h: u32) -> Option<Pixmap> {
-    while src.width() >= w * 2 && src.height() >= h * 2 {
-        let (hw, hh) = (src.width() / 2, src.height() / 2);
-        let mut dst = Pixmap::new(hw.max(1), hh.max(1))?;
-        let sw = src.width() as usize;
-        let s = src.data();
-        let d = dst.data_mut();
-        for y in 0..hh as usize {
-            for x in 0..hw as usize {
-                for c in 0..4 {
-                    let i = |xx: usize, yy: usize| s[(yy * sw + xx) * 4 + c] as u32;
-                    let v = i(2 * x, 2 * y) + i(2 * x + 1, 2 * y) + i(2 * x, 2 * y + 1) + i(2 * x + 1, 2 * y + 1);
-                    d[(y * hw as usize + x) * 4 + c] = ((v + 2) / 4) as u8;
-                }
-            }
-        }
-        src = dst;
-    }
-    let mut dst = Pixmap::new(w.max(1), h.max(1))?;
-    let t = Transform::from_scale(w as f32 / src.width() as f32, h as f32 / src.height() as f32);
-    dst.draw_pixmap(0, 0, src.as_ref(), &PixmapPaint { quality: FilterQuality::Bicubic, ..Default::default() }, t, None);
-    Some(dst)
+/// 复用 sprites::scale_pixmap（先 2× 盒式降采样，再双三次；已达目标尺寸时零拷贝）
+fn scale_to(src: Pixmap, w: u32, h: u32) -> Option<Pixmap> {
+    crate::render::sprites::scale_pixmap(src, w, h)
 }
 
 /// (表情, 衣服, 尺寸)
@@ -469,9 +502,13 @@ impl BlinkSched {
     /// 打断（换成闭眼表情、被拎起来……）
     pub fn cancel(&mut self) { self.starts = [None; 2]; }
 
-    /// now 时刻的闭眼程度
+    /// now 时刻的闭眼程度（先做整数差再转 f32，避免运行 >4.6h 后 f32 精度丢失）
     pub fn amount(&self, now: u64) -> f32 {
-        self.starts.iter().flatten().map(|&s| blink_curve(now as f32 - s as f32)).fold(0.0, f32::max)
+        self.starts
+            .iter()
+            .flatten()
+            .map(|&s| if now < s { 0.0 } else { blink_curve((now - s) as f32) })
+            .fold(0.0, f32::max)
     }
 
     /// 还在眨（要高帧率）
@@ -504,8 +541,11 @@ impl MouthEnv {
     const RELEASE_MS: f32 = 90.0;
 
     pub fn step(&mut self, target: f32, dt_ms: f32) -> f32 {
+        if !self.value.is_finite() { self.value = 0.0; }
+        let target = if target.is_finite() { target.clamp(0.0, 1.0) } else { 0.0 };
+        let dt_ms = if dt_ms.is_finite() { dt_ms.max(0.0) } else { 0.0 };
         let tau = if target > self.value { Self::ATTACK_MS } else { Self::RELEASE_MS };
-        let a = 1.0 - (-dt_ms.max(0.0) / tau).exp();
+        let a = 1.0 - (-dt_ms / tau).exp();
         self.value += (target - self.value) * a;
         if self.value < 0.01 { self.value = 0.0; }
         self.value
@@ -851,7 +891,7 @@ mod tests {
         let mut v: Vec<(Face, String)> = Vec::new();
         for f in Face::ALL {
             let s = drawn_stem(f, costume);
-            if !v.iter().any(|(_, x)| *x == s) { v.push((f, s)); }
+            if !v.iter().any(|(_, x)| *x == s) { v.push((f, s.to_string())); }
         }
         v
     }
@@ -905,5 +945,23 @@ mod tests {
             let b = Pixmap::decode_png(crate::assets::get(base).unwrap()).unwrap();
             assert_eq!((a.width(), a.height()), (b.width(), b.height()), "{p} vs {base}");
         }
+    }
+
+    #[test]
+    fn blink_precision_at_high_uptime_and_mouth_nan_guard() {
+        // 连续运行 >10 天后，u64 差值再转 f32 依然精确（不因 f32 24-bit 尾数丢失眨眼动画）
+        let base: u64 = 10 * 86_400_000;
+        let mut s = BlinkSched::new(base, 0.5);
+        s.fire(base, true, 0.5, 0.9);
+        assert!(s.amount(base + 85) > 0.9);
+        assert_eq!(s.amount(base + 250), 0.0);
+        // MouthEnv 收到 NaN/Inf 时自愈为有限值
+        let mut m = MouthEnv::default();
+        assert_eq!(m.step(f32::NAN, 16.0), 0.0);
+        assert!(m.step(0.8, f32::NAN).is_finite());
+        assert!(m.step(0.8, 35.0) > 0.4);
+        // scale_pixmap 宽高为 0 时安全返回 None
+        assert!(crate::render::sprites::scale_pixmap(test_img(10, 10), 0, 10).is_none());
+        assert!(crate::render::sprites::scale_pixmap(test_img(10, 10), 10, 0).is_none());
     }
 }

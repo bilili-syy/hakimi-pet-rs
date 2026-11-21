@@ -157,8 +157,65 @@ pub fn xf_matrix(xf: &Xf, ox: f32, oy: f32) -> Transform {
         .pre_translate(-ox, -oy)
 }
 
+#[derive(PartialEq, Eq)]
+struct BubbleTextKey {
+    scale_bits: u32,
+    text: String,
+}
+
+#[derive(PartialEq, Eq)]
+struct BubbleKey {
+    scale_bits: u32,
+    text: String,
+    scroll_px: i32,
+}
+
+#[derive(PartialEq, Eq)]
+struct StatusKey {
+    scale_bits: u32,
+    days: u32,
+    hunger: i64,
+    mood: i64,
+    energy: i64,
+    affection_tenth: i64,
+    level: String,
+    moyu: Option<u32>,
+    checkin: Option<(u32, u32)>,
+    weather: Option<String>,
+}
+
+impl StatusKey {
+    fn from(st: &StatusView, scale: f32) -> Self {
+        Self {
+            scale_bits: scale.to_bits(),
+            days: st.days,
+            hunger: st.hunger.round().clamp(0.0, 100.0) as i64,
+            mood: st.mood.round().clamp(0.0, 100.0) as i64,
+            energy: st.energy.round().clamp(0.0, 100.0) as i64,
+            affection_tenth: (st.affection * 10.0).round() as i64,
+            level: st.level.clone(),
+            moyu: st.moyu,
+            checkin: st.checkin,
+            weather: st.weather.clone(),
+        }
+    }
+
+    fn matches(&self, st: &StatusView, scale: f32) -> bool {
+        self.scale_bits == scale.to_bits()
+            && self.days == st.days
+            && self.hunger == st.hunger.round().clamp(0.0, 100.0) as i64
+            && self.mood == st.mood.round().clamp(0.0, 100.0) as i64
+            && self.energy == st.energy.round().clamp(0.0, 100.0) as i64
+            && self.affection_tenth == (st.affection * 10.0).round() as i64
+            && self.level == st.level
+            && self.moyu == st.moyu
+            && self.checkin == st.checkin
+            && self.weather == st.weather
+    }
+}
+
 struct BubbleText {
-    key: String,
+    key: BubbleTextKey,
     lines: Vec<(Option<text::Coverage>, f32)>,
     cell: f32,
 }
@@ -166,8 +223,8 @@ struct BubbleText {
 /// (资源路径, 尺寸, 裁好的图, 在缩放图里的 x, y)
 type Crop = (&'static str, (u32, u32), Rc<Pixmap>, f32, f32);
 
-struct Layer {
-    key: String,
+struct Layer<K> {
+    key: K,
     pm: Pixmap,
     /// 设备像素位置
     x: i32,
@@ -175,11 +232,16 @@ struct Layer {
     rect: Rect,
 }
 
+fn clamp_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.1 { scale.min(8.0) } else { 1.0 }
+}
+
 pub struct Renderer {
     pm: Option<Pixmap>,
     frame: Frame,
     last: Option<(Scene, f32)>,
     sprites: sprites::SpriteCache,
+    skin: skin_loader::SkinCache,
     warper: live::Warper,
     patches: live::PatchCache,
     /// HAKIMI_TRACE=1 时的帧耗时/帧率/CPU 统计
@@ -187,9 +249,9 @@ pub struct Renderer {
     /// 尾巴/星星图层裁到不透明部分（整张画布大多是透明的，画小图省一大半像素）
     crops: Vec<Crop>,
     text: text::TextEngine,
-    bubble: Option<Layer>,
+    bubble: Option<Layer<BubbleKey>>,
     bubble_text: Option<BubbleText>,
-    status: Option<Layer>,
+    status: Option<Layer<StatusKey>>,
     glyphs: Vec<((char, u32), Rc<text::Coverage>)>,
     pub bubble_rect: Option<Rect>,
     pub status_rect: Option<Rect>,
@@ -208,6 +270,7 @@ impl Renderer {
             frame: Frame { w: 0, h: 0, bgra: Vec::new() },
             last: None,
             sprites: sprites::SpriteCache::new(12),
+            skin: skin_loader::SkinCache::default(),
             warper: live::Warper::default(),
             patches: live::PatchCache::default(),
             perf: perf::Perf::new(),
@@ -238,9 +301,9 @@ impl Renderer {
     }
 
     fn update_inner(&mut self, scene: &Scene, scale: f32) -> bool {
-        let scale = if scale.is_finite() && scale > 0.1 { scale } else { 1.0 };
+        let scale = clamp_scale(scale);
         // 换了角色包：旧皮肤的图已释放，这一帧必须重画
-        if skin_loader::sync(&mut self.sprites) { self.last = None; }
+        if self.skin.sync(&mut self.sprites) { self.last = None; }
         if let Some((s, sc)) = &self.last
             && s == scene
             && *sc == scale
@@ -248,7 +311,13 @@ impl Renderer {
             return false;
         }
         self.draw(scene, scale);
-        self.last = Some((scene.clone(), scale));
+        match &mut self.last {
+            Some((s, sc)) => {
+                s.clone_from(scene);
+                *sc = scale;
+            }
+            None => self.last = Some((scene.clone(), scale)),
+        }
         let Some(pm) = self.pm.as_ref() else { return false };
         let (w, h) = (pm.width(), pm.height());
         self.frame.w = w;
@@ -267,6 +336,8 @@ impl Renderer {
 
     /// 只画到内部 Pixmap（测试用）
     pub fn draw(&mut self, scene: &Scene, scale: f32) {
+        let scale = clamp_scale(scale);
+        self.skin.sync(&mut self.sprites);
         let w = (WIN_W as f32 * scale).round() as u32;
         let h = (WIN_H as f32 * scale).round() as u32;
         if self.pm.as_ref().is_none_or(|p| p.width() != w || p.height() != h) {
@@ -326,7 +397,7 @@ impl Renderer {
 
         let layers = sprites::layers_for(scene.face, &scene.costume, &scene.outfits);
         // 角色包：当前皮肤有这个表情就用它（不画哈基米专属的尾巴/星星/配件），没有就回退内置
-        let skin = skin_loader::base(&mut self.sprites, scene.face, sw, sh);
+        let skin = self.skin.base(&mut self.sprites, scene.face, sw, sh);
         let layers = match &skin { Some((k, _)) => skin_loader::strip_layers(layers, k), None => layers };
         let skinned = skin.is_some();
         let base = skin.map(|s| s.1).or_else(|| self.sprites.asset(&layers.base, sw, sh));
@@ -340,7 +411,7 @@ impl Renderer {
                     Some(g)
                 });
                 if let Some(g) = glow {
-                    let pad = ((g.width() - base.width()) / 2) as i32;
+                    let pad = (g.width().saturating_sub(base.width()) / 2) as i32;
                     // 光晕跟着呼吸扭曲一起动（以前是静止的一圈，身子起伏时会露馅）
                     match snap {
                         Some((x, y)) => self.warper.warp_blit(&g, &scene.live, PET_H, pad as u32, pm, x - pad, y - pad, mirror, 1.0),
@@ -387,7 +458,7 @@ impl Renderer {
                 // 角色包：用包里和底图同尺寸的 blink / mouthOpen 叠加层，不盖哈基米的贴片
                 let head = body.pre_translate(0.0, -live::row_lift(lv, live::FACE_V));
                 for (name, a) in [("blink", lv.blink), ("mouthOpen", lv.mouth)] {
-                    if a > 0.003 && let Some(o) = skin_loader::overlay(&mut self.sprites, name, sw, sh) {
+                    if a > 0.003 && let Some(o) = self.skin.overlay(&mut self.sprites, name, sw, sh) {
                         let pp = PixmapPaint { opacity: a.min(1.0), ..paint };
                         pm.draw_pixmap(0, 0, o.as_ref().as_ref(), &pp, head.pre_concat(to_box(&o)), None);
                     }
@@ -503,11 +574,45 @@ impl Renderer {
 
     // ------------------------------------------------------------ 气泡
     fn draw_bubble(&mut self, pm: &mut Pixmap, scene: &Scene, scale: f32) {
-        let Some(b) = &scene.bubble else { self.bubble_rect = None; self.bubble_overflow = false; return };
-        if b.opacity <= 0.003 || b.text.is_empty() { self.bubble_rect = None; self.bubble_overflow = false; return; }
-        let key = format!("{}|{}|{:.3}", scale, b.text, b.scroll);
-        if self.bubble.as_ref().is_none_or(|l| l.key != key) {
-            self.bubble = self.build_bubble(&b.text, b.scroll, scale).map(|(pm, rect)| Layer { key, pm, x: (8.0 * scale).round() as i32, y: 0, rect });
+        let Some(b) = &scene.bubble else {
+            self.bubble_rect = None;
+            self.bubble_overflow = false;
+            self.bubble = None;
+            self.bubble_text = None;
+            return;
+        };
+        if b.opacity <= 0.003 || b.text.is_empty() {
+            self.bubble_rect = None;
+            self.bubble_overflow = false;
+            self.bubble = None;
+            self.bubble_text = None;
+            return;
+        }
+        let s = scale;
+        let px = 14.0 * s;
+        let lh = 14.0 * 1.35 * s;
+        let content_w = 200.0 * s;
+        let sbits = s.to_bits();
+        if self.bubble_text.as_ref().is_none_or(|t| t.key.scale_bits != sbits || t.key.text != b.text) {
+            let lines = self.text.wrap(&b.text, content_w, px, false);
+            let cell = self.text.cell_height(px, false);
+            let mut out = Vec::new();
+            for line in &lines {
+                let lw = self.text.text_width(line, px, false);
+                out.push((self.text.raster(line, px, false), 12.0 * s + (content_w - lw) / 2.0));
+            }
+            self.bubble_text = Some(BubbleText { key: BubbleTextKey { scale_bits: sbits, text: b.text.clone() }, lines: out, cell });
+        }
+        let Some(bt) = self.bubble_text.as_ref() else { return };
+        let full_h = bt.lines.len() as f32 * lh;
+        let content_h = full_h.min(128.0 * s);
+        self.bubble_overflow = full_h > content_h + 0.5;
+        let scroll_px = (b.scroll.clamp(0.0, 1.0) * (full_h - content_h).max(0.0)).round() as i32;
+        let need_rebuild = self.bubble.as_ref().is_none_or(|l| l.key.scale_bits != sbits || l.key.scroll_px != scroll_px || l.key.text != b.text);
+        if need_rebuild {
+            let key = BubbleKey { scale_bits: sbits, text: b.text.clone(), scroll_px };
+            self.bubble = self.build_bubble_from_cache(scroll_px as f32, full_h, content_h, lh, s)
+                .map(|(pm, rect)| Layer { key, pm, x: (8.0 * s).round() as i32, y: 0, rect });
         }
         if let Some(l) = &self.bubble {
             let p = PixmapPaint { opacity: b.opacity, ..Default::default() };
@@ -517,31 +622,13 @@ impl Renderer {
     }
 
     /// 气泡：left/right 8px、border 2、padding 6/10 → 内容宽 200；14px 行高 1.35；内容最多 128 高
-    fn build_bubble(&mut self, text: &str, scroll: f32, s: f32) -> Option<(Pixmap, Rect)> {
-        let px = 14.0 * s;
-        let lh = 14.0 * 1.35 * s;
-        let content_w = 200.0 * s;
-        let tkey = format!("{s}|{text}");
-        if self.bubble_text.as_ref().is_none_or(|t| t.key != tkey) {
-            let lines = self.text.wrap(text, content_w, px, false);
-            let cell = self.text.cell_height(px, false);
-            let mut out = Vec::new();
-            for line in &lines {
-                let lw = self.text.text_width(line, px, false);
-                out.push((self.text.raster(line, px, false), 12.0 * s + (content_w - lw) / 2.0));
-            }
-            self.bubble_text = Some(BubbleText { key: tkey, lines: out, cell });
-        }
-        let bt = self.bubble_text.take()?;
-        let full_h = bt.lines.len() as f32 * lh;
-        let content_h = full_h.min(128.0 * s);
-        self.bubble_overflow = full_h > content_h + 0.5;
+    fn build_bubble_from_cache(&self, scroll_px: f32, _full_h: f32, content_h: f32, lh: f32, s: f32) -> Option<(Pixmap, Rect)> {
+        let bt = self.bubble_text.as_ref()?;
         let box_w = 224.0 * s;
         let box_h = content_h + 16.0 * s;
         let mut pm = Pixmap::new(box_w.ceil() as u32 + 1, (box_h + 6.0 * s).ceil() as u32 + 1)?;
         draw_card(&mut pm, box_w, box_h, s, 1.0);
-        let scroll_px = (scroll.clamp(0.0, 1.0) * (full_h - content_h).max(0.0)).round();
-        let (top, bottom) = ((8.0 * s) as i32, (8.0 * s + content_h).round() as i32);
+        let (top, bottom) = ((8.0 * s).round() as i32, (8.0 * s + content_h).round() as i32);
         for (i, (cov, x)) in bt.lines.iter().enumerate() {
             let y = 8.0 * s + i as f32 * lh - scroll_px;
             if y + lh < top as f32 || y > bottom as f32 { continue; }
@@ -550,16 +637,23 @@ impl Renderer {
                 text::blit(&mut pm, c, x.round() as i32, (y + (lh - bt.cell) / 2.0).round() as i32, C_TEXT, 1.0, clip);
             }
         }
-        self.bubble_text = Some(bt);
         Some((pm, Rect { x: 8.0, y: 0.0, w: 224.0, h: box_h / s }))
     }
 
     // ------------------------------------------------------------ 状态卡
     fn draw_status(&mut self, pm: &mut Pixmap, scene: &Scene, scale: f32) {
-        let Some(st) = &scene.status else { self.status_rect = None; return };
-        if st.opacity <= 0.003 { self.status_rect = None; return; }
-        let key = format!("{scale}|{st:?}").replace(&format!("opacity: {:?}", st.opacity), "");
-        if self.status.as_ref().is_none_or(|l| l.key != key) {
+        let Some(st) = &scene.status else {
+            self.status_rect = None;
+            self.status = None;
+            return;
+        };
+        if st.opacity <= 0.003 {
+            self.status_rect = None;
+            self.status = None;
+            return;
+        }
+        if self.status.as_ref().is_none_or(|l| !l.key.matches(st, scale)) {
+            let key = StatusKey::from(st, scale);
             self.status = self.build_status(st, scale).map(|(pm, rect)| Layer { key, pm, x: (14.0 * scale).round() as i32, y: (46.0 * scale).round() as i32, rect });
         }
         if let Some(l) = &self.status {
@@ -596,16 +690,21 @@ impl Renderer {
             let by = y + (lh - 8.0 * s) / 2.0;
             let id = Transform::identity();
             shapes::fill_rrect(&mut pm, bx, by, bw, 8.0 * s, 4.0 * s, 0xf1e6d6, 1.0, id);
-            let fw = bw * (v.round().clamp(0.0, 100.0) / 100.0);
+            let clamped = v.round().clamp(0.0, 100.0);
+            let fw = bw * (clamped / 100.0);
             if fw > 0.5 { shapes::fill_rrect(&mut pm, bx, by, fw, 8.0 * s, 4.0 * s, color, 1.0, id); }
-            let n = format!("{}", v.round() as i64);
+            let n = format!("{}", clamped as i64);
             let nw = self.text.text_width(&n, px, false);
             self.text_at(&mut pm, &n, x0 + cw - nw, y, lh, px, false, C_TEXT);
             y += lh + 3.0 * s;
         }
         self.text_at(&mut pm, "亲密", x0, y, lh, px, false, C_TEXT);
         self.text_at(&mut pm, &st.level, x0 + 34.0 * s, y, lh, px, true, C_BLUE);
-        let n = format!("{}", st.affection);
+        let n = if (st.affection - st.affection.round()).abs() < 1e-3 {
+            format!("{}", st.affection.round() as i64)
+        } else {
+            format!("{:.1}", st.affection)
+        };
         let nw = self.text.text_width(&n, px, false);
         self.text_at(&mut pm, &n, x0 + cw - nw, y, lh, px, false, C_TEXT);
         y += lh + 3.0 * s;

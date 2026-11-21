@@ -89,7 +89,7 @@ impl Chat {
                 None,
             )
             .ok()?;
-            let edit = CreateWindowExW(
+            let Some(edit) = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("EDIT"),
                 PCWSTR::null(),
@@ -103,7 +103,10 @@ impl Chat {
                 Some(instance),
                 None,
             )
-            .ok()?;
+            .ok() else {
+                let _ = DestroyWindow(host);
+                return None;
+            };
             let _ = SetWindowSubclass(edit, Some(edit_proc), 1, 0);
             SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(MAX_LEN)), None);
             let bg = CreateSolidBrush(BG);
@@ -117,10 +120,8 @@ impl Chat {
     pub fn set_scale(&mut self, scale: f32) {
         self.scale = scale;
         unsafe {
-            if !self.font.is_invalid() {
-                let _ = DeleteObject(HGDIOBJ(self.font.0));
-            }
-            self.font = CreateFontW(
+            // 先创建新字体并 WM_SETFONT，再释放旧字体，避免控件持有悬空 HFONT
+            let new_font = CreateFontW(
                 -(12.0 * scale).round() as i32,
                 0,
                 0,
@@ -136,7 +137,14 @@ impl Chat {
                 FF_DONTCARE.0 as u32,
                 w!("Microsoft YaHei"),
             );
+            if new_font.is_invalid() {
+                return;
+            }
+            let old = std::mem::replace(&mut self.font, new_font);
             SendMessageW(self.edit, WM_SETFONT, Some(WPARAM(self.font.0 as usize)), Some(LPARAM(1)));
+            if !old.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(old.0));
+            }
         }
     }
 
@@ -170,7 +178,9 @@ impl Chat {
             );
             let r = (28.0 * s).round() as i32;
             let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r);
-            SetWindowRgn(self.host, Some(rgn), true);
+            if SetWindowRgn(self.host, Some(rgn), true) == 0 {
+                let _ = DeleteObject(HGDIOBJ(rgn.0));
+            }
             let _ = InvalidateRect(Some(self.host), None, true);
         }
     }
@@ -213,10 +223,15 @@ impl Chat {
 
 impl Drop for Chat {
     fn drop(&mut self) {
+        BG_BRUSH.store(0, Ordering::Relaxed);
         unsafe {
             let _ = DestroyWindow(self.host);
-            let _ = DeleteObject(HGDIOBJ(self.font.0));
-            let _ = DeleteObject(HGDIOBJ(self.bg.0));
+            if !self.font.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+            if !self.bg.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(self.bg.0));
+            }
         }
     }
 }
@@ -290,7 +305,7 @@ unsafe fn paint_cue(edit: HWND) {
 
 fn edit_text(edit: HWND) -> String {
     unsafe {
-        let n = GetWindowTextLengthW(edit);
+        let n = GetWindowTextLengthW(edit).max(0);
         let mut buf = vec![0u16; n as usize + 1];
         let got = GetWindowTextW(edit, &mut buf);
         String::from_utf16_lossy(&buf[..got.max(0) as usize])
@@ -336,6 +351,7 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 }
 
 unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    static TRACKING: AtomicBool = AtomicBool::new(false);
     unsafe {
         match msg {
             WM_PAINT => {
@@ -345,7 +361,12 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 let _ = GetClientRect(hwnd, &mut rc);
                 let s = super::current_scale();
                 let pen = CreatePen(PS_SOLID, (2.0 * s).round().max(1.0) as i32, BORDER);
-                let brush = CreateSolidBrush(BG);
+                let cached_bg = BG_BRUSH.load(Ordering::Relaxed);
+                let (brush, owned_brush) = if cached_bg != 0 {
+                    (HBRUSH(cached_bg as *mut _), false)
+                } else {
+                    (CreateSolidBrush(BG), true)
+                };
                 let op = SelectObject(hdc, HGDIOBJ(pen.0));
                 let ob = SelectObject(hdc, HGDIOBJ(brush.0));
                 let r = (28.0 * s).round() as i32;
@@ -353,7 +374,9 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 SelectObject(hdc, op);
                 SelectObject(hdc, ob);
                 let _ = DeleteObject(HGDIOBJ(pen.0));
-                let _ = DeleteObject(HGDIOBJ(brush.0));
+                if owned_brush {
+                    let _ = DeleteObject(HGDIOBJ(brush.0));
+                }
                 paint_close(hdc, hwnd);
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
@@ -384,16 +407,19 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     let r = close_rect(hwnd);
                     let _ = InvalidateRect(Some(hwnd), Some(&r), false);
                 }
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                let _ = TrackMouseEvent(&mut tme);
+                if !TRACKING.swap(true, Ordering::Relaxed) {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                }
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
+                TRACKING.store(false, Ordering::Relaxed);
                 if CLOSE_HOT.swap(false, Ordering::Relaxed) {
                     let r = close_rect(hwnd);
                     let _ = InvalidateRect(Some(hwnd), Some(&r), false);

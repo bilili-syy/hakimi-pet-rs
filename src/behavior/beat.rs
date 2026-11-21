@@ -76,6 +76,7 @@ fn onsets(e: &[f32]) -> Vec<f32> {
 
 /// 音量包络（ENV_MS 一格）
 pub fn envelope(e: &[f32], hop_ms: f64) -> Vec<u8> {
+    if !hop_ms.is_finite() || hop_ms <= 0.0 { return Vec::new(); }
     let per = ((ENV_MS as f64 / hop_ms).round() as usize).max(1);
     let cells: Vec<f32> = e.chunks(per).map(|c| c.iter().sum::<f32>() / c.len() as f32).collect();
     if cells.is_empty() { return Vec::new(); }
@@ -87,13 +88,16 @@ pub fn envelope(e: &[f32], hop_ms: f64) -> Vec<u8> {
 
 /// 从能量序列估计节拍。hop_ms = 每个能量点的时长
 pub fn analyze(e: &[f32], hop_ms: f64) -> BeatInfo {
+    if !hop_ms.is_finite() || hop_ms <= 0.0 {
+        return BeatInfo { tempo: None, confidence: 0.0, env: Vec::new() };
+    }
     let env = envelope(e, hop_ms);
     let none = |confidence| BeatInfo { tempo: None, confidence, env: env.clone() };
     let o = onsets(e);
     let n = o.len();
     let lo = (60_000.0 / (MAX_BPM * hop_ms)).floor() as usize;
     let hi = (60_000.0 / (MIN_BPM * hop_ms)).ceil() as usize;
-    if lo < 2 || n < hi * 4 { return none(0.0); }
+    if lo < 2 || n < hi.saturating_mul(4) { return none(0.0); }
     let acf = |lag: usize| -> f32 {
         let s: f32 = (0..n - lag).map(|i| o[i] * o[i + lag]).sum();
         s / (n - lag) as f32
@@ -174,7 +178,7 @@ fn decode_energies(path: &std::path::Path, max_secs: u32) -> Option<(Vec<f32>, f
     let dec = b.build().ok()?;
     let ch = dec.channels().get() as usize;
     let sr = dec.sample_rate().get();
-    let max = sr as usize * max_secs as usize * ch;
+    let max = (sr as usize).saturating_mul(max_secs as usize).saturating_mul(ch);
     let mut m = EnergyMeter::new(sr);
     let (mut acc, mut k) = (0.0f32, 0usize);
     for s in dec.take(max) {

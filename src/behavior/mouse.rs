@@ -37,8 +37,12 @@ impl Behavior {
                 self.down = None;
                 self.dragging = false;
             }
-            // 备忘提醒响着时双击 = 稍后再提醒，否则开聊天
-            MouseEv::DoubleClick { x, y } if self.zone(x, y) == Zone::Pet && !self.memo_double_click() => self.open_chat(),
+            // 备忘提醒响着时双击 = 稍后再提醒，否则（不在逗猫棒游戏中）开聊天
+            MouseEv::DoubleClick { x, y }
+                if self.zone(x, y) == Zone::Pet && !self.memo_double_click() && self.play.game.is_none() =>
+            {
+                self.open_chat()
+            }
             _ => {}
         }
     }
@@ -67,7 +71,7 @@ impl Behavior {
             let dir = dx.signum();
             if dir != d.dir {
                 d.dir = dir;
-                d.flips.retain(|t| now - t < 1500);
+                d.flips.retain(|t| now.saturating_sub(*t) < 1500);
                 d.flips.push(now);
             }
             if d.flips.len() >= 6 { self.shaken = true; }
@@ -76,7 +80,9 @@ impl Behavior {
 
     /// 摸头不用点：鼠标在她头上来回蹭几下就算
     pub(super) fn on_rub(&mut self, x: f32, y: f32) {
-        if self.chatting { return; }
+        if self.chatting || self.play.game.is_some() || self.routine.is_some() || self.memo_ringing() || matches!(self.state, St::Drag | St::Fall) {
+            return;
+        }
         if y - PET_TOP > 293.0 * 0.38 { return; }
         let dx = x - self.rub.last;
         self.rub.last = x;
@@ -85,7 +91,7 @@ impl Behavior {
         let now = self.now;
         if d != self.rub.dir {
             self.rub.dir = d;
-            self.rub.flips.retain(|t| now - t < 2000);
+            self.rub.flips.retain(|t| now.saturating_sub(*t) < 2000);
             self.rub.flips.push(now);
         }
         if self.rub.flips.len() >= 6 && now > self.rub.cool && !matches!(self.state, St::Drag | St::Fall) {
@@ -105,6 +111,7 @@ impl Behavior {
     pub(super) fn on_poke(&mut self) {
         self.yield_chat();
         if self.memo_poke() { return; }
+        if self.play.game.is_some() { return; }
         if self.routine.is_some() { return self.finish_routine(true); }
         if self.state == St::Sleep {
             self.act(Act::Wake);
@@ -113,7 +120,7 @@ impl Behavior {
             return self.set_state(St::Sit, Some((8000.0, 15000.0)));
         }
         let now = self.now;
-        self.pokes.retain(|t| now - t < 3000);
+        self.pokes.retain(|t| now.saturating_sub(*t) < 3000);
         self.pokes.push(now);
         if self.pokes.len() >= 5 {
             self.pokes.clear();

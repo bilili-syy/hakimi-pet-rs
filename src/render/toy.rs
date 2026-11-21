@@ -107,6 +107,7 @@ fn teaser(pm: &mut Pixmap, t: Transform) {
 
 /// 画一帧道具（预乘 BGRA）
 pub fn render(kind: ToyKind, scale: f32) -> Frame {
+    let scale = if scale.is_finite() && scale > 0.1 { scale.min(8.0) } else { 1.0 };
     let n = (TOY * scale).round().max(8.0) as u32;
     let Some(mut pm) = Pixmap::new(n, n) else { return Frame { w: 0, h: 0, bgra: Vec::new() } };
     let t = Transform::from_scale(scale, scale);

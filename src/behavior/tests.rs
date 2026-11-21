@@ -452,3 +452,106 @@ fn chat_voice_off_shows_text_immediately_without_tts() {
     assert_eq!(b.calls.iter().filter(|c| c.starts_with("speak:")).count(), before);
     assert!(!b.calls.iter().any(|c| c.starts_with("cvspeak:")));
 }
+
+#[test]
+fn sleep_wake_jump_does_not_storm_timers() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    // 电脑休眠 8 小时后唤醒：on_blink / on_tick 按真实 now 重排，不应追赶成 1ms 死循环风暴
+    let jump = 3_000 + 8 * 3_600_000;
+    let mut out = Vec::new();
+    b.frame_at(jump, &mut out);
+    assert!(b.next_tick > jump);
+    assert!(b.next_blink > jump);
+    assert!(b.next_interval() >= 16);
+}
+
+#[test]
+fn rub_ignored_during_game_and_perch_lost_cancels_dance() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    // 逗猫游戏中快速晃鼠标不应触发揉头，以免打断游戏状态
+    ev(&mut b, AppEvent::Menu(MenuAction::Game), 3_100);
+    assert!(b.play.game.is_some());
+    let mood0 = b.stats.data.mood;
+    for i in 0..8 {
+        let x = if i % 2 == 0 { 90.0 } else { 150.0 };
+        ev(&mut b, AppEvent::Mouse(MouseEv::Move { x, y: 120.0, sx: x as i32, sy: 120 }), 3_200 + i * 30);
+    }
+    assert!(b.play.game.is_some());
+    assert_eq!(b.stats.data.mood, mood0);
+
+    // 跳舞中途栖息窗口消失：必须取消 routine，不能在地上继续跳
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Dance(String::new())), 3_200);
+    assert!(b.routine.is_some());
+    ev(&mut b, AppEvent::PerchLost, 3_500);
+    assert!(b.routine.is_none());
+}
+
+#[test]
+fn double_honey_fast_keeps_glow_and_tts_off_aborts_cv_and_outfit_noop() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    // 连续喂两次蜂蜜：第一次到期时 fast_until 已被延后，glow 不能被提前关掉
+    b.stats.data.hunger = 30.0;
+    ev(&mut b, AppEvent::Menu(MenuAction::Honey), 3_100);
+    tick(&mut b, 6_000); // 触发第一次 Later::HoneyFast（glow = true，排 60s 后 HoneyFastEnd）
+    assert!(b.scene.glow);
+    let first_end = b.laters.iter().find(|l| l.1 == Later::HoneyFastEnd).map(|l| l.0).unwrap();
+    ev(&mut b, AppEvent::Menu(MenuAction::Honey), 20_000);
+    tick(&mut b, 23_000); // 触发第二次 Later::HoneyFast，把 fast_until 推到 83_000
+    tick(&mut b, first_end + 100);
+    assert!(b.scene.glow);
+    // 第二次真正到期后才关 glow
+    tick(&mut b, 23_000 + 61_000);
+    assert!(!b.scene.glow);
+
+    // MenuAction::Tts(false) 应中止正在等语音的 ChatVoice 并立即显示文本
+    let mut b = mk();
+    b.fake_chat_voice = true;
+    tick(&mut b, 3_000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 3_000);
+    ev(&mut b, AppEvent::ChatSubmit("你好".into()), 3_100);
+    ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, text: "收到喵～".into(), need_key: false }), 4_000);
+    assert!(b.cv.is_some());
+    let out = ev(&mut b, AppEvent::Menu(MenuAction::Tts(false)), 4_500);
+    assert!(b.cv.is_none());
+    assert!(out.contains(&WinCmd::ChatInput(ChatInputCmd::Enable(true))));
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "收到喵～");
+
+    // 没穿配饰时点「清空配饰」不应说出脱衣台词
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    b.scene.bubble = None;
+    ev(&mut b, AppEvent::Menu(MenuAction::ClearOutfit), 4_000);
+    assert!(b.scene.bubble.is_none());
+}
+
+#[test]
+fn off_work_remind_deferred_during_fullscreen_and_chat() {
+    // 1. 全屏安静时触发下班提醒：先静默推迟，退出全屏立刻补说
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    ev(&mut b, AppEvent::Sense(crate::types::SenseEv::Fullscreen(true)), 4_000);
+    ev(&mut b, AppEvent::Remind(RemindKind::OffWork), 5_000);
+    assert!(b.pending_off_work.is_some());
+    assert_ne!(b.state, St::Happy);
+    ev(&mut b, AppEvent::Sense(crate::types::SenseEv::Fullscreen(false)), 10 * 60_000);
+    assert!(b.pending_off_work.is_none());
+    assert_eq!(b.state, St::Happy);
+    assert!(b.scene.bubble.as_ref().is_some_and(|x| lines::OFF_WORK.contains(&x.text.as_str())));
+
+    // 2. 聊天中触发下班提醒：先推迟，关闭聊天框后由重试定时器补说
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 4_000);
+    ev(&mut b, AppEvent::Remind(RemindKind::OffWork), 5_000);
+    assert!(b.pending_off_work.is_some());
+    ev(&mut b, AppEvent::ChatCancel, 7_000);
+    tick(&mut b, 11_000);
+    assert!(b.pending_off_work.is_none());
+    assert_eq!(b.state, St::Happy);
+    assert!(b.scene.bubble.as_ref().is_some_and(|x| lines::OFF_WORK.contains(&x.text.as_str())));
+}

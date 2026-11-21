@@ -230,11 +230,20 @@ impl Behavior {
         }
     }
 
+    /// 语音回答被打断时清理残留的 CV 情绪状态
+    pub(super) fn emotion_cv_clear(&mut self) {
+        self.mind.cv_emo = None;
+        if self.mind.emo.is_some_and(|(t, _)| t == CV_TOKEN) {
+            self.mind.emo = None;
+        }
+    }
+
     /// 和聊天回复一样地说一句（换表情、气泡 + 聊天语音、说完回平时）
     fn mind_reply(&mut self, line: &str, e: Emotion) {
         self.emotion_face(Some(e));
         let ms = (2500 + line.encode_utf16().count() as u64 * 150).min(20_000);
-        self.say_opts(line, ms, true, SpeakKind::Chat);
+        let voice = !self.chat_voice_disabled_by_user();
+        self.say_opts(line, ms, voice, SpeakKind::Chat);
         self.hold_timer(2500, StateAct::ChatIdle);
         self.emotion_hold(Some(e));
     }

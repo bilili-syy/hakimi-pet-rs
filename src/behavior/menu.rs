@@ -71,8 +71,11 @@ impl Behavior {
             MenuAction::ReloadSettings => {
                 let (c, o) = if self.io {
                     let cfg = crate::core::config::reload();
-                    // 设置窗口里关了声音：正在念的停掉
-                    if !cfg.tts.enabled { self.stop_voice(); }
+                    // 设置窗口里关了声音：正在念的停掉，并中止未念完的语音回答队列
+                    if !cfg.tts.enabled {
+                        self.cv_disable_tts();
+                        self.stop_voice();
+                    }
                     (cfg.costume, cfg.outfit)
                 } else {
                     (self.costume.clone(), self.outfits.clone())
@@ -83,7 +86,10 @@ impl Behavior {
             }
             MenuAction::Tts(on) => {
                 if self.io { crate::core::config::update(|c| c.tts.enabled = on); }
-                if !on { self.stop_voice(); }
+                if !on {
+                    self.cv_disable_tts();
+                    self.stop_voice();
+                }
             }
             MenuAction::TtsChatOnly(on) => {
                 if self.io { crate::core::config::update(|c| c.tts.speak = if on { "chat".into() } else { "all".into() }); }
@@ -109,6 +115,7 @@ impl Behavior {
     }
 
     pub(super) fn set_outfits(&mut self, l: Vec<String>) {
+        if l == self.outfits { return; }
         let added = l.len() > self.outfits.len();
         if self.io { let v = l.clone(); crate::core::config::update(|c| c.outfit = v); }
         self.outfits = l;

@@ -609,8 +609,11 @@ impl Behavior {
     /// think() 开头调用；返回 true = 已经决定了下一步
     pub(super) fn think_play(&mut self) -> bool {
         if self.play.game.is_some() { return true; }
-        if self.play.food.as_ref().is_some_and(|f| f.phase == FoodPhase::Ground || f.phase == FoodPhase::Chasing) {
-            self.chase_food();
+        if let Some(f) = &self.play.food {
+            if f.phase == FoodPhase::Ground || f.phase == FoodPhase::Chasing {
+                self.chase_food();
+            }
+            // 小鱼干下落中或被主人捏在手里时也别走开/睡着
             return true;
         }
         let r = fastrand::f64();
@@ -650,6 +653,9 @@ impl Behavior {
     }
 
     pub(super) fn jump_down(&mut self) {
+        self.cancel_routine();
+        self.set_flip(false);
+        self.sleep_since = None;
         self.play.perch = None;
         self.play.jumping_down = true;
         self.cmds.push(WinCmd::Unperch);
@@ -686,6 +692,9 @@ impl Behavior {
     }
 
     pub(super) fn on_perch_lost(&mut self) {
+        self.cancel_routine();
+        self.set_flip(false);
+        self.sleep_since = None;
         self.play.perch = None;
         self.play.jumping_down = false;
         self.dragging_cls = false;

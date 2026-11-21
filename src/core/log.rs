@@ -1,23 +1,56 @@
 //! 追加写 hakimi.log：`[2026-11-20T03:04:05.678Z] msg`（和原版 main.js log() 同格式，UTC ISO 时间）。
 //! 文件超过 MAX_BYTES 时改名为 hakimi.log.old（覆盖旧的）再从头写，最多占 2×MAX_BYTES。
 //! 注意：调用方别把 API Key 之类的敏感信息拼进 msg。
+use std::fs::File;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// 单个日志文件上限
 pub const MAX_BYTES: u64 = 1024 * 1024;
 
-static LOCK: Mutex<()> = Mutex::new(());
+struct Sink {
+    path: PathBuf,
+    file: File,
+    bytes: u64,
+}
+
+static SINK: Mutex<Option<Sink>> = Mutex::new(None);
+
+fn open_sink(path: PathBuf) -> Option<Sink> {
+    let _ = std::fs::create_dir_all(super::paths::data_dir());
+    let mut len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if len >= MAX_BYTES {
+        let _ = std::fs::rename(&path, path.with_extension("log.old"));
+        len = 0;
+    }
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+    Some(Sink { path, file, bytes: len })
+}
 
 pub fn log(msg: &str) {
-    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let path = super::paths::log_file();
-    let _ = std::fs::create_dir_all(super::paths::data_dir());
-    if std::fs::metadata(&path).map(|m| m.len() >= MAX_BYTES).unwrap_or(false) {
-        let _ = std::fs::rename(&path, path.with_extension("log.old"));
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "[{}] {msg}", iso_now());
+    let line = format!("[{}] {msg}\n", iso_now());
+    {
+        let mut g = SINK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = super::paths::log_file();
+        if g.as_ref().is_some_and(|s| s.path != path || s.bytes >= MAX_BYTES) {
+            *g = None;
+        }
+        if g.is_none() {
+            *g = open_sink(path.clone());
+        }
+        if let Some(s) = g.as_mut() {
+            if s.file.write_all(line.as_bytes()).is_ok() {
+                s.bytes = s.bytes.saturating_add(line.len() as u64);
+            } else {
+                *g = open_sink(path);
+                if let Some(s) = g.as_mut()
+                    && s.file.write_all(line.as_bytes()).is_ok()
+                {
+                    s.bytes = s.bytes.saturating_add(line.len() as u64);
+                }
+            }
+        }
     }
     #[cfg(debug_assertions)]
     eprintln!("{msg}");

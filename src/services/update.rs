@@ -18,13 +18,21 @@ pub fn check() -> Result<(String, bool), String> {
     Ok((tag, newer))
 }
 
-/// "v1.2.0" > "1.1.0"？只比数字部分（主.次.修订）
+/// "v1.2.0" > "1.1.0"？正式版 > 同版本号的预发布版（如 1.2.0 > 1.2.0-beta.1）
 pub fn is_newer(tag: &str, cur: &str) -> bool { parse(tag) > parse(cur) }
 
-fn parse(s: &str) -> (u32, u32, u32) {
+fn parse(s: &str) -> (u32, u32, u32, bool) {
     let s = s.trim().trim_start_matches(['v', 'V']);
-    let mut it = s.split(['.', '-', '+']).map(|x| x.parse::<u32>().unwrap_or(0));
-    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+    let s = s.split('+').next().unwrap_or("");
+    let (core, pre) = match s.split_once('-') {
+        Some((c, p)) => (c, !p.is_empty()),
+        None => (s, false),
+    };
+    let mut it = core.split('.').map(|x| x.parse::<u32>().unwrap_or(0));
+    let (a, b, c) = (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0));
+    let valid = a > 0 || b > 0 || c > 0;
+    // release = true > prerelease = false；无法解析的视为 (0,0,0,false)
+    (a, b, c, valid && !pre)
 }
 
 #[cfg(test)]
@@ -36,6 +44,9 @@ mod tests {
         assert!(is_newer("v1.2.0", "1.1.0"));
         assert!(is_newer("v1.1.1", "1.1.0"));
         assert!(is_newer("2.0", "1.9.9"));
+        assert!(is_newer("v1.2.0", "1.2.0-beta.1"));
+        assert!(!is_newer("v1.2.0-beta.1", "1.2.0"));
+        assert!(!is_newer("v1.2-1", "1.2.0"));
         assert!(!is_newer("v1.1.0", "1.1.0"));
         assert!(!is_newer("v1.0.9", "1.1.0"));
         assert!(!is_newer("garbage", "1.1.0"));

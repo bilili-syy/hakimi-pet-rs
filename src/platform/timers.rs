@@ -68,6 +68,13 @@ impl Reminders {
         }
     }
 
+    /// 重新载入配置：保留今天已响过的下班提醒日期，避免同一分钟内重发
+    pub fn reschedule(&mut self, c: &RemCfg, now: u64) {
+        let fired = self.off_fired_on;
+        *self = Self::schedule(c, now);
+        self.off_fired_on = fired;
+    }
+
     pub fn next_deadline(&self) -> Option<u64> {
         [self.water_next, self.stand_next, self.off.map(|_| self.off_next)].into_iter().flatten().min()
     }

@@ -81,7 +81,7 @@ impl Sense {
                 }
                 if let Some(last) = self.flips.back_mut() { last.1 += dx.abs(); }
             }
-            while self.flips.front().is_some_and(|f| p.now - f.0 > SHAKE_WIN_MS) { self.flips.pop_front(); }
+            while self.flips.front().is_some_and(|f| p.now.saturating_sub(f.0) > SHAKE_WIN_MS) { self.flips.pop_front(); }
             let path: i32 = self.flips.iter().map(|f| f.1).sum();
             if self.flips.len() > SHAKE_FLIPS && path >= SHAKE_PATH && p.now >= self.shake_cool {
                 self.shake_cool = p.now + SHAKE_COOL_MS;
@@ -152,7 +152,7 @@ pub fn maybe_poll(now: u64, pet: HWND, evs: &mut Vec<AppEvent>) {
         s.step(&p, &mut out);
         if now >= s.next_slow {
             s.next_slow = now + 2000;
-            let fs = unsafe { super::power::fullscreen_now(pet) };
+            let fs = unsafe { super::power::fullscreen_now(now, pet) };
             let peak = f32::from_bits(PEAK.load(Ordering::Relaxed));
             let music = PLAYER.load(Ordering::Relaxed) && peak > 0.02 && !crate::services::audio::is_playing();
             s.slow(fs, music, &mut out);
@@ -186,32 +186,64 @@ const PLAYERS: [&str; 12] = [
     "applemusic", "music.ui", "lx-music-desktop", "yesplaymusic",
 ];
 
-/// 后台线程：峰值电平 + 播放器在不在（失败就一直当没在放）
+/// 后台线程：峰值电平 + 播放器在不在（只在检测到播放器时才激活 COM 电平表，平时不打扰 audiosrv）
 fn start_meter() {
     let _ = std::thread::Builder::new().name("sense-meter".into()).spawn(|| unsafe {
         use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
         use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender};
         use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let open_meter = || -> Option<IAudioMeterInformation> {
+            (|| -> windows::core::Result<IAudioMeterInformation> {
+                let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+                let dev = en.GetDefaultAudioEndpoint(eRender, eConsole)?;
+                dev.Activate(CLSCTX_ALL, None)
+            })()
+            .ok()
+        };
         let mut meter: Option<IAudioMeterInformation> = None;
         let mut tick = 0u32;
         loop {
             if tick.is_multiple_of(5) {
-                PLAYER.store(player_running(), Ordering::Relaxed);
-                // 换了输出设备（插耳机）就重新拿
-                meter = (|| -> windows::core::Result<IAudioMeterInformation> {
-                    let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-                    let dev = en.GetDefaultAudioEndpoint(eRender, eConsole)?;
-                    dev.Activate(CLSCTX_ALL, None)
-                })()
-                .ok();
+                let running = player_running();
+                PLAYER.store(running, Ordering::Relaxed);
+                if running {
+                    // 换了输出设备（插耳机）或刚检测到播放器时刷新电平表
+                    meter = open_meter();
+                } else {
+                    meter = None;
+                }
             }
             tick = tick.wrapping_add(1);
-            let peak = if PLAYER.load(Ordering::Relaxed) { meter.as_ref().and_then(|m| m.GetPeakValue().ok()).unwrap_or(0.0) } else { 0.0 };
+            let peak = if PLAYER.load(Ordering::Relaxed) {
+                match meter.as_ref().and_then(|m| m.GetPeakValue().ok()) {
+                    Some(v) => v,
+                    None => {
+                        meter = open_meter();
+                        meter.as_ref().and_then(|m| m.GetPeakValue().ok()).unwrap_or(0.0)
+                    }
+                }
+            } else {
+                0.0
+            };
             PEAK.store(peak.to_bits(), Ordering::Relaxed);
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     });
+}
+
+fn exe_matches_player(utf16: &[u16]) -> bool {
+    let mut buf = [0u8; 64];
+    let mut n = 0usize;
+    for &u in utf16 {
+        if u == 0 { break; }
+        if u > 0x7f || n >= buf.len() { return false; }
+        buf[n] = (u as u8).to_ascii_lowercase();
+        n += 1;
+    }
+    let name = &buf[..n];
+    let stem = name.strip_suffix(b".exe").unwrap_or(name);
+    PLAYERS.iter().any(|p| p.as_bytes() == stem)
 }
 
 unsafe fn player_running() -> bool {
@@ -222,10 +254,7 @@ unsafe fn player_running() -> bool {
     let mut found = false;
     if unsafe { Process32FirstW(snap, &mut e) }.is_ok() {
         loop {
-            let n = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
-            let name = String::from_utf16_lossy(&e.szExeFile[..n]).to_ascii_lowercase();
-            let stem = name.strip_suffix(".exe").unwrap_or(&name);
-            if PLAYERS.contains(&stem) { found = true; break; }
+            if exe_matches_player(&e.szExeFile) { found = true; break; }
             if unsafe { Process32NextW(snap, &mut e) }.is_err() { break; }
         }
     }

@@ -372,6 +372,9 @@ struct Store {
 }
 
 static STORE: Mutex<Option<Store>> = Mutex::new(None);
+static CLEAR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn clear_gen() -> u64 { CLEAR_GEN.load(std::sync::atomic::Ordering::SeqCst) }
 
 pub fn file() -> PathBuf { super::paths::data_dir().join("memory.json") }
 
@@ -430,9 +433,12 @@ pub fn snapshot() -> Book { with(|s| s.book.clone()) }
 
 pub fn count() -> usize { with(|s| s.book.items.len()) }
 
-/// 后台提取的结果
-pub fn merge_ai(facts: &[Fact], seen_until: u64) -> usize {
+/// 后台提取的结果（如果期间发生过清空记忆，或 seen_until 已落后于 extracted_at，则丢弃）
+pub fn merge_ai_if(facts: &[Fact], seen_until: u64, expected_gen: u64) -> usize {
     edit(|b| {
+        if clear_gen() != expected_gen || (seen_until > 0 && seen_until <= b.extracted_at) {
+            return (0, false);
+        }
         let n = b.merge(facts, Now::get().dt, false);
         let moved = seen_until > b.extracted_at;
         if moved {
@@ -442,9 +448,19 @@ pub fn merge_ai(facts: &[Fact], seen_until: u64) -> usize {
     })
 }
 
+/// 后台提取的结果
+#[allow(dead_code)]
+pub fn merge_ai(facts: &[Fact], seen_until: u64) -> usize {
+    merge_ai_if(facts, seen_until, clear_gen())
+}
+
 pub fn clear() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-    edit(|b| { b.clear(now); ((), true) })
+    edit(|b| {
+        CLEAR_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        b.clear(now);
+        ((), true)
+    })
 }
 
 pub fn prompt() -> String { with(|s| s.book.prompt_block(PROMPT_CHARS)) }

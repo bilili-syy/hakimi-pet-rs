@@ -86,12 +86,15 @@ impl Behavior {
         }
         self.waiting = false;
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(true)));
+        let busy_phys = self.dragging || matches!(self.state, St::Drag | St::Fall);
         if r.ok {
             self.act(Act::Chat);
-            self.play(Shot::Bounce);
-            self.set_state(St::Happy, None);
-            self.emotion_face(emo);
-        } else {
+            if !busy_phys {
+                self.play(Shot::Bounce);
+                self.set_state(St::Happy, None);
+                self.emotion_face(emo);
+            }
+        } else if !busy_phys {
             self.play(Shot::Shake);
             self.set_state(if r.need_key { St::Sit } else { St::Drag }, None);
         }
@@ -100,8 +103,10 @@ impl Behavior {
         // 语音回答关了：聊天回复只出字
         let voice = !(r.ok && self.chat_voice_disabled_by_user());
         self.say_opts(&r.text, ms, voice, if r.ok { SpeakKind::Chat } else { SpeakKind::Line });
-        self.hold_timer(2500, StateAct::ChatIdle);
-        self.emotion_hold(emo);
+        if !busy_phys {
+            self.hold_timer(2500, StateAct::ChatIdle);
+            self.emotion_hold(emo);
+        }
         self.mind_after_reply(r.ok);
     }
 }

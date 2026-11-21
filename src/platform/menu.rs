@@ -6,7 +6,7 @@
 //! 原来菜单里的那些配置开关（出声、只念聊天、摸鱼监督、开机自启…）都搬进了设置窗口（platform/settings.rs）。
 //!
 //! 菜单对象只在 UI 线程（thread_local）；点击经 MenuEvent 回调放进队列再 PostMessage 给主窗口。
-use super::{MENU_QUEUE, POMO_END, WM_APP_MENU, main_hwnd, now_ms, timers};
+use super::{MENU_QUEUE, WM_APP_MENU, main_hwnd, pomodoro_left};
 use crate::types::MenuAction;
 use std::cell::{Cell, RefCell};
 use tray_icon::menu::{CheckMenuItem, ContextMenu, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -356,12 +356,11 @@ pub(crate) fn tray_click_timer() {
 
 fn ctx_now() -> Ctx {
     let cfg = crate::core::config::get();
-    let pomo_end = POMO_END.load(std::sync::atomic::Ordering::Relaxed);
     Ctx {
         costume: cfg.costume,
         outfits: cfg.outfit,
         visible: main_hwnd().is_some_and(|h| unsafe { IsWindowVisible(h).as_bool() }),
-        pomo_left: (pomo_end != 0).then(|| timers::minutes_left(pomo_end, now_ms())),
+        pomo_left: pomodoro_left(),
     }
 }
 

@@ -10,8 +10,10 @@ use super::sprites::{SpriteCache, load_scaled};
 use crate::core::skin::{self, SkinInfo};
 use crate::types::Face;
 use std::cell::{Cell, RefCell};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -26,6 +28,7 @@ thread_local! {
 }
 
 /// 每帧开头调用：皮肤版本变了就释放旧皮肤的缓存图。返回 true = 这一帧必须重画
+#[allow(dead_code)]
 pub fn sync(cache: &mut SpriteCache) -> bool {
     let v = skin::version();
     let changed = SEEN.with(|s| s.replace(Some(v)) != Some(v));
@@ -110,15 +113,114 @@ pub fn base_of(cache: &mut SpriteCache, s: &SkinInfo, face: Face, w: u32, h: u32
     Some((k, pm))
 }
 
+/// 每个 Renderer 独享的皮肤解析缓存：只在 skin::version() 变化时读一次全局状态和磁盘 is_file()，
+/// 渲染热路径零 Mutex、零文件系统 stat、失败的叠加层也会记住不再 60fps 反复解码。
+#[derive(Default)]
+pub struct SkinCache {
+    ver: Option<u64>,
+    scale: f32,
+    /// Face → (SpriteCache 键, 底图路径, 可选的 blink 叠加层路径)
+    sprites: HashMap<Face, (String, PathBuf, Option<PathBuf>)>,
+    /// 0 = blink, 1 = mouthOpen → (SpriteCache 键, 路径)
+    overlays: [Option<(String, PathBuf)>; 2],
+    failed: Vec<(String, u32, u32)>,
+}
+
+impl SkinCache {
+    pub fn sync(&mut self, cache: &mut SpriteCache) -> bool {
+        let v = skin::version();
+        if self.ver == Some(v) {
+            return false;
+        }
+        self.ver = Some(v);
+        cache.forget(|k| k.contains(KEY_MARK));
+        self.sprites.clear();
+        self.overlays = [None, None];
+        self.failed.clear();
+        let active: Option<Arc<SkinInfo>> = skin::active();
+        if let Some(s) = active {
+            self.scale = s.scale();
+            let blink_ov = s.overlay_file("blink");
+            for face in Face::ALL {
+                if let Some(st) = state_for(&s, face)
+                    && let Some(file) = s.sprite_file(st)
+                {
+                    let ov = if face == Face::Blink && st != "blink" { blink_ov.clone() } else { None };
+                    let k = format!("{KEY_MARK}{v}:{}:{}", s.id, if ov.is_some() { "idle+blink" } else { st });
+                    self.sprites.insert(face, (k, file, ov));
+                }
+            }
+            for (idx, name) in [(0, "blink"), (1, "mouthOpen")] {
+                if let Some(file) = s.overlay_file(name) {
+                    let k = format!("{KEY_MARK}{v}:{}:ov:{name}", s.id);
+                    self.overlays[idx] = Some((k, file));
+                }
+            }
+        }
+        true
+    }
+
+    pub fn base(&mut self, cache: &mut SpriteCache, face: Face, w: u32, h: u32) -> Option<(String, Rc<Pixmap>)> {
+        let (k, file, blink_ov) = self.sprites.get(&face)?;
+        if self.failed.iter().any(|(fk, fw, fh)| fk == k && *fw == w && *fh == h) {
+            return None;
+        }
+        let scale = self.scale;
+        let pm = cache.get_or(k, (w, h), || {
+            let mut base = load_fit(file, w, h, scale)?;
+            if let Some(ov) = blink_ov
+                && let Some(o) = load_fit(ov, w, h, scale)
+            {
+                base.draw_pixmap(0, 0, o.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            }
+            Some(base)
+        });
+        let Some(pm) = pm else {
+            if !cfg!(test) { crate::core::log::log(&format!("skin image failed: {}", file.display())); }
+            self.failed.push((k.clone(), w, h));
+            return None;
+        };
+        Some((k.clone(), pm))
+    }
+
+    pub fn overlay(&mut self, cache: &mut SpriteCache, name: &str, w: u32, h: u32) -> Option<Rc<Pixmap>> {
+        let idx = match name {
+            "blink" => 0,
+            "mouthOpen" => 1,
+            _ => return None,
+        };
+        let (k, file) = self.overlays[idx].as_ref()?;
+        if self.failed.iter().any(|(fk, fw, fh)| fk == k && *fw == w && *fh == h) {
+            return None;
+        }
+        let scale = self.scale;
+        let pm = cache.get_or(k, (w, h), || load_fit(file, w, h, scale));
+        let Some(pm) = pm else {
+            if !cfg!(test) { crate::core::log::log(&format!("skin overlay failed: {}", file.display())); }
+            self.failed.push((k.clone(), w, h));
+            return None;
+        };
+        Some(pm)
+    }
+}
+
 /// 叠加层（blink / mouthOpen），和底图同样缩放对齐。给呼吸/眨眼/张嘴那条线用
 #[allow(dead_code)]
 pub fn overlay_of(cache: &mut SpriteCache, s: &SkinInfo, name: &str, w: u32, h: u32) -> Option<Rc<Pixmap>> {
     let file = s.overlay_file(name)?;
     let scale = s.scale();
-    cache.get_or(&key(s, &format!("ov:{name}")), (w, h), || load_fit(&file, w, h, scale))
+    let k = key(s, &format!("ov:{name}"));
+    let fkey = format!("{k}@{w}x{h}");
+    if FAILED.with(|f| f.borrow().contains(&fkey)) { return None; }
+    let pm = cache.get_or(&k, (w, h), || load_fit(&file, w, h, scale));
+    if pm.is_none() {
+        FAILED.with(|f| f.borrow_mut().push(fkey));
+    }
+    pm
 }
 
 /// 渲染器钩子：当前皮肤这一帧的底图（内置哈基米 / 回退时 None）
+#[allow(dead_code)]
 pub fn base(cache: &mut SpriteCache, face: Face, w: u32, h: u32) -> Option<(String, Rc<Pixmap>)> {
     let s = skin::active()?;
     base_of(cache, &s, face, w, h)

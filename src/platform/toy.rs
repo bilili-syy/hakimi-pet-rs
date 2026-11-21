@@ -31,11 +31,12 @@ impl Drop for Toy {
 }
 
 fn register() -> bool {
-    static mut DONE: bool = false;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Acquire) {
+        return true;
+    }
     unsafe {
-        if DONE {
-            return true;
-        }
         let Ok(m) = GetModuleHandleW(None) else { return false };
         let hinst: HINSTANCE = m.into();
         let wc = WNDCLASSEXW {
@@ -46,8 +47,9 @@ fn register() -> bool {
             lpszClassName: w!("HakimiPetRsToy"),
             ..Default::default()
         };
-        DONE = RegisterClassExW(&wc) != 0;
-        DONE
+        let ok = RegisterClassExW(&wc) != 0;
+        if ok { DONE.store(true, Ordering::Release); }
+        ok
     }
 }
 
@@ -59,7 +61,11 @@ impl Toy {
         }
         let frame = crate::render::toy::render(kind, scale);
         let size = frame.w as i32;
-        if size <= 0 {
+        if size <= 0 || frame.w != frame.h {
+            return None;
+        }
+        let need = (size as usize).checked_mul(size as usize)?.checked_mul(4)?;
+        if frame.bgra.len() < need {
             return None;
         }
         let mut ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
@@ -70,9 +76,12 @@ impl Toy {
         let hwnd = unsafe {
             CreateWindowExW(ex, w!("HakimiPetRsToy"), w!("哈基米的小道具"), WS_POPUP, x, y, size, size, None, None, Some(hinst), None).ok()?
         };
-        let dib = create_dib(size, size)?;
+        let Some(dib) = create_dib(size, size) else {
+            unsafe { let _ = DestroyWindow(hwnd); }
+            return None;
+        };
         unsafe {
-            std::ptr::copy_nonoverlapping(frame.bgra.as_ptr(), dib.bits, (size * size * 4) as usize);
+            std::ptr::copy_nonoverlapping(frame.bgra.as_ptr(), dib.bits, need);
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,

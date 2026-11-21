@@ -3,7 +3,7 @@
 //! 短间隔（< SHORT_MS）额外挂一个高精度定时器，消息循环用 MsgWaitForMultipleObjectsEx 等它；
 //! SetTimer 照样挂着兜底（菜单/对话框的模态循环里只有 WM_TIMER 能进来）。创建失败就只用 SetTimer。
 use std::sync::atomic::{AtomicIsize, Ordering};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CreateWaitableTimerExW, SetWaitableTimer,
 };
@@ -18,8 +18,24 @@ const ACCESS: u32 = 0x1F_0003;
 pub fn init() {
     let h = unsafe { CreateWaitableTimerExW(None, PCWSTR::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, ACCESS) };
     match h {
-        Ok(h) if !h.is_invalid() => TIMER.store(h.0 as isize, Ordering::Relaxed),
+        Ok(h) if !h.is_invalid() => {
+            let prev = TIMER.swap(h.0 as isize, Ordering::AcqRel);
+            if prev != 0 {
+                unsafe { let _ = CloseHandle(HANDLE(prev as *mut _)); }
+            }
+        }
         _ => crate::core::log::log("high-res timer unavailable, using SetTimer"),
+    }
+}
+
+pub fn close() {
+    let prev = TIMER.swap(0, Ordering::AcqRel);
+    if prev != 0 {
+        unsafe {
+            let h = HANDLE(prev as *mut _);
+            let _ = CancelWaitableTimer(h);
+            let _ = CloseHandle(h);
+        }
     }
 }
 

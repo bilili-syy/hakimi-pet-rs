@@ -41,7 +41,7 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POI
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
     CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, SelectObject,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext};
@@ -53,6 +53,7 @@ pub(crate) const WM_APP_EVENT: u32 = WM_APP + 1;
 pub(crate) const WM_APP_MENU: u32 = WM_APP + 2;
 pub(crate) const WM_APP_SECOND: u32 = WM_APP + 3;
 const WM_APP_DPI: u32 = WM_APP + 4;
+const WM_APP_CLEAR_MIND: u32 = WM_APP + 5;
 /// 自动化/自测用：PostMessage(hwnd, WM_APP+9, i, 0) 等于点了 DEBUG_MENU[i] 那个菜单项
 const WM_APP_DEBUG_MENU: u32 = WM_APP + 9;
 /// 10 = 打开设置窗口，11 = 打开聊天框
@@ -77,8 +78,8 @@ static SCALE_BITS: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0f32
 static DPI_BITS: AtomicU32 = AtomicU32::new(0x3f80_0000);
 static EVENT_QUEUE: Mutex<VecDeque<AppEvent>> = Mutex::new(VecDeque::new());
 pub(crate) static MENU_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
-/// 番茄钟结束时间（epoch 毫秒），0 = 没开
-pub(crate) static POMO_END: AtomicU64 = AtomicU64::new(0);
+/// 番茄钟结束时间（GetTickCount64 单调毫秒，计入睡眠/休眠时间），0 = 没开
+static POMO_END: AtomicU64 = AtomicU64::new(0);
 static MOYU_TODAY_SEC: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn main_hwnd() -> Option<HWND> {
@@ -90,13 +91,20 @@ pub(crate) fn current_scale() -> f32 {
     f32::from_bits(SCALE_BITS.load(Ordering::Relaxed))
 }
 
+/// 单调毫秒时钟（起点 1000ms，永不回拨、永不为 0），驱动帧循环/物理/提醒间隔
 pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    1_000 + ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// 番茄钟专用单调毫秒时钟：Windows GetTickCount64 明确计入 S3 睡眠和 S4 休眠时间，且不受手动改系统时间影响
+pub(crate) fn pomo_now_ms() -> u64 {
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }.max(1)
 }
 
 /// 任意线程：把事件送回 UI 线程
 pub(crate) fn post_event(ev: AppEvent) {
-    EVENT_QUEUE.lock().unwrap().push_back(ev);
+    EVENT_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push_back(ev);
     if let Some(h) = main_hwnd() {
         unsafe {
             let _ = PostMessageW(Some(h), WM_APP_EVENT, WPARAM(0), LPARAM(0));
@@ -117,6 +125,7 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
         crate::core::log::log("second instance, exit");
         return;
     };
+    crate::core::save::cleanup_stale_tmps();
     crate::core::session::begin();
     let Some(hwnd) = create_main_window() else {
         crate::core::log::log("create window failed");
@@ -192,6 +201,17 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
             // 高精度定时器到点 = 一次 tick；其余照常分发消息
             'pump: loop {
                 let r = MsgWaitForMultipleObjectsEx(Some(&[t]), windows::Win32::System::Threading::INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                if r == windows::Win32::Foundation::WAIT_FAILED {
+                    // 句柄异常时回退到阻塞 GetMessage，防止 100% CPU 空转
+                    if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                        break 'pump;
+                    }
+                    if !settings::dialog_message(&msg) {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    continue;
+                }
                 if r == windows::Win32::Foundation::WAIT_OBJECT_0 {
                     tick();
                 }
@@ -227,7 +247,7 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
 /// 番茄钟剩余分钟，没开返回 None
 pub fn pomodoro_left() -> Option<u32> {
     let end = POMO_END.load(Ordering::Relaxed);
-    (end != 0).then(|| timers::minutes_left(end, now_ms()))
+    (end != 0).then(|| timers::minutes_left(end, pomo_now_ms()))
 }
 
 /// 今天摸鱼了几分钟；摸鱼监督关闭时返回 None
@@ -425,7 +445,7 @@ fn rearm() {
             due = due.min(t);
         }
         if let Some(p) = &s.pomodoro {
-            due = due.min(p.end);
+            due = due.min(now + p.end.saturating_sub(pomo_now_ms()));
         }
         // 备忘录：排到下一条提醒的时间
         if let Some(ms) = crate::core::memo::ms_until_next(crate::core::memo::Now::get()) {
@@ -457,9 +477,16 @@ fn memo_prewarm() {
     }
 }
 
+thread_local! {
+    /// 备忘录轮询节流（至多每秒查一次，睡眠醒来/改时间立即清零）
+    static MEMO_NEXT: Cell<u64> = const { Cell::new(0) };
+    /// 主窗口左键是否处于按下/捕获中（配合 WM_CAPTURECHANGED 防止拖动卡死）
+    static LEFT_DOWN: Cell<bool> = const { Cell::new(false) };
+}
+
 fn tick() {
+    // 正在 pump() 里重入（如模态弹窗）：不要 1ms 重排空转，pump 结束时会统一 rearm()
     if PUMPING.with(|p| p.get()) {
-        rearm();
         return;
     }
     let now = now_ms();
@@ -474,13 +501,20 @@ fn tick() {
     if pomo_done {
         menu::refresh();
     }
-    // 备忘录到点（睡眠醒来后错过的几条一次性合并发出）
-    let hits = crate::core::memo::poll(crate::core::memo::Now::get());
-    if !hits.is_empty() {
-        evs.push(AppEvent::Memo(crate::types::MemoEv::Due(hits)));
-        menu::refresh();
+    // 备忘录到点（最多每秒核对一次，避免 60~120Hz 每帧锁表；睡眠醒来/改时间会重置 MEMO_NEXT）
+    if now >= MEMO_NEXT.with(|m| m.get()) {
+        MEMO_NEXT.with(|m| m.set(now + 1000));
+        let hits = crate::core::memo::poll(crate::core::memo::Now::get());
+        if !hits.is_empty() {
+            evs.push(AppEvent::Memo(crate::types::MemoEv::Due(hits)));
+            menu::refresh();
+        }
+        memo_prewarm();
     }
-    memo_prewarm();
+    // 省电探测（藏起来/全屏程序/锁屏/电池 → 灵动效果降帧），每 2 秒一次；放在 sense 前让 sense 复用全屏探测结果
+    if let Some(h) = with(|s| s.hwnd) {
+        power::maybe_probe(now, h);
+    }
     // 场景感知：走开/回来、打字、晃鼠标、全屏、音乐
     if let Some(h) = with(|s| s.hwnd) {
         sense::maybe_poll(now, h, &mut evs);
@@ -489,11 +523,6 @@ fn tick() {
         emit(e);
     }
     pump();
-
-    // 省电探测（藏起来/全屏程序/锁屏/电池 → 灵动效果降帧），每 2 秒一次
-    if let Some(h) = with(|s| s.hwnd) {
-        power::maybe_probe(now, h);
-    }
     // 帧
     let due = with(|s| !s.quitting && now >= s.next_frame).unwrap_or(false);
     if due {
@@ -549,6 +578,13 @@ fn apply(out: Vec<WinCmd>) {
                 });
             }
             WinCmd::Toy(t) => {
+                // 先把旧 Toy 移出 STATE 再销毁窗口，避免 DestroyWindow 同步派发 WM_CAPTURECHANGED 时重入 STATE.borrow_mut()
+                let old_toy = if matches!(t, ToyCmd::Spawn { .. } | ToyCmd::Remove) {
+                    with(|s| s.toy.take()).flatten()
+                } else {
+                    None
+                };
+                drop(old_toy);
                 if let Some(ev) = with(|s| s.toy_cmd(t)).flatten() {
                     emit(ev);
                 }
@@ -630,7 +666,7 @@ fn after(a: MenuAction) {
         }
         MenuAction::PomodoroStart(m) => {
             with(|s| {
-                let p = Pomodoro::start(m, now);
+                let p = Pomodoro::start(m, pomo_now_ms());
                 POMO_END.store(p.end, Ordering::Relaxed);
                 s.pomodoro = Some(p);
             });
@@ -666,7 +702,7 @@ fn after(a: MenuAction) {
             let cfg = crate::core::config::get();
             let dpi = f32::from_bits(DPI_BITS.load(Ordering::Relaxed));
             with(|s| {
-                s.reminders = Reminders::schedule(&cfg.reminders, now);
+                s.reminders.reschedule(&cfg.reminders, now);
                 s.set_watch(cfg.moyu.enabled, now);
                 s.set_scale(dpi * cfg.scale);
             });
@@ -678,9 +714,11 @@ fn after(a: MenuAction) {
         MenuAction::Memo(crate::types::MemoAct::OpenFile) => open_path(&crate::core::memo::ensure_file()),
         MenuAction::Memo(crate::types::MemoAct::OpenWindow) => settings::open(3),
         MenuAction::Mind(crate::types::MindAct::OpenFile) => open_path(&crate::core::memory::ensure_file()),
-        // 清空记忆：弹框二次确认，确认了才真的发 Clear（行为层清空并哭一下）
-        MenuAction::Mind(crate::types::MindAct::ClearAsk) if mind_menu::confirm_clear(main_hwnd()) => {
-            on_menu(MenuAction::Mind(crate::types::MindAct::Clear));
+        // 清空记忆：推迟到 pump() 外弹模态确认框，避免在 PUMPING=true 期间阻塞事件队列
+        MenuAction::Mind(crate::types::MindAct::ClearAsk) => {
+            if let Some(h) = main_hwnd() {
+                unsafe { let _ = PostMessageW(Some(h), WM_APP_CLEAR_MIND, WPARAM(0), LPARAM(0)); }
+            }
         }
         // 「🎭 角色」→「打开皮肤文件夹」（不存在先建）
         MenuAction::Costume(c) if c == crate::core::skin::MENU_OPEN => open_path(&crate::core::skin::ensure_dir()),
@@ -694,9 +732,13 @@ fn do_quit() {
         return;
     }
     with(|s| s.quitting = true);
+    settings::close_now();
+    hrtimer::close();
     with_handler(|h| h.quit());
     crate::core::session::end();
     menu::shutdown();
+    let old_toy = with(|s| s.toy.take()).flatten();
+    drop(old_toy);
     let hwnd = with(|s| {
         s.chat = None;
         s.hwnd
@@ -723,6 +765,18 @@ pub(crate) fn chat_escape() {
 }
 
 // ---------------------------------------------------------------- 窗口
+
+fn work_area_of(hwnd: HWND) -> RECT {
+    unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+        }
+    }
+}
 
 fn work_area_at(pt: POINT, flag: windows::Win32::Graphics::Gdi::MONITOR_FROM_FLAGS) -> RECT {
     unsafe {
@@ -881,35 +935,39 @@ impl Plat {
     fn timers(&mut self, now: u64, evs: &mut Vec<AppEvent>) -> bool {
         let mut pomo_done = false;
         if let Some(p) = self.pomodoro
-            && now >= p.end
+            && pomo_now_ms() >= p.end
         {
             self.pomodoro = None;
             POMO_END.store(0, Ordering::Relaxed);
             evs.push(AppEvent::Pomodoro(PomodoroEv::Done { minutes: p.minutes }));
             pomo_done = true;
         }
-        let lt = LocalTime::now();
-        for k in self.reminders.poll(now, lt) {
-            evs.push(AppEvent::Remind(k));
-        }
-        if let Some(t) = self.watch_next
-            && now >= t
-        {
-            self.watch_next = Some(now + watch::STEP as u64 * 1000);
-            let cfg = crate::core::config::get().moyu;
-            if cfg.enabled {
-                let sample = watch::sample();
-                if let Some(ev) = self.sup.on_sample(&sample, &cfg, self.pomodoro.is_some(), lt.day_key()) {
-                    let (kind, level, minutes) = match &ev {
-                        crate::types::MoyuEv::Nag { level, minutes, .. } => ("nag", *level, *minutes),
-                        crate::types::MoyuEv::Back { minutes } => ("back", 0, *minutes),
-                    };
-                    crate::core::log::log(&format!(
-                        "moyu {{\"type\":\"{kind}\",\"level\":{level},\"minutes\":{minutes}}}"
-                    ));
-                    evs.push(AppEvent::Moyu(ev));
+        let rem_due = self.reminders.next_deadline().is_some_and(|t| now >= t);
+        let watch_due = self.watch_next.is_some_and(|t| now >= t);
+        if rem_due || watch_due {
+            let lt = LocalTime::now();
+            if rem_due {
+                for k in self.reminders.poll(now, lt) {
+                    evs.push(AppEvent::Remind(k));
                 }
-                MOYU_TODAY_SEC.store(self.sup.today_sec(), Ordering::Relaxed);
+            }
+            if watch_due {
+                self.watch_next = Some(now + watch::STEP as u64 * 1000);
+                let cfg = crate::core::config::get().moyu;
+                if cfg.enabled {
+                    let sample = watch::sample();
+                    if let Some(ev) = self.sup.on_sample(&sample, &cfg, self.pomodoro.is_some(), lt.day_key()) {
+                        let (kind, level, minutes) = match &ev {
+                            crate::types::MoyuEv::Nag { level, minutes, .. } => ("nag", *level, *minutes),
+                            crate::types::MoyuEv::Back { minutes } => ("back", 0, *minutes),
+                        };
+                        crate::core::log::log(&format!(
+                            "moyu {{\"type\":\"{kind}\",\"level\":{level},\"minutes\":{minutes}}}"
+                        ));
+                        evs.push(AppEvent::Moyu(ev));
+                    }
+                    MOYU_TODAY_SEC.store(self.sup.today_sec(), Ordering::Relaxed);
+                }
             }
         }
         pomo_done
@@ -934,7 +992,13 @@ impl Plat {
     /// 把一帧（预乘 BGRA）贴到分层窗口
     fn blit(&mut self, f: &Frame) {
         let (fw, fh) = (f.w as i32, f.h as i32);
-        if fw <= 0 || fh <= 0 || f.bgra.len() < (fw * fh * 4) as usize {
+        let Some(need) = (fw > 0 && fh > 0)
+            .then(|| (fw as usize).checked_mul(fh as usize).and_then(|n| n.checked_mul(4)))
+            .flatten()
+        else {
+            return;
+        };
+        if f.bgra.len() < need {
             return;
         }
         if self.dib.as_ref().is_none_or(|d| d.w != fw || d.h != fh) {
@@ -943,10 +1007,16 @@ impl Plat {
         }
         let Some(dib) = &self.dib else { return };
         unsafe {
-            std::ptr::copy_nonoverlapping(f.bgra.as_ptr(), dib.bits, (fw * fh * 4) as usize);
+            std::ptr::copy_nonoverlapping(f.bgra.as_ptr(), dib.bits, need);
         }
-        // 尺寸变了（DPI 变化）：以脚底中点为锚
+        // 尺寸变了（DPI 变化）：以脚底中点为锚；若正在拖拽则按比例缩放 drag_off 防止跳动
         if (fw, fh) != (self.w, self.h) {
+            if LEFT_DOWN.with(|d| d.get()) && self.w > 0 && self.h > 0 {
+                self.drag_off = (
+                    (self.drag_off.0 as f32 * fw as f32 / self.w as f32).round() as i32,
+                    (self.drag_off.1 as f32 * fh as f32 / self.h as f32).round() as i32,
+                );
+            }
             self.x += (self.w - fw) / 2;
             self.y += self.h - fh;
             self.w = fw;
@@ -1035,8 +1105,8 @@ impl Plat {
             PerchKind::WindowTop => {
                 let own: Vec<HWND> = std::iter::once(self.hwnd).chain(self.toy.as_ref().map(|t| t.hwnd)).collect();
                 let Some((h, r)) = perch::foreground(&own) else { return Some(AppEvent::ClimbFailed) };
-                let work: perch::R =
-                    work_area_at(POINT { x: (r.l + r.r) / 2, y: r.t.max(0) + 10 }, MONITOR_DEFAULTTONEAREST).into();
+                // 直接按目标窗口所在显示器取工作区，兼容副屏在主屏上方（负 Y 坐标）的情况
+                let work: perch::R = work_area_of(h).into();
                 let Some(to) = perch::window_perch(r, work, cx, self.w, self.h, self.scale) else {
                     return Some(AppEvent::ClimbFailed);
                 };
@@ -1125,7 +1195,7 @@ impl Plat {
                     if x < wa.left || x + size > wa.right {
                         x = cx - side.signum() * off - size / 2;
                     }
-                    (x.clamp(wa.left, wa.right - size), (self.y + (67.0 * self.scale) as i32).max(wa.top))
+                    (x.clamp(wa.left, (wa.right - size).max(wa.left)), (self.y + (67.0 * self.scale) as i32).max(wa.top))
                 };
                 let mut t = toy::Toy::create(kind, x, y, self.scale)?;
                 t.falling = kind != ToyKind::Teaser;
@@ -1202,6 +1272,9 @@ impl Plat {
 fn create_dib(w: i32, h: i32) -> Option<Dib> {
     unsafe {
         let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() {
+            return None;
+        }
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -1215,7 +1288,10 @@ fn create_dib(w: i32, h: i32) -> Option<Dib> {
             ..Default::default()
         };
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        let Ok(bmp) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
+            let _ = DeleteDC(dc);
+            return None;
+        };
         if bits.is_null() {
             let _ = DeleteObject(HGDIOBJ(bmp.0));
             let _ = DeleteDC(dc);
@@ -1273,7 +1349,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     unsafe {
         match msg {
             WM_APP_EVENT => {
-                let evs: Vec<AppEvent> = EVENT_QUEUE.lock().unwrap().drain(..).collect();
+                let evs: Vec<AppEvent> = EVENT_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
                 for e in evs {
                     emit(e);
                 }
@@ -1281,13 +1357,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_APP_MENU => {
-                let ids: Vec<String> = MENU_QUEUE.lock().unwrap().drain(..).collect();
+                let ids: Vec<String> = MENU_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
                 for id in ids {
                     if let Some(a) = menu::action_for(&id) {
                         on_menu(a);
                     }
                 }
                 pump();
+                LRESULT(0)
+            }
+            WM_APP_CLEAR_MIND => {
+                if mind_menu::confirm_clear(main_hwnd()) {
+                    on_menu(MenuAction::Mind(crate::types::MindAct::Clear));
+                    pump();
+                }
                 LRESULT(0)
             }
             WM_APP_DEBUG_MENU => {
@@ -1336,6 +1419,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 let dbl = msg == WM_LBUTTONDBLCLK;
+                LEFT_DOWN.with(|d| d.set(true));
                 let _ = SetCapture(hwnd);
                 mouse(lp, |s, (x, y, sx, sy)| {
                     s.drag_off = (sx - s.x, sy - s.y);
@@ -1345,6 +1429,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
+                LEFT_DOWN.with(|d| d.set(false));
                 let _ = ReleaseCapture();
                 let mut dbl = None;
                 mouse(lp, |s, (x, y, sx, sy)| {
@@ -1356,6 +1441,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some((x, y)) = dbl {
                     emit(AppEvent::Mouse(MouseEv::DoubleClick { x, y }));
                     pump();
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                // 拖动中被 Alt+Tab / UAC / 弹窗抢走鼠标捕获：主动结束拖拽防止卡死
+                if LEFT_DOWN.with(|d| d.replace(false)) {
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    if let Some(ev) = with(|s| {
+                        s.dbl_pending = false;
+                        MouseEv::Up {
+                            button: Button::Left,
+                            x: (pt.x - s.x) as f32 / s.scale,
+                            y: (pt.y - s.y) as f32 / s.scale,
+                            sx: pt.x,
+                            sy: pt.y,
+                        }
+                    }) {
+                        emit(AppEvent::Mouse(ev));
+                        pump();
+                    }
                 }
                 LRESULT(0)
             }
@@ -1406,6 +1512,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             // 睡眠醒来 / 改了系统时间：马上重排定时器，错过的备忘会在下一次 tick 合并补发
             WM_POWERBROADCAST | WM_TIMECHANGE => {
+                MEMO_NEXT.with(|m| m.set(0));
                 rearm();
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -1420,5 +1527,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
+    }
+}
+
+#[cfg(test)]
+mod pomo_clock_tests {
+    use super::*;
+
+    #[test]
+    fn pomodoro_left_uses_same_clock_as_start() {
+        let prev = POMO_END.load(Ordering::Relaxed);
+        let p = Pomodoro::start(25, pomo_now_ms());
+        POMO_END.store(p.end, Ordering::Relaxed);
+        let left = pomodoro_left();
+        POMO_END.store(prev, Ordering::Relaxed);
+        assert_eq!(left, Some(25));
     }
 }

@@ -31,6 +31,10 @@ pub(super) struct LiveState {
     depth: f32,
     /// 上一帧画的 (表情, 衣服)；表情变了就从旧的淡过去
     shown: Option<(Face, String)>,
+    /// 缓存当前 (表情, 衣服) 对应的贴片可用性，避免 60~120fps 每帧查询
+    avail_key: Option<(Face, String)>,
+    avail_blink: bool,
+    avail_mouth: bool,
     /// 交叉淡化：(旧表情, 开始时刻)
     fade: Option<(Face, u64)>,
     /// 上一帧输出的整体变换 + 那时的动画 (种类, 起点)
@@ -50,6 +54,9 @@ impl LiveState {
             force_low_power: false,
             depth: 0.0,
             shown: None,
+            avail_key: None,
+            avail_blink: false,
+            avail_mouth: false,
             fade: None,
             pet_last: Xf::ID,
             pet_key: None,
@@ -58,23 +65,49 @@ impl LiveState {
     }
 }
 
-/// 周期 period 的相位，带一点缓慢的周期抖动（±4%），每一口气长短略有不同
+/// 周期 period 的相位，带一点缓慢的周期抖动（±4%），每一口气长短略有不同。
+/// 用 f64 做时间取模，避免连续运行 >4.66 小时后 f32 精度退化导致呼吸发卡
 fn phase(now: u64, period: f32, offset: f32) -> f32 {
-    let t = now as f32;
-    let jitter = 0.04 * period / std::f32::consts::TAU * (t / 23_000.0).sin();
-    ((t + jitter * std::f32::consts::TAU) / period + offset).rem_euclid(1.0)
+    let t = now as f64;
+    let p = period as f64;
+    let jitter = 0.04 * p * (t / 23_000.0).sin();
+    (((t + jitter) / p + offset as f64).rem_euclid(1.0)) as f32
 }
 
 impl Behavior {
     fn live_low_power(&self) -> bool { self.live.force_low_power || live::low_power() }
+
+    fn live_avail(&self, kind: Kind) -> bool {
+        if self.live.avail_key.as_ref().is_some_and(|(f, c)| *f == self.face && c == &self.costume) {
+            return match kind { Kind::Blink => self.live.avail_blink, Kind::Mouth => self.live.avail_mouth };
+        }
+        live::available(self.face, &self.costume, kind)
+    }
+
+    fn refresh_live_avail(&mut self) {
+        if self.live.avail_key.as_ref().is_some_and(|(f, c)| *f == self.face && c == &self.costume) {
+            return;
+        }
+        self.live.avail_blink = live::available(self.face, &self.costume, Kind::Blink);
+        self.live.avail_mouth = live::available(self.face, &self.costume, Kind::Mouth);
+        match &mut self.live.avail_key {
+            Some((f, c)) => {
+                *f = self.face;
+                c.clone_from(&self.costume);
+            }
+            None => self.live.avail_key = Some((self.face, self.costume.clone())),
+        }
+    }
 
     /// 呼吸扭曲：None = 关；Some(true) = 睡觉的深呼吸
     fn live_mode(&self) -> Option<bool> {
         if self.routine.is_some() || self.dragging || self.dragging_cls { return None; }
         match self.state {
             St::Sleep => (!self.live_low_power()).then_some(true),
-            // 站着的平静表情也呼吸（以前只有待机/坐/思考，其它表情退回 5fps 的整体缩放）
-            St::Idle | St::Sit | St::Think | St::Hungry | St::Stare | St::Love | St::Shy | St::Happy | St::Surprised if !self.live_low_power() => Some(false),
+            // 站着的平静表情也呼吸（含 v1.1 的 6 个新表情）
+            St::Idle | St::Sit | St::Think | St::Hungry | St::Stare | St::Love | St::Shy | St::Happy | St::Surprised
+            | St::Pout | St::Smug | St::Confused | St::Scared | St::Starry | St::Puff
+                if !self.live_low_power() => Some(false),
             _ => None,
         }
     }
@@ -83,7 +116,7 @@ impl Behavior {
     pub(super) fn blink_allowed(&self) -> bool {
         self.routine.is_none()
             && !matches!(self.state, St::Drag | St::Fall | St::Dance | St::Sleep)
-            && live::available(self.face, &self.costume, Kind::Blink)
+            && self.live_avail(Kind::Blink)
     }
 
     /// 正在念台词 / 聊天语音（不算唱歌、跳舞的伴奏）
@@ -112,26 +145,33 @@ impl Behavior {
             v.bob = phase(now, BOB_MS, pk);
             v.sway = phase(now, SWAY_MS, ps);
         }
+        self.refresh_live_avail();
         if self.blink_allowed() {
             v.blink = self.live.blink.amount(now);
         } else {
             self.live.blink.cancel();
         }
-        let target = if self.speaking() && live::available(self.face, &self.costume, Kind::Mouth) {
+        let target = if self.speaking() && self.live_avail(Kind::Mouth) {
             let rms = if self.io { crate::services::audio::level() } else { self.fake_level };
             live::rms_to_open(rms)
         } else {
             0.0
         };
         v.mouth = live::mouth_alpha(self.live.mouth.step(target, dt));
-        // 表情切换：旧表情盖在上面淡出
-        let cur = (self.face, self.costume.clone());
-        if self.live.shown.as_ref() != Some(&cur) {
+        // 表情切换：旧表情盖在上面淡出（零每帧 String 克隆）
+        let changed = self.live.shown.as_ref().is_none_or(|(pf, pc)| *pf != self.face || pc != &self.costume);
+        if changed {
             self.live.fade = match &self.live.shown {
-                Some((pf, pc)) if *pc == cur.1 && self.xfade_ok(*pf, cur.0) => Some((*pf, now)),
+                Some((pf, pc)) if pc == &self.costume && self.xfade_ok(*pf, self.face) => Some((*pf, now)),
                 _ => None,
             };
-            self.live.shown = Some(cur);
+            match &mut self.live.shown {
+                Some((f, c)) => {
+                    *f = self.face;
+                    c.clone_from(&self.costume);
+                }
+                None => self.live.shown = Some((self.face, self.costume.clone())),
+            }
         }
         if let Some((pf, t0)) = self.live.fade {
             let a = xfade_alpha(now.saturating_sub(t0));
@@ -149,7 +189,9 @@ impl Behavior {
     fn xfade_ok(&self, from: Face, to: Face) -> bool {
         if self.state == St::Walk || self.routine.is_some() || self.dragging_cls { return false; }
         let group = |f: Face| match f {
-            Face::Idle | Face::Happy | Face::Hungry | Face::Think | Face::Shy | Face::Surprised | Face::Love | Face::Stare | Face::Cry | Face::Hiss | Face::Honey | Face::Eat | Face::Yawn => Some(0),
+            Face::Idle | Face::Happy | Face::Hungry | Face::Think | Face::Shy | Face::Surprised | Face::Love
+            | Face::Stare | Face::Cry | Face::Hiss | Face::Honey | Face::Eat | Face::Yawn
+            | Face::Pout | Face::Smug | Face::Confused | Face::Scared | Face::Starry | Face::Puff => Some(0),
             Face::Sit => Some(1),
             _ => None,
         };
@@ -184,7 +226,7 @@ impl Behavior {
         }
         let out = match self.live.pet_from {
             Some((from, t0)) if now < t0 + PET_BLEND_MS => {
-                let t = (now - t0) as f32 / PET_BLEND_MS as f32;
+                let t = now.saturating_sub(t0) as f32 / PET_BLEND_MS as f32;
                 lerp_xf(&from, &pet, 1.0 - (1.0 - t) * (1.0 - t))
             }
             _ => {
@@ -196,10 +238,11 @@ impl Behavior {
         out
     }
 
-    /// 眨眼计时器到点
-    pub(super) fn on_blink(&mut self) {
+    /// 眨眼计时器到点（休眠醒来落后很多时按真实 now 排下一次，不补发一连串）
+    pub(super) fn on_blink(&mut self, real_now: u64) {
         let ok = self.blink_allowed();
-        self.live.blink.fire(self.now, ok, fastrand::f64(), fastrand::f64());
+        let at = real_now.max(self.now);
+        self.live.blink.fire(at, ok, fastrand::f64(), fastrand::f64());
         self.next_blink = self.live.blink.next;
     }
 
@@ -211,7 +254,7 @@ impl Behavior {
         if let Some(d) = self.live.blink.due(now) { ms = ms.min(d.saturating_sub(now).max(1) as u32); }
         // 帧间隔常量归帧率那边管，这里只沿用；扭曲深度渐出的那几百毫秒也算活动帧
         if self.live_mode().is_some() || self.live.depth > 0.001 || self.live.mouth.value > 0.0
-            || (self.speaking() && live::available(self.face, &self.costume, Kind::Mouth))
+            || (self.speaking() && self.live_avail(Kind::Mouth))
         {
             ms = ms.min(crate::core::config::frame_ms());
         }

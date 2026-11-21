@@ -48,11 +48,11 @@ impl Behavior {
     }
 
     pub(super) fn tail_star(&self) -> (Xf, Xf) {
-        let now = self.now as f32;
+        let now = self.now as f64;
         let m = self.mood_cls;
         let sad = m == MoodLevel::Sad;
         let tired = m == MoodLevel::Exhausted;
-        let p = |dur: f32| (now % dur) / dur;
+        let p = |dur: f32| ((now % dur as f64) / dur as f64) as f32;
         let tail = if self.state == St::Happy {
             anim::tail_wag(p(450.0))
         } else if sad || tired {
@@ -95,33 +95,34 @@ impl Behavior {
             let op = self.status_fade.value(now);
             (op > 0.0).then(|| StatusView { opacity: op, ..s.clone() })
         });
-        let mut zzz = Vec::new();
+        self.scene.zzz.clear();
         if let (St::Sleep, Some(since)) = (self.state, self.sleep_since) {
             const Z: [(char, f32, u32); 3] = [('z', 14.0, 0x4285f4), ('z', 18.0, 0x34a853), ('Z', 24.0, 0xea4335)];
             for (i, (ch, size, color)) in Z.iter().enumerate() {
                 let t = now as i64 - since as i64 - i as i64 * 1000;
                 if t < 0 { continue; }
                 let xf = anim::zfloat((t % 3000) as f32 / 3000.0);
-                zzz.push(ZGlyph { ch: *ch, size: *size, color: *color, x: xf.tx, y: xf.ty, opacity: xf.opacity });
+                self.scene.zzz.push(ZGlyph { ch: *ch, size: *size, color: *color, x: xf.tx, y: xf.ty, opacity: xf.opacity });
             }
         }
         let flip = self.flip_value();
-        self.scene = Scene {
-            face: self.face,
-            costume: self.costume.clone(),
-            outfits: self.outfits.clone(),
-            pet,
-            flip,
-            tail,
-            star,
-            glow: self.glow,
-            lean,
-            bubble,
-            status,
-            zzz,
-            fx: self.fx.sprites(now),
-            live,
-        };
+        self.scene.face = self.face;
+        if self.scene.costume != self.costume {
+            self.scene.costume.clone_from(&self.costume);
+        }
+        if self.scene.outfits != self.outfits {
+            self.scene.outfits.clone_from(&self.outfits);
+        }
+        self.scene.pet = pet;
+        self.scene.flip = flip;
+        self.scene.tail = tail;
+        self.scene.star = star;
+        self.scene.glow = self.glow;
+        self.scene.lean = lean;
+        self.scene.bubble = bubble;
+        self.scene.status = status;
+        self.scene.fx = self.fx.sprites(now);
+        self.scene.live = live;
         self.apply_dance_scene();
     }
 }

@@ -1,5 +1,7 @@
 //! 系统杂项：单实例、开机自启（HKCU\...\Run）、ShellExecute 打开路径、宽字符串工具。
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, WPARAM, LPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HANDLE, LPARAM, WPARAM,
+};
 use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
@@ -30,6 +32,7 @@ pub fn single_instance(msg: u32) -> Option<HANDLE> {
     unsafe {
         let h = CreateMutexW(None, false, PCWSTR(name.as_ptr())).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(h);
             // 等第一个实例窗口建好（它可能也刚启动）
             for _ in 0..20 {
                 if let Ok(w) = FindWindowW(WINDOW_CLASS, PCWSTR::null())
@@ -110,7 +113,7 @@ pub fn set_autostart(on: bool) {
         } else {
             RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE)
         };
-        if r != ERROR_SUCCESS {
+        if r != ERROR_SUCCESS && !(!on && r == ERROR_FILE_NOT_FOUND) {
             crate::core::log::log(&format!("autostart {on} failed: {:?}", r));
         }
     }
@@ -127,10 +130,17 @@ pub fn open_url(url: &str) {
     }
 }
 
-/// 用资源管理器 / 默认程序打开文件或文件夹
+/// 用资源管理器 / 默认程序打开文件或文件夹；如果 .json 没关联默认程序则退回记事本
 pub fn open_path(path: &std::path::Path) {
     let p = HSTRING::from(path.as_os_str());
     unsafe {
-        ShellExecuteW(None, w!("open"), &p, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        let r = ShellExecuteW(None, w!("open"), &p, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        if (r.0 as isize) <= 32 {
+            if path.is_file() {
+                let r2 = ShellExecuteW(None, w!("open"), w!("notepad.exe"), &p, PCWSTR::null(), SW_SHOWNORMAL);
+                if (r2.0 as isize) > 32 { return; }
+            }
+            crate::core::log::log(&format!("open_path failed ({}): {}", r.0 as isize, path.display()));
+        }
     }
 }

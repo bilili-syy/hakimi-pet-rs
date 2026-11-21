@@ -41,10 +41,13 @@ fn costume_alias(stem: &str) -> &str {
     }
 }
 
-pub fn costume_src(costume: &str, face: Face) -> String {
+pub fn costume_face_stem(face: Face) -> &'static str {
     let n = costume_alias(face.stem());
-    let f = if COSTUME_FACES.contains(&n) { n } else { "idle" };
-    format!("outfits/{costume}/{f}.png")
+    COSTUME_FACES.iter().copied().find(|&c| c == n).unwrap_or("idle")
+}
+
+pub fn costume_src(costume: &str, face: Face) -> String {
+    format!("outfits/{costume}/{}.png", costume_face_stem(face))
 }
 
 pub fn outfit_offset(face: Face) -> Option<(f32, f32)> {
@@ -90,16 +93,25 @@ pub fn layers_for(face: Face, costume: &str, outfits: &[String]) -> Layers {
     }
 }
 
-/// 解码 + 缩放到 (w,h)。先 2× 盒式降采样到接近目标尺寸，再双三次缩放，避免锯齿
-pub fn load_scaled(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
-    let mut src = Pixmap::decode_png(bytes).ok()?;
-    while src.width() >= w * 2 && src.height() >= h * 2 {
+/// 把已解码的图缩放到 (w,h)。先 2× 盒式降采样到接近目标尺寸，再双三次缩放，避免锯齿
+pub fn scale_pixmap(mut src: Pixmap, w: u32, h: u32) -> Option<Pixmap> {
+    if w == 0 || h == 0 { return None; }
+    while src.width() >= w.saturating_mul(2) && src.height() >= h.saturating_mul(2) {
         src = halve(&src)?;
     }
-    let mut dst = Pixmap::new(w.max(1), h.max(1))?;
+    if src.width() == w && src.height() == h {
+        return Some(src);
+    }
+    let mut dst = Pixmap::new(w, h)?;
     let t = Transform::from_scale(w as f32 / src.width() as f32, h as f32 / src.height() as f32);
     dst.draw_pixmap(0, 0, src.as_ref(), &PixmapPaint { quality: FilterQuality::Bicubic, ..Default::default() }, t, None);
     Some(dst)
+}
+
+/// 解码 + 缩放到 (w,h)
+pub fn load_scaled(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
+    if w == 0 || h == 0 { return None; }
+    scale_pixmap(Pixmap::decode_png(bytes).ok()?, w, h)
 }
 
 fn halve(src: &Pixmap) -> Option<Pixmap> {

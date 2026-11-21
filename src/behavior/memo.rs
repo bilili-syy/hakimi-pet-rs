@@ -16,8 +16,8 @@ const ACK_DELAY: u64 = 550;
 
 #[derive(Debug, Default)]
 pub struct MemoUi {
-    /// 正在响的条目
-    alert: Vec<u64>,
+    /// 正在响的条目（保存完整 MemoHit，多次并发 Due 到来时合并保留全部文案）
+    alert: Vec<MemoHit>,
     alert_until: u64,
     bubble_token: u64,
     /// 叮咚放完再念的那句
@@ -145,9 +145,12 @@ impl Behavior {
         self.call(format!("memo:due:{}", hits.iter().map(|h| h.id.to_string()).collect::<Vec<_>>().join(",")));
         // 藏起来也要叫出来
         self.cmds.push(WinCmd::Show);
-        for h in &hits {
-            if !self.memo.alert.contains(&h.id) {
-                self.memo.alert.push(h.id);
+        if !self.memo.active(self.now) {
+            self.memo.alert.clear();
+        }
+        for h in hits {
+            if !self.memo.alert.iter().any(|x| x.id == h.id) {
+                self.memo.alert.push(h);
             }
         }
         if !matches!(self.state, St::Drag | St::Fall) {
@@ -156,9 +159,9 @@ impl Behavior {
             self.hold_timer(2500, StateAct::Set(St::Idle, Some((8000.0, 15000.0))));
         }
         self.fx(FxKind::Exclaim, 1);
-        let (bubble, voice) = alert_lines(&hits);
+        let (bubble, voice) = alert_lines(&self.memo.alert);
         self.memo.alert_until = self.now + ALERT_MS;
-        self.memo.nag_voice = nag_line(&hits);
+        self.memo.nag_voice = nag_line(&self.memo.alert);
         self.laters.retain(|l| !matches!(l.1, Later::MemoNag(_)));
         for n in 1..=NAGS {
             self.later(NAG_MS * n as u64, Later::MemoNag(n));
@@ -196,7 +199,8 @@ impl Behavior {
 
     /// 没点她：隔一会儿再叮咚 + 追一句，蹦一下
     pub(super) fn memo_nag(&mut self, n: u8) {
-        if self.memo.bubble_token == 0 || !self.memo.active(self.now) {
+        let old_tok = self.memo.bubble_token;
+        if old_tok == 0 || !self.memo.active(self.now) {
             return;
         }
         self.call(format!("memo:nag:{n}"));
@@ -205,9 +209,13 @@ impl Behavior {
             self.play(Shot::Jump);
         }
         self.fx(FxKind::Exclaim, 1);
+        // 分配新 token，避免 stop_voice() 异步发回的旧 AudioDone 撞上本次催促的 after_chime
+        let tok = self.next_token();
+        self.memo.bubble_token = tok;
         if let Some(b) = &mut self.bubble
-            && b.token == self.memo.bubble_token
+            && b.token == old_tok
         {
+            b.token = tok;
             b.hide_at = Some(self.memo.alert_until);
         }
         let v = self.memo.nag_voice.clone();
@@ -227,7 +235,7 @@ impl Behavior {
     }
 
     pub(super) fn memo_ack(&mut self) {
-        let ids = std::mem::take(&mut self.memo.alert);
+        let ids: Vec<u64> = std::mem::take(&mut self.memo.alert).into_iter().map(|h| h.id).collect();
         if ids.is_empty() {
             return;
         }
@@ -246,7 +254,7 @@ impl Behavior {
             return false;
         }
         self.laters.retain(|l| l.1 != Later::MemoAck);
-        let ids = std::mem::take(&mut self.memo.alert);
+        let ids: Vec<u64> = std::mem::take(&mut self.memo.alert).into_iter().map(|h| h.id).collect();
         self.memo_snooze(ids);
         true
     }
@@ -275,7 +283,7 @@ impl Behavior {
     pub(super) fn on_memo_menu(&mut self, a: MemoAct) {
         match a {
             MemoAct::Done(id) => {
-                self.memo.alert.retain(|x| *x != id);
+                self.memo.alert.retain(|x| x.id != id);
                 if self.io {
                     store::complete(id);
                 }
@@ -283,7 +291,7 @@ impl Behavior {
                 self.react(St::Happy, 1500, Some(pick(&["划掉啦，真棒喵！", "完成一件喵～"])));
             }
             MemoAct::Delete(id) => {
-                self.memo.alert.retain(|x| *x != id);
+                self.memo.alert.retain(|x| x.id != id);
                 if self.io {
                     store::delete(id);
                 }
@@ -291,7 +299,7 @@ impl Behavior {
                 self.say("删掉啦喵", 2000);
             }
             MemoAct::Snooze => {
-                let ids = std::mem::take(&mut self.memo.alert);
+                let ids: Vec<u64> = std::mem::take(&mut self.memo.alert).into_iter().map(|h| h.id).collect();
                 self.laters.retain(|l| l.1 != Later::MemoAck);
                 self.memo_snooze(ids);
             }
@@ -354,7 +362,11 @@ impl Behavior {
         self.play(Shot::Bounce);
         self.set_state(St::Happy, None);
         let ms = (2500 + line.encode_utf16().count() as u64 * 150).min(20_000);
-        self.memo_say(line, line, ms);
+        if self.chat_voice_disabled_by_user() {
+            self.say_opts(line, ms, false, SpeakKind::Chat);
+        } else {
+            self.memo_say(line, line, ms);
+        }
         self.hold_timer(2500, StateAct::ChatIdle);
     }
 }
@@ -507,5 +519,27 @@ mod tests {
         ev(&mut b, AppEvent::Menu(MenuAction::Memo(MemoAct::Delete(4))), 12000);
         ev(&mut b, AppEvent::Menu(MenuAction::Memo(MemoAct::ClearDone)), 15000);
         assert!(b.calls.iter().any(|c| c == "memo:clear"));
+    }
+
+    #[test]
+    fn concurrent_due_preserves_all_texts_and_nag_refreshes_token() {
+        let mut b = mk();
+        tick(&mut b, 3000);
+        ev(&mut b, AppEvent::Memo(MemoEv::Due(vec![hit(1, "开会", false)])), 3100);
+        let tok1 = b.memo.bubble_token;
+        // 还没点掉就来了第二条到期备忘：合并后的气泡和补叫都要保留「开会」和「喝药」
+        ev(&mut b, AppEvent::Memo(MemoEv::Due(vec![hit(2, "喝药", false)])), 4000);
+        let bub = &b.scene.bubble.as_ref().unwrap().text;
+        assert!(bub.contains("开会") && bub.contains("喝药"), "{bub}");
+        // 等到一次补叫：必须分配新 token，旧 token 的 AudioDone 不能误触新补叫语音
+        let mut t = 4000;
+        while t < 4000 + NAG_MS + 500 { t += 250; tick(&mut b, t); }
+        let tok_nag = b.memo.bubble_token;
+        assert_ne!(tok_nag, tok1);
+        let speaks_before = b.calls.iter().filter(|c| c.starts_with("speak:")).count();
+        ev(&mut b, AppEvent::AudioDone { token: tok1 }, t + 100);
+        assert_eq!(b.calls.iter().filter(|c| c.starts_with("speak:")).count(), speaks_before);
+        ev(&mut b, AppEvent::AudioDone { token: tok_nag }, t + 200);
+        assert!(b.calls.iter().filter(|c| c.starts_with("speak:")).count() > speaks_before);
     }
 }

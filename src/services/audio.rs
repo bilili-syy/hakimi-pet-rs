@@ -81,45 +81,58 @@ fn done(token: u64) {
     if let Some(tx) = EVENTS.get() { tx.send(AppEvent::AudioDone { token }); }
 }
 
-fn send(cmd: Cmd) {
+fn send(cmd: Cmd) -> bool {
     let token = match &cmd { Cmd::Play { token, .. } => Some(*token), _ => None };
     let ok = sender().is_some_and(|s| s.send(cmd).is_ok());
     if !ok && let Some(t) = token { done(t); }
+    ok
 }
+
+/// 还在通道里排队、尚未被 worker 消费的非试听语音 Play 计数，避免 PLAYING 被过早清零
+static PENDING_VOICE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 播放一句语音（wav/ogg/mp3，或 [`stream_open`] 给的流式句柄），volume 0~1；放完发 AppEvent::AudioDone { token }。
 /// 会顶掉正在念的上一句，不影响正在放的歌
 pub fn play(token: u64, audio: Audio, volume: f32) {
-    if !is_preview(token) { PLAYING.store(true, Ordering::SeqCst); }
+    let tracked = !is_preview(token);
+    if tracked {
+        PENDING_VOICE.fetch_add(1, Ordering::SeqCst);
+        PLAYING.store(true, Ordering::SeqCst);
+    }
     let src = match take_stream(&audio.0) {
         Some(s) => Src::Stream(s),
         None => Src::Mem(audio.0),
     };
-    send(Cmd::Play { token, src, volume, max_secs: 0, music: false });
+    if !send(Cmd::Play { token, src, volume, max_secs: 0, music: false }) && tracked {
+        let prev = PENDING_VOICE.fetch_sub(1, Ordering::SeqCst);
+        if prev <= 1 {
+            PLAYING.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 /// 播放本地歌曲文件（mp3/ogg/wav/m4a/flac/aac），最多 max_secs 秒；放完或到时发 AudioDone。
 /// 顶掉正在放的上一首，不打断语音（有语音时自动压低）
 pub fn play_file(token: u64, path: PathBuf, volume: f32, max_secs: u32) {
-    send(Cmd::Play { token, src: Src::File(path), volume, max_secs, music: true });
+    let _ = send(Cmd::Play { token, src: Src::File(path), volume, max_secs, music: true });
 }
 
 /// 全停（语音和音乐）
-pub fn stop() { send(Cmd::Stop { voice: true, music: true }); }
+pub fn stop() { let _ = send(Cmd::Stop { voice: true, music: true }); }
 
 /// 停掉这个 token 的声音（语音或音乐，哪个在放它停哪个；已经放完的不管）
-pub fn stop_token(token: u64) { send(Cmd::StopToken(token)); }
+pub fn stop_token(token: u64) { let _ = send(Cmd::StopToken(token)); }
 
 /// 内存里的一段音乐（比如跳舞的内置鼓点）走音乐声道：不被说话顶掉，说话时自动压低
 pub fn play_music_mem(token: u64, audio: Audio, volume: f32, max_secs: u32) {
-    send(Cmd::Play { token, src: Src::Mem(audio.0), volume, max_secs, music: true });
+    let _ = send(Cmd::Play { token, src: Src::Mem(audio.0), volume, max_secs, music: true });
 }
 
 /// 只停语音（歌照放）
-pub fn stop_voice() { send(Cmd::Stop { voice: true, music: false }); }
+pub fn stop_voice() { let _ = send(Cmd::Stop { voice: true, music: false }); }
 
 /// 只停音乐（话照说）
-pub fn stop_music() { send(Cmd::Stop { voice: false, music: true }); }
+pub fn stop_music() { let _ = send(Cmd::Stop { voice: false, music: true }); }
 
 /// 当前是否在说话（行为层用来判断气泡要不要多留一会儿、口型要不要动）。音乐和试听不算
 pub fn is_playing() -> bool { PLAYING.load(Ordering::SeqCst) }
@@ -145,6 +158,8 @@ const MAX_OPEN: usize = 8;
 /// 边收边播的 16 位单声道 PCM 缓冲。tts 线程写，声卡线程读
 pub struct PcmStream {
     rate: u32,
+    /// 快速原子标志：缓冲有数据或已结束时为 true，欠载期间声卡线程无需每样本抢 Mutex
+    ready: AtomicBool,
     buf: Mutex<PcmBuf>,
 }
 
@@ -160,18 +175,30 @@ struct PcmBuf {
 
 impl PcmStream {
     fn new(rate: u32) -> Self {
-        Self { rate, buf: Mutex::new(PcmBuf { samples: VecDeque::new(), odd: None, done: false, last_push: Instant::now(), total: 0 }) }
+        Self {
+            rate,
+            ready: AtomicBool::new(false),
+            buf: Mutex::new(PcmBuf { samples: VecDeque::new(), odd: None, done: false, last_push: Instant::now(), total: 0 }),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PcmBuf> { self.buf.lock().unwrap_or_else(|e| e.into_inner()) }
 
-    /// 追加一块小端 16 位 PCM 字节
+    /// 追加一块小端 16 位 PCM 字节（有最大缓冲上限防消费端停止拉取导致内存无限涨）
     pub fn push_pcm16(&self, bytes: &[u8]) {
+        let max_samples = (self.rate as usize).saturating_mul(60);
         let mut b = self.lock();
         let mut it = bytes.iter().copied();
+        let mut pushed = 0usize;
+        let mut push_one = |samples: &mut VecDeque<f32>, lo: u8, hi: u8| {
+            if samples.len() < max_samples {
+                samples.push_back(f32::from(i16::from_le_bytes([lo, hi])) / 32768.0);
+                pushed += 1;
+            }
+        };
         if let Some(lo) = b.odd.take() {
             match it.next() {
-                Some(hi) => b.samples.push_back(f32::from(i16::from_le_bytes([lo, hi])) / 32768.0),
+                Some(hi) => push_one(&mut b.samples, lo, hi),
                 None => {
                     b.odd = Some(lo);
                     return;
@@ -180,7 +207,7 @@ impl PcmStream {
         }
         loop {
             match (it.next(), it.next()) {
-                (Some(lo), Some(hi)) => b.samples.push_back(f32::from(i16::from_le_bytes([lo, hi])) / 32768.0),
+                (Some(lo), Some(hi)) => push_one(&mut b.samples, lo, hi),
                 (Some(lo), None) => {
                     b.odd = Some(lo);
                     break;
@@ -188,20 +215,30 @@ impl PcmStream {
                 _ => break,
             }
         }
-        b.total = b.total.saturating_add(bytes.len() / 2);
+        b.total = b.total.saturating_add(pushed);
         b.last_push = Instant::now();
+        if !b.samples.is_empty() {
+            self.ready.store(true, Ordering::Release);
+        }
     }
 
     /// 收完了（正常结束或出错都调）：放完缓冲里剩下的就结束
-    pub fn finish(&self) { self.lock().done = true; }
+    pub fn finish(&self) {
+        let mut b = self.lock();
+        b.done = true;
+        self.ready.store(true, Ordering::Release);
+    }
 
     pub fn is_done(&self) -> bool { self.lock().done }
 
-    /// 一次最多取 n 个样本；返回 (样本, 是否已经结束且取空)
+    /// 一次最多取 n 个样本；返回是否已经结束且取空
     fn pull(&self, n: usize, out: &mut Vec<f32>) -> bool {
         let mut b = self.lock();
         let k = n.min(b.samples.len());
         out.extend(b.samples.drain(..k));
+        if b.samples.is_empty() && !b.done {
+            self.ready.store(false, Ordering::Release);
+        }
         let stalled = b.samples.is_empty() && b.last_push.elapsed() > STREAM_STALL;
         (b.done || stalled) && b.samples.is_empty()
     }
@@ -240,10 +277,12 @@ struct StreamSrc {
     local: Vec<f32>,
     pos: usize,
     ended: bool,
+    /// 欠载静音样本计数：每 ~10ms 才加锁检查一次断流超时，平时仅做一次原子读
+    underrun: u32,
 }
 
 impl StreamSrc {
-    fn new(s: Arc<PcmStream>) -> Self { Self { s, local: Vec::with_capacity(2048), pos: 0, ended: false } }
+    fn new(s: Arc<PcmStream>) -> Self { Self { s, local: Vec::with_capacity(2048), pos: 0, ended: false, underrun: 0 } }
 }
 
 impl Iterator for StreamSrc {
@@ -254,14 +293,24 @@ impl Iterator for StreamSrc {
             if self.ended { return None; }
             self.local.clear();
             self.pos = 0;
+            // 无新数据也没结束时，仅每 ~10ms 查一次 stall 超时，避免 24kHz 自旋抢 Mutex
+            let stall_every = (self.s.rate / 100).max(128);
+            if !self.s.ready.load(Ordering::Acquire) {
+                self.underrun += 1;
+                if self.underrun < stall_every {
+                    return Some(0.0);
+                }
+                self.underrun = 0;
+            }
             let end = self.s.pull(1024, &mut self.local);
             if self.local.is_empty() {
                 if end {
                     self.ended = true;
                     return None;
                 }
-                return Some(0.0); // 还没收到：先补一个静音样本
+                return Some(0.0);
             }
+            self.underrun = 0;
         }
         let v = self.local[self.pos];
         self.pos += 1;
@@ -302,9 +351,13 @@ fn worker(rx: Receiver<Cmd>) {
         };
         match msg {
             Ok(Cmd::Play { token, src, volume, max_secs, music: is_music }) => {
+                let tracked = !is_music && !is_preview(token);
+                if tracked {
+                    PENDING_VOICE.fetch_sub(1, Ordering::SeqCst);
+                }
                 let slot = if is_music { &mut music } else { &mut voice };
-                finish(slot);
-                let meter = !is_music && !is_preview(token);
+                finish(slot, !is_music);
+                let meter = tracked;
                 match start(&mut sink, src, volume, max_secs, meter) {
                     Ok(player) => {
                         crate::core::log::trace(&format!("audio start:{token}{}", if is_music { " music" } else { "" }));
@@ -319,23 +372,23 @@ fn worker(rx: Receiver<Cmd>) {
                 }
             }
             Ok(Cmd::Stop { voice: v, music: m }) => {
-                if v { finish(&mut voice); }
-                if m { finish(&mut music); }
+                if v { finish(&mut voice, true); }
+                if m { finish(&mut music, false); }
             }
             Ok(Cmd::StopToken(t)) => {
-                for slot in [&mut voice, &mut music] {
-                    if slot.as_ref().is_some_and(|c| c.token == t) { finish(slot); }
-                }
+                if voice.as_ref().is_some_and(|c| c.token == t) { finish(&mut voice, true); }
+                if music.as_ref().is_some_and(|c| c.token == t) { finish(&mut music, false); }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                finish(&mut voice);
-                finish(&mut music);
+                finish(&mut voice, true);
+                finish(&mut music, false);
                 return;
             }
         }
-        for slot in [&mut voice, &mut music] {
+        for (idx, slot) in [&mut voice, &mut music].into_iter().enumerate() {
             if slot.as_ref().is_some_and(|c| c.player.empty()) && let Some(c) = slot.take() {
+                if idx == 0 { set_level(0.0); }
                 done(c.token);
             }
         }
@@ -345,9 +398,10 @@ fn worker(rx: Receiver<Cmd>) {
             m.player.set_volume(duck_volume(m.volume, talking));
             ducked = talking;
         }
-        if voice.is_none() {
-            // 只有队列里确实没有新的 play 时才认为不说话了
-            PLAYING.store(false, Ordering::SeqCst);
+        let voice_playing = voice.as_ref().is_some_and(|c| !is_preview(c.token))
+            || PENDING_VOICE.load(Ordering::SeqCst) > 0;
+        PLAYING.store(voice_playing, Ordering::SeqCst);
+        if !voice_playing {
             set_level(0.0);
         }
         if voice.is_some() || music.is_some() {
@@ -365,10 +419,11 @@ pub fn duck_volume(base: f32, talking: bool) -> f32 {
 }
 
 /// 停掉这个声道当前的声音并发 AudioDone
-fn finish(cur: &mut Option<Current>) {
+fn finish(cur: &mut Option<Current>, is_voice: bool) {
     if let Some(c) = cur.take() {
         c.player.stop();
         drop(c.player);
+        if is_voice { set_level(0.0); }
         done(c.token);
     }
 }

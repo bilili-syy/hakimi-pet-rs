@@ -67,7 +67,7 @@ impl Period {
             Period::Afternoon | Period::Dusk => (if h < 12 { h + 12 } else { h }, 0),
             Period::Evening => match h {
                 12 => (0, 1),
-                1..=4 => (h, 1),
+                0..=4 => (h, 1),
                 5..=11 => (h + 12, 0),
                 _ => (h, 0),
             },
@@ -267,15 +267,31 @@ impl Scan {
             j += 2;
         } else if self.starts(j, "整") {
             j += 1;
-        } else if let Some((mm, mn)) = self.num(j)
-            && mm < 60
-            // 「3点1刻」也认；「3点5分钟后」不是钟点
-            && !self.starts(j + mn, "分钟")
+        } else if self.at(j) == Some('零')
+            && let Some((mm, mn)) = self.num(j + 1)
+            && mm < 10
+            && !self.starts(j + 1 + mn, "分钟")
         {
+            // 「3点零5分」「三点零五分」
             m = mm;
-            j += mn;
+            j += 1 + mn;
             if self.starts(j, "分") {
                 j += 1;
+            }
+        } else if let Some((mm, mn)) = self.num(j)
+            && mm < 60
+            // 「3点1刻」「3点3刻」；「3点5分钟后」不是钟点
+            && !self.starts(j + mn, "分钟")
+        {
+            if self.starts(j + mn, "刻") && matches!(mm, 1 | 3) {
+                m = mm * 15;
+                j += mn + 1;
+            } else {
+                m = mm;
+                j += mn;
+                if self.starts(j, "分") {
+                    j += 1;
+                }
             }
         }
         Some(((h, m), j - i))
@@ -366,10 +382,10 @@ impl Scan {
                 ];
                 f.period = Some(P[p]);
                 n = len;
-            } else if let Some((hm, len)) = self.clock(i) {
+            } else if f.clock.is_none() && let Some((hm, len)) = self.clock(i) {
                 f.clock = Some(hm);
                 n = len;
-            } else if let Some((d, len)) = self.date(i) {
+            } else if f.day.is_none() && let Some((d, len)) = self.date(i) {
                 f.day = Some(d);
                 n = len;
             } else {
@@ -539,8 +555,15 @@ fn resolve(f: &Feat, now: Dt) -> Result<Option<(Dt, Repeat)>, ()> {
         }
         Some(Day::Date { mo, d }) => {
             let (mut y, mut mo2) = (now.y, mo.unwrap_or(now.mo));
-            let mut cand = Dt::new(y, mo2, d, 0, 0);
-            if cand.is_none_or(|c| c < today) {
+            let mut cand = None;
+            let limit = if mo.is_some() { 9 } else { 14 };
+            for _ in 0..limit {
+                if let Some(c) = Dt::new(y, mo2, d, 0, 0)
+                    && c >= today
+                {
+                    cand = Some(c);
+                    break;
+                }
                 if mo.is_some() {
                     y += 1;
                 } else {
@@ -550,7 +573,6 @@ fn resolve(f: &Feat, now: Dt) -> Result<Option<(Dt, Repeat)>, ()> {
                         y += 1;
                     }
                 }
-                cand = Dt::new(y, mo2, d, 0, 0);
             }
             cand.ok_or(())?
         }
@@ -733,28 +755,28 @@ pub fn parse_ai(reply: &str, now: Dt) -> Option<Draft> {
 
 const NO_KEY_LINE: &str = "这个时间哈基米没听懂喵……换个说法？比如「30 分钟后提醒我喝水」「明天 9 点提醒我交报告」";
 
+static MEMO_AI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 本地规则没看懂：后台线程问 AI。是备忘就加上并发 Memo(Reply)，不是就当普通聊天发 ChatReply
 pub fn route_ai(tx: &EventSender, text: String, ctx: ChatCtx) {
     let worker_tx = tx.clone();
     let spawned = std::thread::Builder::new().name("hakimi-memo".into()).spawn(move || {
+        let _g = MEMO_AI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let now = Now::get().dt;
-        if crate::core::config::get().api_key.is_empty() {
+        if crate::core::config::get().api_key.trim().is_empty() {
             worker_tx.send(AppEvent::Memo(MemoEv::Reply { ok: false, text: NO_KEY_LINE.into() }));
             return;
         }
-        let draft = match crate::services::ai::ask_once(&ai_prompt(now), &text) {
-            Ok(r) => parse_ai(&r, now),
-            Err(e) => {
-                crate::core::log::log(&format!("memo ai error {e}"));
-                None
-            }
-        };
-        match draft {
-            Some(d) => {
-                crate::core::memo::add(&d.text, d.time, d.repeat);
-                worker_tx.send(AppEvent::Memo(MemoEv::Reply { ok: true, text: confirm_line(&d, now) }));
-            }
-            None => worker_tx.send(AppEvent::ChatReply(crate::services::ai::chat_blocking(&text, &ctx))),
+        match crate::services::ai::ask_once_reply(&ai_prompt(now), &text, 512) {
+            Ok(r) => match parse_ai(&r, now) {
+                Some(d) => {
+                    crate::core::memo::add(&d.text, d.time, d.repeat);
+                    worker_tx.send(AppEvent::Memo(MemoEv::Reply { ok: true, text: confirm_line(&d, now) }));
+                }
+                None => worker_tx.send(AppEvent::ChatReply(crate::services::ai::chat_blocking(&text, &ctx))),
+            },
+            // 网络/超时/429/401 等传输或鉴权错误直接反馈，不再重打一次 chat_blocking
+            Err(reply) => worker_tx.send(AppEvent::ChatReply(reply)),
         }
     });
     if spawned.is_err() {
@@ -930,5 +952,26 @@ mod tests {
         assert!(parse_ai("不是 JSON", now()).is_none());
         assert!(parse_ai(r#"{"memo":true,"text":"x","time":"明天"}"#, now()).is_none());
         assert!(ai_prompt(now()).contains("2026-11-20 12:41（周五）"));
+    }
+
+    #[test]
+    fn edge_cases_clock_and_rollover() {
+        use Repeat::None;
+        // 零几分 & 几刻
+        check("3点零5分提醒我喝水", "喝水", Some(dt(11, 20, 15, 5)), None);
+        check("下午三点零五分提醒我喝水", "喝水", Some(dt(11, 20, 15, 5)), None);
+        check("提醒我3点1刻开会", "开会", Some(dt(11, 20, 15, 15)), None);
+        check("提醒我3点3刻开会", "开会", Some(dt(11, 20, 15, 45)), None);
+        // 明晚 0 点 = 后天 00:00（而不是明天 00:00）
+        check("明晚0点提醒我抢券", "抢券", Some(dt(11, 22, 0, 0)), None);
+        // 正文里的「3号」不应覆盖前面已解析的「明天」
+        check("明天3点提醒我取3号快递", "取3号快递", Some(dt(11, 21, 15, 0)), None);
+        // 1 月 31 日说「30号」：2 月没有 30 号，顺延到 3 月 30 日
+        let jan31 = Dt::new(2026, 1, 31, 12, 0).unwrap();
+        let Parsed::Memo(d) = parse("30号提醒我还信用卡", jan31) else { panic!("expected memo") };
+        assert_eq!(d.time, Some(Dt::new(2026, 3, 30, 9, 0).unwrap()));
+        // 平年说「2月29日」：顺延到下一个闰年（2028-02-29）
+        let Parsed::Memo(d) = parse("2月29日提醒我庆祝", now()) else { panic!("expected memo") };
+        assert_eq!(d.time, Some(Dt::new(2028, 2, 29, 9, 0).unwrap()));
     }
 }

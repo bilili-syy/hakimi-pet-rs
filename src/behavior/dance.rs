@@ -80,6 +80,7 @@ impl Score {
 
     /// 拍位置 → (动作段下标, 段内进度 0..1, 已进入本段多少拍)
     pub fn step_at(&self, beat: f64) -> (usize, f32, f64) {
+        if self.steps.is_empty() { return (0, 0.0, 0.0); }
         let lb = self.loop_beats() as f64;
         let pos = beat.max(0.0).rem_euclid(lb);
         let mut acc = 0.0;
@@ -502,7 +503,7 @@ impl Behavior {
     fn play_builtin_beat(&mut self, tok: u64, bpm: f32, secs: f32) {
         if !self.io { return; }
         let vol = crate::core::config::get().tts.volume * 0.8;
-        crate::services::audio::play(tok, Audio(beat::synth_wav(bpm, secs + 0.5)), vol);
+        crate::services::audio::play_music_mem(tok, Audio(beat::synth_wav(bpm, secs + 0.5)), vol, secs.ceil() as u32 + 2);
     }
 
     /// 每帧推进（frame_at 里调）

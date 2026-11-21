@@ -212,15 +212,38 @@ pub fn extract_prompt(now: Dt, known: &Book) -> String {
     )
 }
 
-/// 解析模型给的 JSON（容忍 ```json 包裹、前后废话）
-pub fn parse_facts(reply: &str) -> Vec<Fact> {
+/// 模型明确表示「没有新事实」的常见纯文本回复（避免因不是 JSON 数组而反复重试）
+fn is_explicit_empty_reply(s: &str) -> bool {
+    let clean = s
+        .trim()
+        .trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | '。' | '.' | '!' | '！' | '~' | '～'))
+        .trim();
+    matches!(
+        clean.to_ascii_lowercase().as_str(),
+        "none" | "null" | "无" | "没有" | "没有新的" | "没有新事实" | "没有新信息" | "暂无" | "无新事实" | "无新信息"
+    )
+}
+
+/// 解析模型给的 JSON（容忍 ```json 包裹、前后废话）；区分「合法空结果」与「格式损坏/截断」
+pub fn parse_facts_strict(reply: &str) -> Result<Vec<Fact>, ()> {
     let s = reply.trim();
-    let (Some(a), Some(b)) = (s.find('['), s.rfind(']')) else { return vec![] };
-    if b <= a {
-        return vec![];
+    // 尝试找一段合法 JSON 数组，避免正文前面有普通 `[...]` 导致外层切片解析失败
+    let mut parsed: Option<Vec<Value>> = None;
+    for (a, _) in s.match_indices('[') {
+        for (b, _) in s.rmatch_indices(']') {
+            if b <= a { break; }
+            if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&s[a..=b]) {
+                parsed = Some(arr);
+                break;
+            }
+        }
+        if parsed.is_some() { break; }
     }
-    let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&s[a..=b]) else { return vec![] };
-    arr.iter()
+    let Some(arr) = parsed else {
+        return if is_explicit_empty_reply(s) { Ok(Vec::new()) } else { Err(()) };
+    };
+    Ok(arr
+        .iter()
         .filter_map(|v| {
             let text = v.get("text").and_then(Value::as_str)?.trim();
             if text.is_empty() {
@@ -231,7 +254,13 @@ pub fn parse_facts(reply: &str) -> Vec<Fact> {
             Some(Fact { kind, text: text.to_string(), key: key.chars().take(12).collect() })
         })
         .take(10)
-        .collect()
+        .collect())
+}
+
+/// 解析模型给的 JSON（兼容旧签名，测试用）
+#[cfg(test)]
+pub fn parse_facts(reply: &str) -> Vec<Fact> {
+    parse_facts_strict(reply).unwrap_or_default()
 }
 
 /// chat.json 里 t > since 的消息拼成对话文本（去掉情绪标签）；返回 (文本, 最新的 t)
@@ -268,22 +297,47 @@ pub fn extract_in_background() {
     }
 }
 
+const MAX_PARSE_FAILS: u32 = 3;
+static EXTRACT_PARSE_FAILS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn record_parse_fail(counter: &std::sync::atomic::AtomicU32) -> bool {
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n >= MAX_PARSE_FAILS {
+        counter.store(0, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 fn extract_blocking() {
-    if crate::core::config::get().api_key.is_empty() {
+    if crate::core::config::get().api_key.trim().is_empty() {
         return;
     }
+    let clear_gen = store::clear_gen();
     let book = store::snapshot();
     let history = crate::services::ai::load_history();
     let (dialogue, last) = dialogue_since(&history, book.extracted_at);
     if dialogue.trim().is_empty() {
         return;
     }
-    match crate::services::ai::ask_once(&extract_prompt(Now::get().dt, &book), &dialogue) {
-        Ok(r) => {
-            let facts = parse_facts(&r);
-            let n = store::merge_ai(&facts, last);
-            crate::core::log::log(&format!("mind: extracted {} facts, {n} changed", facts.len()));
-        }
+    match crate::services::ai::ask_once_max(&extract_prompt(Now::get().dt, &book), &dialogue, 1024) {
+        Ok(r) => match parse_facts_strict(&r) {
+            Ok(facts) => {
+                EXTRACT_PARSE_FAILS.store(0, Ordering::Relaxed);
+                let n = store::merge_ai_if(&facts, last, clear_gen);
+                crate::core::log::log(&format!("mind: extracted {} facts, {n} changed", facts.len()));
+            }
+            Err(()) => {
+                // 偶发截断先重试；连续失败 3 次则推进游标，防止不按 JSON 格式回复的模型无限重发
+                if record_parse_fail(&EXTRACT_PARSE_FAILS) {
+                    let _ = store::merge_ai_if(&[], last, clear_gen);
+                    crate::core::log::log("mind: 3 consecutive invalid extract replies, advancing cursor");
+                } else {
+                    crate::core::log::log("mind: extract reply not valid json array, will retry");
+                }
+            }
+        },
         // 只记一句，不带服务器返回的内容（可能回显提示词里的记忆）
         Err(_) => crate::core::log::log("mind: extract request failed"),
     }
@@ -428,6 +482,22 @@ mod tests {
         assert!(parse_facts("[]").is_empty());
         assert!(parse_facts("没有新的").is_empty());
         assert!(parse_facts("[oops").is_empty());
+        // parse_facts_strict：空数组和明确「没有新的/NONE」算合法空结果；截断/损坏算 Err
+        assert_eq!(parse_facts_strict("[]"), Ok(vec![]));
+        assert_eq!(parse_facts_strict("没有新的。"), Ok(vec![]));
+        assert_eq!(parse_facts_strict("NONE"), Ok(vec![]));
+        assert!(parse_facts_strict("[oops").is_err());
+        assert!(parse_facts_strict("今天天气不错").is_err());
+        // 连续 3 次解析失败才触发推进游标
+        let c = std::sync::atomic::AtomicU32::new(0);
+        assert!(!record_parse_fail(&c));
+        assert!(!record_parse_fail(&c));
+        assert!(record_parse_fail(&c));
+        assert!(!record_parse_fail(&c));
+        let with_prefix = "[note] 以下是结果：\n[{\"kind\":\"like\",\"text\":\"主人喜欢喝拿铁\"}]";
+        let ok = parse_facts_strict(with_prefix).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].text, "主人喜欢喝拿铁");
     }
 
     #[test]

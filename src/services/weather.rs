@@ -21,49 +21,58 @@ pub fn url_for(city: &str) -> String {
     format!("https://wttr.in/{enc}?format=j1&lang=zh")
 }
 static BUSY: AtomicBool = AtomicBool::new(false);
-/// (结果, 拿到时的 epoch 毫秒)
-static LATEST: Mutex<Option<(WeatherInfo, u64, String)>> = Mutex::new(None);
-
-fn epoch_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
+static WANT_REFRESH: AtomicBool = AtomicBool::new(false);
+/// (结果, 拿到时的单调时间, 规范化后的城市名)
+static LATEST: Mutex<Option<(WeatherInfo, std::time::Instant, String)>> = Mutex::new(None);
 
 /// 最近一次拿到的天气（3 小时以上的旧数据不算）
 pub fn latest() -> Option<WeatherInfo> {
     let g = LATEST.lock().unwrap_or_else(|e| e.into_inner());
-    let city = crate::core::config::get().weather_city;
+    let city = crate::core::config::get().weather_city.trim().to_string();
     // 换了城市，旧缓存作废
     g.as_ref()
-        .filter(|(_, t, c)| epoch_ms().saturating_sub(*t) < 3 * 3600 * 1000 && *c == city)
+        .filter(|(_, t, c)| t.elapsed() < std::time::Duration::from_secs(3 * 3600) && *c == city)
         .map(|(w, _, _)| w.clone())
 }
 
-/// 后台拉一次天气（已经在拉就忽略）
+/// 后台拉一次天气（已经在拉时记一次待重试，换城市后不丢新请求）
 pub fn refresh(tx: &EventSender) {
     if BUSY.swap(true, Ordering::AcqRel) {
+        WANT_REFRESH.store(true, Ordering::Release);
         return;
     }
     let tx = tx.clone();
-    let r = std::thread::Builder::new().name("weather".into()).stack_size(256 * 1024).spawn(move || {
-        let city = crate::core::config::get().weather_city;
-        let w = crate::services::net::get_text(&url_for(&city), 20, 512 * 1024)
-            .ok()
-            .filter(|(st, _)| *st == 200)
-            .and_then(|(_, body)| parse(&body));
-        match &w {
-            Some(w) => crate::core::log::log(&format!(
-                "weather {:?} {}C {:?}/{:?} rain {:?}% {}",
-                w.kind, w.temp_c, w.high_c, w.low_c, w.rain_chance, w.desc
-            )),
-            None => crate::core::log::log("weather unavailable"),
-        }
-        if let Some(w) = &w {
-            *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = Some((w.clone(), epoch_ms(), city));
+    let r = std::thread::Builder::new().name("weather".into()).spawn(move || {
+        loop {
+            WANT_REFRESH.store(false, Ordering::Release);
+            let city = crate::core::config::get().weather_city.trim().to_string();
+            let w = crate::services::net::get_text(&url_for(&city), 20, 512 * 1024)
+                .ok()
+                .filter(|(st, _)| *st == 200)
+                .and_then(|(_, body)| parse(&body));
+            match &w {
+                Some(w) => crate::core::log::log(&format!(
+                    "weather {:?} {}C {:?}/{:?} rain {:?}% {}",
+                    w.kind, w.temp_c, w.high_c, w.low_c, w.rain_chance, w.desc
+                )),
+                None => crate::core::log::log("weather unavailable"),
+            }
+            // 请求期间若用户改了城市，丢弃旧城市结果并立即拉新城市
+            let cur_city = crate::core::config::get().weather_city.trim().to_string();
+            if cur_city != city {
+                continue;
+            }
+            if let Some(w) = &w {
+                *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = Some((w.clone(), std::time::Instant::now(), city));
+            }
+            if let Some(w) = w {
+                tx.send(AppEvent::Weather(w));
+            }
+            if !WANT_REFRESH.swap(false, Ordering::AcqRel) {
+                break;
+            }
         }
         BUSY.store(false, Ordering::Release);
-        if let Some(w) = w {
-            tx.send(AppEvent::Weather(w));
-        }
     });
     if r.is_err() {
         BUSY.store(false, Ordering::Release);
@@ -99,7 +108,9 @@ pub fn kind_name(k: WeatherKind) -> &'static str {
 }
 
 fn num(v: &Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        .filter(|n| n.is_finite())
 }
 
 fn first_value(v: &Value) -> Option<String> {

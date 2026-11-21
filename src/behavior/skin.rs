@@ -20,6 +20,13 @@ pub const CATEGORIES: &[(&str, &[&str])] = &[
     ("rub", lines::RUB), ("dizzy", lines::DIZZY), ("surprised", lines::SURPRISED), ("cry", lines::CRY),
     ("hiss", lines::HISS), ("yawn", lines::YAWN), ("love", lines::LOVE), ("stare", lines::STARE),
     ("dance", lines::DANCE), ("song", lines::SONG), ("honey", lines::HONEY), ("fast", lines::FAST), ("slow", lines::SLOW),
+    ("pout", lines::POUT), ("smug", lines::SMUG), ("confused", lines::CONFUSED), ("scared", lines::SCARED),
+    ("starry", lines::STARRY), ("puff", lines::PUFF), ("alone", lines::ALONE), ("typing", lines::TYPING),
+    ("pounce", lines::POUNCE), ("fs_off", lines::FS_OFF), ("music", lines::MUSIC), ("birthday", lines::BIRTHDAY),
+    ("new_year", lines::NEW_YEAR), ("valentine", lines::VALENTINE), ("halloween", lines::HALLOWEEN),
+    ("xmas", lines::XMAS), ("year_end", lines::YEAR_END), ("spring", lines::SPRING), ("lantern", lines::LANTERN),
+    ("dragon_boat", lines::DRAGON_BOAT), ("qixi", lines::QIXI), ("mid_autumn", lines::MID_AUTUMN),
+    ("intro", lines::INTRO), ("welcome", lines::WELCOME),
 ];
 
 /// 换角色成功后她说的话（分类名 skin_on，可以在 lines 里覆盖）

@@ -130,7 +130,7 @@ impl Behavior {
             self.sense.quiet_since = self.now;
             self.stop_voice();
             if matches!(self.state, St::Idle | St::Walk) { self.set_state(St::Sit, None); }
-        } else if self.now.saturating_sub(self.sense.quiet_since) >= 5 * 60_000 && !self.sense_busy() {
+        } else if !self.flush_off_work() && self.now.saturating_sub(self.sense.quiet_since) >= 5 * 60_000 && !self.sense_busy() {
             self.react(St::Smug, 2400, Some(pick(lines::FS_OFF)));
         }
     }

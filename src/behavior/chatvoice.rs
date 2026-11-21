@@ -142,8 +142,8 @@ fn read_ms(text: &str) -> u64 {
 impl Behavior {
     /// 这次回复要不要走「语音回答」
     pub(super) fn chat_voice_on(&self) -> bool {
-        if self.routine.is_some() {
-            return false; // 跳舞时不念（内置鼓点走语音声道）；放歌时照念（audio 混音）
+        if self.routine.is_some() || self.sense.quiet || self.memo_ringing() {
+            return false; // 跳舞、全屏安静、备忘响铃时不走语音回答
         }
         if !self.io {
             return self.fake_chat_voice;
@@ -266,6 +266,14 @@ impl Behavior {
     pub(super) fn cv_interrupted(&mut self) {
         if self.cv.as_ref().is_some_and(|cv| cv.shown > 0) {
             self.cv = None;
+            self.emotion_cv_clear();
+        }
+    }
+
+    /// 用户关掉了语音开关：把还没念完的文字直接出全，清空队列不再续播已预合成的段
+    pub(super) fn cv_disable_tts(&mut self) {
+        if self.cv.is_some() {
+            self.cv_give_up();
         }
     }
 
@@ -274,15 +282,33 @@ impl Behavior {
         self.waiting = false;
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(true)));
         self.act(Act::Chat);
-        self.play(Shot::Bounce);
-        self.set_state(St::Happy, None);
-        self.hold_timer(2500, StateAct::ChatIdle);
-        // 情绪表情（behavior/emotion.rs）：出字这一刻换表情，念完 2 秒后回平时
-        self.emotion_cv_reveal();
+        if !self.dragging && !matches!(self.state, St::Drag | St::Fall) {
+            self.play(Shot::Bounce);
+            self.set_state(St::Happy, None);
+            self.hold_timer(2500, StateAct::ChatIdle);
+            // 情绪表情（behavior/emotion.rs）：出字这一刻换表情，念完 2 秒后回平时
+            self.emotion_cv_reveal();
+        } else {
+            self.emotion_cv_clear();
+        }
     }
 
     /// 显示下一段的字（累加到气泡里），同时开始念它；然后预合成下一段
     fn cv_reveal(&mut self, audio: Option<(Audio, u64)>) {
+        // 合成期间切到全屏或备忘响铃：不再出声或盖掉备忘气泡
+        if self.sense.quiet || self.memo_ringing() {
+            if self.memo_ringing() {
+                if self.cv.as_ref().is_some_and(|cv| cv.shown == 0) {
+                    self.waiting = false;
+                    self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(true)));
+                }
+                self.cv = None;
+                self.emotion_cv_clear();
+                return;
+            }
+            self.cv_give_up();
+            return;
+        }
         let Some(cv) = &mut self.cv else { return };
         let first = cv.shown == 0;
         let started = cv.started;

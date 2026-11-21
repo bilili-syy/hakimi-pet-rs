@@ -121,6 +121,8 @@ enum Later {
     MemoNag(u8),
     /// 第一次见面的开场白：第 n 句
     Intro(u8),
+    /// 下班提醒被全屏安静或忙碌挡住：稍后补说
+    OffWorkRetry,
 }
 
 /// 透明度过渡（transition: opacity 0.25s）
@@ -279,6 +281,8 @@ pub struct Behavior {
     pub(crate) fake_chat_voice_off: bool,
     /// 这次运行里已经提醒过「去设置里填 Key」
     key_hint_shown: bool,
+    /// 被全屏安静/忙碌挡住的下班提醒截止时刻（过期后不再补说）
+    pending_off_work: Option<u64>,
 }
 
 impl Behavior {
@@ -363,6 +367,7 @@ impl Behavior {
             fake_chat_voice: false,
             fake_chat_voice_off: false,
             key_hint_shown: false,
+            pending_off_work: None,
             memo: memo::MemoUi::default(),
             sense: sense::SenseUi::default(),
             mind: emotion::MindUi::default(),
@@ -531,8 +536,8 @@ impl Behavior {
                         self.on_later(l);
                     }
                 }
-                2 => self.on_blink(),
-                3 => self.on_tick(),
+                2 => self.on_blink(now),
+                3 => self.on_tick(now),
                 // 走路换帧跟着整体动画的颠步走（live.rs）
                 4 => self.walk_tick(now),
                 5 => self.on_dance_beat(),
@@ -552,15 +557,15 @@ impl Behavior {
     }
 
     fn next_due(&self) -> Option<u64> {
-        let mut v: Vec<u64> = vec![self.next_blink, self.next_tick];
-        if let Some((d, _)) = self.state_timer { v.push(d); }
-        v.extend(self.laters.iter().map(|l| l.0));
-        if self.state == St::Walk { v.push(self.next_walk_frame); }
-        if let Some(d) = &self.dance { v.push(d.next_beat); }
-        if let Some(Some(h)) = self.bubble.as_ref().map(|b| b.hide_at) { v.push(h); }
-        if let Some(h) = self.status_hide_at { v.push(h); }
-        if let Some(d) = self.play.next_due() { v.push(d); }
-        v.into_iter().min()
+        let mut best = self.next_blink.min(self.next_tick);
+        if let Some((d, _)) = self.state_timer { best = best.min(d); }
+        for l in &self.laters { best = best.min(l.0); }
+        if self.state == St::Walk { best = best.min(self.next_walk_frame); }
+        if let Some(d) = &self.dance { best = best.min(d.next_beat); }
+        if let Some(h) = self.bubble.as_ref().and_then(|b| b.hide_at) { best = best.min(h); }
+        if let Some(h) = self.status_hide_at { best = best.min(h); }
+        if let Some(d) = self.play.next_due() { best = best.min(d); }
+        Some(best)
     }
 
     fn animating(&self) -> bool {
@@ -605,9 +610,22 @@ impl Behavior {
         }
     }
 
+    /// 当前是否正忙于高优先级状态（真实拖拽/下落/备忘响铃/小游戏/跳舞）
+    /// 注意：不检查 St::Drag（该枚举也被番茄钟摸鱼/重摔表情复用），物理拖拽以 self.dragging 为准
+    pub(super) fn is_busy_for_interruption(&self) -> bool {
+        self.dragging
+            || self.state == St::Fall
+            || self.memo_ringing()
+            || self.routine.is_some()
+            || self.play.game.is_some()
+    }
+
     fn on_later(&mut self, l: Later) {
         match l {
             Later::LevelUp(name) => {
+                if self.dragging || matches!(self.state, St::Drag | St::Fall) || self.memo_ringing() {
+                    return;
+                }
                 self.react(St::Starry, 3000, Some(pickv(lines::level_up(name))));
                 self.fx(FxKind::Spark, 8);
                 self.fx(FxKind::Heart, 4);
@@ -615,14 +633,21 @@ impl Behavior {
             Later::HoneyFast => {
                 self.fast_until = self.now + 60_000;
                 self.glow = true;
+                self.later(60_000, Later::HoneyFastEnd);
+                if self.is_busy_for_interruption() || self.chatting || self.waiting {
+                    return;
+                }
                 self.say(&pick(lines::FAST), 2000);
                 self.fx(FxKind::Spark, 6);
                 self.go_walk();
-                self.later(60_000, Later::HoneyFastEnd);
             }
             Later::HoneyFastEnd => {
-                self.glow = false;
-                if self.now >= self.fast_until { self.say(&pick(lines::SLOW), 2000); }
+                if self.now >= self.fast_until {
+                    self.glow = false;
+                    if !self.memo_ringing() && !self.sense.quiet {
+                        self.say(&pick(lines::SLOW), 2000);
+                    }
+                }
             }
             Later::Greet if self.intro => {
                 self.react(St::Starry, 3500, Some(lines::INTRO[0].to_string()));
@@ -637,17 +662,24 @@ impl Behavior {
                     self.intro = false;
                     return;
                 }
+                if self.is_busy_for_interruption() || self.chatting {
+                    self.later(3000, Later::Intro(n as u8));
+                    return;
+                }
                 self.react(St::Happy, 4500, Some(lines::INTRO[n].to_string()));
                 self.later(5500, Later::Intro(n as u8 + 1));
             }
             Later::Greet => {
-                let slot = self.greet_slot_line();
+                if self.is_busy_for_interruption() || self.sense.quiet {
+                    return;
+                }
+                // 先判节日与深夜，避免节日/深夜问候白白消耗早/午/晚问候槽位
                 let fest = self.festive_line();
                 let line = if let Some(f) = fest.clone() {
                     f
                 } else if Self::is_night() {
                     pick(lines::NIGHT)
-                } else if let Some(l) = slot {
+                } else if let Some(l) = self.greet_slot_line() {
                     l
                 } else if self.saved_existed && self.away_min >= 60.0 {
                     pickv(lines::back(&lines::fmt_away(self.away_min)))
@@ -658,7 +690,11 @@ impl Behavior {
                 self.react(st, 1500, Some(line));
                 if self.stats.data.hunger < 30.0 { self.later(3000, Later::Beg); }
             }
-            Later::Beg => self.go_beg(),
+            Later::Beg => {
+                if !self.is_busy_for_interruption() && !self.chatting && !self.waiting && !self.sense.quiet {
+                    self.go_beg();
+                }
+            }
             Later::Prewarm => {
                 let items = lines::prewarm_items();
                 self.call(format!("prewarm:{}", items.len()));
@@ -667,14 +703,16 @@ impl Behavior {
             Later::ChatVoiceTimeout(t) => self.cv_timeout(t),
             Later::MemoAck => self.memo_ack(),
             Later::MemoNag(n) => self.memo_nag(n),
+            Later::OffWorkRetry => { self.flush_off_work(); }
         }
     }
 
     // 眨眼（on_blink）：2~6 秒一次、偶尔连眨两下，用眼部贴片淡入淡出 → behavior/live.rs
 
     /// 每 20 秒结算一次数值，并处理「饿了主动讨食」「睡饱自己醒」
-    fn on_tick(&mut self) {
-        self.next_tick = self.now + 20_000;
+    fn on_tick(&mut self, real_now: u64) {
+        // 用真实当前时间续排，防止电脑休眠醒来后补跑上千次 tick 和上千次 save.json 写盘
+        self.next_tick = real_now.max(self.now) + 20_000;
         self.stats.tick(self.state == St::Sleep);
         self.save();
         let (hunger, energy) = (self.stats.data.hunger, self.stats.data.energy);

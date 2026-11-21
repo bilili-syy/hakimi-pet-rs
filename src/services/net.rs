@@ -10,22 +10,76 @@ use std::time::Duration;
 /// 连接超时（全局超时由调用方给）
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 
-/// 缓存一个 Agent（代理+超时没变就复用，省得每次重建 TLS 配置和连接池）
-static CACHE: Mutex<Option<(String, u64, ureq::Agent)>> = Mutex::new(None);
+/// 按代理缓存 Agent（每个代理复用一份 TLS 配置和连接池；请求超时按单次请求设置，不因超时不同而重建）
+static CACHE: Mutex<Vec<(String, ureq::Agent)>> = Mutex::new(Vec::new());
+
+/// 脱敏代理地址里的 `user:pass@` 凭据（写日志用）
+pub fn redact_proxy(proxy: &str) -> String {
+    if let Some((head, tail)) = proxy.split_once("://")
+        && let Some((_, host)) = tail.rsplit_once('@')
+    {
+        return format!("{head}://***@{host}");
+    }
+    if let Some((_, host)) = proxy.rsplit_once('@') {
+        return format!("***@{host}");
+    }
+    proxy.to_string()
+}
+
+/// 判断目标 URL 是否指向本机回环地址（跟随系统代理时跳过代理，支持本地 Ollama / LM Studio 等）
+pub fn is_loopback_url(url: &str) -> bool {
+    let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url.trim());
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = if let Some(h) = host_port.strip_prefix('[') {
+        h.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn cached_agent(proxy: &str) -> ureq::Agent {
+    {
+        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, a)) = cache.iter().find(|(p, _)| p == proxy) {
+            return a.clone();
+        }
+    }
+    // 在锁外构建 TLS 配置和连接池，避免跨服务互相阻塞
+    let a = build(proxy, 0);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, existing)) = cache.iter().find(|(p, _)| p == proxy) {
+        return existing.clone();
+    }
+    if cache.len() >= 4 {
+        cache.remove(0);
+    }
+    cache.push((proxy.to_string(), a.clone()));
+    a
+}
+
+/// 为指定 URL 取复用的 Agent（跟随系统代理且访问 localhost/127.0.0.1 时自动直连）
+fn agent_for_url(url: &str) -> ureq::Agent {
+    let cfg = crate::core::config::get().proxy;
+    let cfg = cfg.trim();
+    let proxy = if !cfg.is_empty() {
+        normalize(cfg).unwrap_or_default()
+    } else if is_loopback_url(url) {
+        String::new()
+    } else {
+        system_proxy().and_then(|s| normalize(&s)).unwrap_or_default()
+    };
+    cached_agent(&proxy)
+}
 
 /// 带代理、带超时（整次请求 timeout_secs 秒）的 Agent。非 2xx 不当错误，调用方自己看 status。
 pub fn agent(timeout_secs: u64) -> ureq::Agent {
-    let proxy = current_proxy();
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((p, t, a)) = cache.as_ref()
-        && *p == proxy
-        && *t == timeout_secs
-    {
-        return a.clone();
+    if timeout_secs == 0 {
+        cached_agent(&current_proxy())
+    } else {
+        build(&current_proxy(), timeout_secs)
     }
-    let a = build(&proxy, timeout_secs);
-    *cache = Some((proxy, timeout_secs, a.clone()));
-    a
 }
 
 fn build(proxy: &str, timeout_secs: u64) -> ureq::Agent {
@@ -35,7 +89,7 @@ fn build(proxy: &str, timeout_secs: u64) -> ureq::Agent {
         match ureq::Proxy::new(proxy) {
             Ok(p) => Some(p),
             Err(e) => {
-                crate::core::log::log(&format!("proxy ignored ({proxy}): {e}"));
+                crate::core::log::log(&format!("proxy ignored ({}): {e}", redact_proxy(proxy)));
                 None
             }
         }
@@ -75,7 +129,9 @@ pub fn current_proxy() -> String {
 pub fn normalize(s: &str) -> Option<String> {
     let s = s.trim();
     if s.is_empty() { return None; }
-    let pick = if s.contains('=') {
+    // 仅当不含 "://" 时才按 Windows 注册表 `http=host:port;https=host:port` 解析，
+    // 避免带 `=` 的代理密码 URL（如 base64 密码）被误判
+    let pick = if !s.contains("://") && s.contains('=') {
         let mut http = None;
         let mut https = None;
         for part in s.split(';') {
@@ -135,10 +191,20 @@ pub fn system_proxy() -> Option<String> { None }
 /// 响应体上限（TTS 返回 base64 wav，一句话通常几百 KB）
 pub const MAX_BODY: u64 = 32 * 1024 * 1024;
 
+fn req_timeout(timeout_secs: u64) -> Option<Duration> {
+    if timeout_secs == 0 { None } else { Some(Duration::from_secs(timeout_secs)) }
+}
+
 /// POST JSON，返回 (HTTP 状态码, 响应文本)。非 2xx 也返回 Ok，由调用方判断。
 /// headers 里可能有 API Key，这里不打日志。
 pub fn post_json(url: &str, headers: &[(&str, &str)], body: &serde_json::Value, timeout_secs: u64) -> Result<(u16, String), ureq::Error> {
-    post_json_via(&agent(timeout_secs), url, headers, body)
+    let agent = agent_for_url(url);
+    let mut req = agent.post(url).config().timeout_global(req_timeout(timeout_secs)).build().header("Content-Type", "application/json");
+    for (k, v) in headers { req = req.header(*k, *v); }
+    let mut res = req.send(serde_json::to_vec(body).unwrap_or_default())?;
+    let status = res.status().as_u16();
+    let text = res.body_mut().with_config().limit(MAX_BODY).read_to_string()?;
+    Ok((status, text))
 }
 
 /// 同 post_json，但用指定的 Agent
@@ -154,7 +220,14 @@ pub fn post_json_via(agent: &ureq::Agent, url: &str, headers: &[(&str, &str)], b
 /// POST JSON，返回 (HTTP 状态码, 响应体读取器)：流式（SSE）边收边读用。非 2xx 也返回 Ok。
 /// 读取器丢掉就断开连接（可以用来真正掐断不要了的请求）。headers 里可能有 API Key，这里不打日志。
 pub fn post_json_stream(url: &str, headers: &[(&str, &str)], body: &serde_json::Value, timeout_secs: u64) -> Result<(u16, ureq::BodyReader<'static>), ureq::Error> {
-    let mut req = agent(timeout_secs).post(url).header("Content-Type", "application/json").header("Accept", "text/event-stream");
+    let agent = agent_for_url(url);
+    let mut req = agent
+        .post(url)
+        .config()
+        .timeout_global(req_timeout(timeout_secs))
+        .build()
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream");
     for (k, v) in headers { req = req.header(*k, *v); }
     let res = req.send(serde_json::to_vec(body).unwrap_or_default())?;
     let status = res.status().as_u16();
@@ -164,10 +237,17 @@ pub fn post_json_stream(url: &str, headers: &[(&str, &str)], body: &serde_json::
 
 /// GET，返回 (HTTP 状态码, 响应文本)。响应体最多 limit 字节
 pub fn get_text(url: &str, timeout_secs: u64, limit: u64) -> Result<(u16, String), ureq::Error> {
-    let mut res = agent(timeout_secs).get(url).call()?;
+    let agent = agent_for_url(url);
+    let mut res = agent.get(url).config().timeout_global(req_timeout(timeout_secs)).build().call()?;
     let status = res.status().as_u16();
     let text = res.body_mut().with_config().limit(limit).read_to_string()?;
     Ok((status, text))
+}
+
+/// 遮蔽错误信息里可能回显的 Key
+pub fn redact_key(msg: &str, key: &str) -> String {
+    let k = key.trim();
+    if k.len() >= 6 { msg.replace(k, "***") } else { msg.to_string() }
 }
 
 /// 网络类错误（连不上/DNS/TLS/代理），对应原版 `net::ERR_*` / `fetch failed`
@@ -192,11 +272,19 @@ mod tests {
     fn proxy_formats() {
         assert_eq!(normalize("127.0.0.1:7890").as_deref(), Some("http://127.0.0.1:7890"));
         assert_eq!(normalize("http://127.0.0.1:7890").as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(normalize("http://user:p=ss@127.0.0.1:7890").as_deref(), Some("http://user:p=ss@127.0.0.1:7890"));
         assert_eq!(normalize("http=127.0.0.1:1;https=127.0.0.1:2;socks=127.0.0.1:3").as_deref(), Some("http://127.0.0.1:2"));
         assert_eq!(normalize("http=127.0.0.1:1").as_deref(), Some("http://127.0.0.1:1"));
         assert_eq!(normalize("socks=127.0.0.1:3"), None);
         assert_eq!(normalize("socks5://127.0.0.1:3"), None);
         assert_eq!(normalize("  "), None);
+        assert_eq!(super::redact_proxy("http://user:secret@127.0.0.1:7890"), "http://***@127.0.0.1:7890");
+        assert_eq!(super::redact_proxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
+        assert!(super::is_loopback_url("http://127.0.0.1:11434/v1"));
+        assert!(super::is_loopback_url("http://localhost:8080/v1"));
+        assert!(super::is_loopback_url("http://[::1]:11434/v1"));
+        assert!(!super::is_loopback_url("https://localhost.example.com/v1"));
+        assert!(!super::is_loopback_url("https://api.openai.com/v1"));
     }
 }
 

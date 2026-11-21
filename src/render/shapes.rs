@@ -15,7 +15,8 @@ pub fn paint(c: u32, a: f32) -> Paint<'static> {
 }
 
 pub fn rrect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
-    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 { return None; }
+    let r = if r.is_finite() { r.min(w / 2.0).min(h / 2.0).max(0.0) } else { 0.0 };
     let k = 0.552_284_8 * r;
     let mut pb = PathBuilder::new();
     pb.move_to(x + r, y);
@@ -122,18 +123,47 @@ fn glyph_path(shape: FxShape) -> Option<Path> {
     pb.finish()
 }
 
+struct GlyphCache {
+    heart: Option<Path>,
+    spark: Option<Path>,
+    note: [Option<Path>; 3],
+    drop: Option<Path>,
+    drop_hi: Option<Path>,
+    anger: Option<Path>,
+    exclaim: Option<Path>,
+}
+
+static GLYPHS: std::sync::LazyLock<GlyphCache> = std::sync::LazyLock::new(|| {
+    let mut pb = PathBuilder::new();
+    pb.push_oval(tiny_skia::Rect::from_xywh(-0.17, 0.02, 0.09, 0.18).unwrap());
+    GlyphCache {
+        heart: glyph_path(FxShape::Heart),
+        spark: glyph_path(FxShape::Spark),
+        note: [glyph_path(FxShape::Note(0)), glyph_path(FxShape::Note(1)), glyph_path(FxShape::Note(2))],
+        drop: glyph_path(FxShape::Drop),
+        drop_hi: pb.finish(),
+        anger: glyph_path(FxShape::Anger),
+        exclaim: glyph_path(FxShape::Exclaim),
+    }
+});
+
 /// 在 t（已经包含字号缩放、以字形中心为原点）下画一个特效字形：先白描边（原版 text-shadow），再填色
 pub fn draw_glyph(pm: &mut Pixmap, shape: FxShape, color: u32, opacity: f32, t: Transform, size: f32) {
-    let Some(path) = glyph_path(shape) else { return };
+    let path = match shape {
+        FxShape::Heart => GLYPHS.heart.as_ref(),
+        FxShape::Spark => GLYPHS.spark.as_ref(),
+        FxShape::Note(n) => GLYPHS.note[(n as usize).min(2)].as_ref(),
+        FxShape::Drop => GLYPHS.drop.as_ref(),
+        FxShape::Anger => GLYPHS.anger.as_ref(),
+        FxShape::Exclaim => GLYPHS.exclaim.as_ref(),
+    };
+    let Some(path) = path else { return };
     let stroke = Stroke { width: 2.0 / size.max(1.0), ..Default::default() };
-    pm.stroke_path(&path, &paint(0xFFFFFF, opacity * 0.85), &stroke, t, None);
-    pm.fill_path(&path, &paint(color, opacity), FillRule::Winding, t, None);
-    if shape == FxShape::Drop {
-        // 高光
-        let mut pb = PathBuilder::new();
-        pb.push_oval(tiny_skia::Rect::from_xywh(-0.17, 0.02, 0.09, 0.18).unwrap());
-        if let Some(p) = pb.finish() {
-            pm.fill_path(&p, &paint(0xFFFFFF, opacity * 0.8), FillRule::Winding, t, None);
-        }
+    pm.stroke_path(path, &paint(0xFFFFFF, opacity * 0.85), &stroke, t, None);
+    pm.fill_path(path, &paint(color, opacity), FillRule::Winding, t, None);
+    if shape == FxShape::Drop
+        && let Some(p) = GLYPHS.drop_hi.as_ref()
+    {
+        pm.fill_path(p, &paint(0xFFFFFF, opacity * 0.8), FillRule::Winding, t, None);
     }
 }

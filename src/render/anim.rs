@@ -41,6 +41,7 @@ fn bezier(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
 }
 
 pub fn ease(e: Ease, t: f32) -> f32 {
+    if !t.is_finite() { return 0.0; }
     match e {
         Ease::Linear => t.clamp(0.0, 1.0),
         Ease::Ease => bezier(0.25, 0.1, 0.25, 1.0, t),
@@ -67,7 +68,7 @@ pub fn kf(p: f32, keys: &[(f32, f32)], e: Ease) -> f32 {
 
 /// 动画迭代进度：elapsed 毫秒、单次时长、次数（None = infinite）。播完返回 None
 pub fn cycle(elapsed_ms: f32, dur_ms: f32, iterations: Option<u32>) -> Option<f32> {
-    if dur_ms <= 0.0 { return None; }
+    if !dur_ms.is_finite() || dur_ms <= 0.0 || !elapsed_ms.is_finite() { return None; }
     let e = elapsed_ms.max(0.0);
     if let Some(n) = iterations && e >= dur_ms * n as f32 { return None; }
     Some((e % dur_ms) / dur_ms)

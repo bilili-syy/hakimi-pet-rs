@@ -134,10 +134,23 @@ pub(super) fn aa_round(hdc: HDC, rc: RECT, radius: f32, bg: COLORREF, fill: COLO
 }
 
 pub(super) fn fill(hdc: HDC, rc: RECT, c: COLORREF) {
+    let cached = if c == BG {
+        BRUSH.with(|b| b.get())
+    } else if c == SIDE {
+        SIDE_BRUSH.with(|b| b.get())
+    } else if c == FIELD {
+        FIELD_BRUSH.with(|b| b.get())
+    } else {
+        0
+    };
     unsafe {
-        let b = CreateSolidBrush(c);
-        windows::Win32::Graphics::Gdi::FillRect(hdc, &rc, b);
-        let _ = DeleteObject(HGDIOBJ(b.0));
+        if cached != 0 {
+            windows::Win32::Graphics::Gdi::FillRect(hdc, &rc, HBRUSH(cached as *mut _));
+        } else {
+            let b = CreateSolidBrush(c);
+            windows::Win32::Graphics::Gdi::FillRect(hdc, &rc, b);
+            let _ = DeleteObject(HGDIOBJ(b.0));
+        }
     }
 }
 

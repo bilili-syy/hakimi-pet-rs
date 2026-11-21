@@ -31,7 +31,7 @@ const NEED_KEY: &str = "哈基米的大脑还没接上喵……右键我点「�
 /// 第一次打开聊天、还没填 Key 时她先说的一句（behavior 用）
 pub const KEY_HINT: &str = "要先帮哈基米接上大脑喵～右键我点「⚙️ 设置…」，在「AI 聊天」里选个服务商、填好 API Key，里面有获取 Key 的链接哦！";
 const ERR_GENERIC: &str = "哈基米的脑袋卡住了喵……等会儿再问我一次？";
-const ERR_TIMEOUT: &str = "网络好慢喵……30 秒都没等到回音。是不是代理没开？";
+const ERR_TIMEOUT: &str = "网络好慢喵……等了好久都没等到回音。是不是代理没开？";
 const ERR_KEY: &str = "API Key 好像不对喵……右键「⚙️ 设置…」检查一下？里面有「测试连接」按钮哦";
 const ERR_429: &str = "问得太快啦，额度用完了喵，歇一会儿再来";
 const ERR_NET: &str = "连不上服务器喵……国内要开代理才能找到 Gemini 哦";
@@ -47,8 +47,12 @@ pub struct ChatCtx {
     pub days: u32,
 }
 
-/// 同一时间只处理一条聊天（chat.json 读改写不打架）
-static BUSY: Mutex<()> = Mutex::new(());
+/// 只保护 chat.json 读写（不再跨 60~100s HTTP 持锁，避免 UI 线程点「忘记聊天记录」卡死）
+static HISTORY_LOCK: Mutex<()> = Mutex::new(());
+/// 每次清空历史 +1，在途聊天回来若代数已变则不再回写旧历史
+static HISTORY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 同一时间在途聊天计数（后台线程顺序化只针对网络发送，不阻塞 clear_history）
+static IN_FLIGHT: Mutex<()> = Mutex::new(());
 
 /// 后台线程发请求，完成后 tx.send(AppEvent::ChatReply(..))
 pub fn chat(tx: &EventSender, text: String, ctx: ChatCtx) {
@@ -65,12 +69,17 @@ pub fn chat(tx: &EventSender, text: String, ctx: ChatCtx) {
 /// 同步版本（在调用线程上阻塞），返回给用户看的结果
 pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
     let c = crate::core::config::get();
-    if c.api_key.is_empty() {
+    if c.api_key.trim().is_empty() {
         return ChatReply { ok: false, need_key: true, text: NEED_KEY.into() };
     }
-    let _g = BUSY.lock().unwrap_or_else(|e| e.into_inner());
-    let mut history = load_history();
-    history.push(json!({ "role": "user", "text": user_text, "t": now_ms() }));
+    let _net_guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let (hist_gen, mut history) = {
+        let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst);
+        let mut h = load_history();
+        h.push(json!({ "role": "user", "text": user_text, "t": now_ms() }));
+        (g, h)
+    };
     let start = history.len().saturating_sub(MAX_HISTORY);
     let system = persona(&c, ctx);
     // 角色包的 persona 追加在末尾（内置哈基米原样）
@@ -87,20 +96,24 @@ pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
     };
     match r {
         Ok(reply) => {
-            history.push(json!({ "role": "model", "text": reply, "t": now_ms() }));
-            save_history(&history);
+            let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            if HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst) == hist_gen {
+                history.push(json!({ "role": "model", "text": reply, "t": now_ms() }));
+                save_history(&history);
+            }
             ChatReply { ok: true, need_key: false, text: reply }
         }
         Err(e) => {
-            crate::core::log::log(&format!("ai error {}", e.detail));
+            crate::core::log::log(&format!("ai error {}", redact(&e.detail, &c.api_key)));
             ChatReply { ok: false, need_key: false, text: e.user_text().into() }
         }
     }
 }
 
-/// 清空 chat.json（原版 saveHistory([])，写一个空数组）
+/// 清空 chat.json（原版 saveHistory([])，写一个空数组）。绝不等待在途 HTTP 请求
 pub fn clear_history() {
-    let _g = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+    let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    HISTORY_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     save_history(&[]);
 }
 
@@ -194,11 +207,11 @@ impl AiError {
     fn other(detail: impl Into<String>) -> Self { Self { kind: ErrKind::Other, detail: detail.into() } }
 }
 
-fn post(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value, AiError> {
-    post_t(url, headers, body, TIMEOUT_SECS)
+fn post(url: &str, headers: &[(&str, &str)], body: &Value, key: &str) -> Result<Value, AiError> {
+    post_t(url, headers, body, TIMEOUT_SECS, key)
 }
 
-fn post_t(url: &str, headers: &[(&str, &str)], body: &Value, timeout: u64) -> Result<Value, AiError> {
+fn post_t(url: &str, headers: &[(&str, &str)], body: &Value, timeout: u64, key: &str) -> Result<Value, AiError> {
     let (status, text) = super::net::post_json(url, headers, body, timeout).map_err(|e| {
         let kind = if matches!(e, ureq::Error::Timeout(_)) {
             ErrKind::Timeout
@@ -207,7 +220,7 @@ fn post_t(url: &str, headers: &[(&str, &str)], body: &Value, timeout: u64) -> Re
         } else {
             ErrKind::Other
         };
-        AiError { kind, detail: e.to_string() }
+        AiError { kind, detail: redact(&e.to_string(), key) }
     })?;
     let json: Option<Value> = serde_json::from_str(&text).ok();
     if !(200..300).contains(&status) {
@@ -220,7 +233,9 @@ fn post_t(url: &str, headers: &[(&str, &str)], body: &Value, timeout: u64) -> Re
                 v => Some(v.to_string()),
             }))
             .unwrap_or_else(|| text.chars().take(200).collect());
-        return Err(AiError { kind: ErrKind::Status(status), detail: format!("HTTP {status}: {msg}") });
+        let safe_msg = super::net::redact_key(&msg, key);
+        let short: String = safe_msg.trim().chars().take(200).collect();
+        return Err(AiError { kind: ErrKind::Status(status), detail: format!("HTTP {status}: {short}") });
     }
     json.ok_or_else(|| AiError::other("bad json"))
 }
@@ -241,19 +256,58 @@ fn encode_component(s: &str) -> String {
 fn msg_text(m: &Value) -> &str { m.get("text").and_then(Value::as_str).unwrap_or("") }
 fn is_user(m: &Value) -> bool { m.get("role").and_then(Value::as_str) == Some("user") }
 
+fn is_gemini_25_flash(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("2.5-flash")
+}
+
+fn is_gemini_25_pro(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("2.5-pro")
+}
+
+fn is_gemini_3(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("gemini-3")
+}
+
+/// 思考/推理型模型：内部思考 token 也算在 maxOutputTokens / max_tokens 里，需要留足预算避免 MAX_TOKENS 空回复
+fn is_reasoning_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let tail = m.rsplit('/').next().unwrap_or(&m);
+    let o_series = |p: &str| tail == p || tail.starts_with(&format!("{p}-"));
+    m.contains("gemini-2.5")
+        || m.contains("gemini-3")
+        || m.contains("thinking")
+        || m.contains("reasoner")
+        || m.contains("deepseek-r1")
+        || m.contains("qwq")
+        || o_series("o1")
+        || o_series("o3")
+        || o_series("o4")
+}
+
+const CHAT_MAX_TOKENS: u32 = 512;
+const REASONING_MAX_TOKENS: u32 = 2048;
+
 pub fn gemini_body(model: &str, system: &str, history: &[Value]) -> Value {
     let contents: Vec<Value> = history
         .iter()
         .map(|m| json!({ "role": if is_user(m) { "user" } else { "model" }, "parts": [{ "text": msg_text(m) }] }))
         .collect();
+    let flash25 = is_gemini_25_flash(model);
+    let max_tokens = if is_reasoning_model(model) && !flash25 { REASONING_MAX_TOKENS } else { CHAT_MAX_TOKENS };
     let mut body = json!({
         "system_instruction": { "parts": [{ "text": system }] },
         "contents": contents,
-        "generationConfig": { "temperature": 0.9, "maxOutputTokens": 300 },
+        "generationConfig": { "temperature": 0.9, "maxOutputTokens": max_tokens },
     });
-    if model.contains("2.5-flash") {
-        // 桌宠聊天不需要深度思考，省时间
+    if flash25 {
+        // Gemini 2.5 Flash 支持关闭思考，桌宠聊天省时间也不烧输出额度
         body["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": 0 });
+    } else if is_gemini_25_pro(model) {
+        // Gemini 2.5 Pro 最低允许 128；压低思考预算避免把 maxOutputTokens 烧光
+        body["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": 128 });
+    } else if is_gemini_3(model) {
+        // Gemini 3 用 thinkingLevel 控思考深度，"low" 兼顾 Flash/Pro 并明显降低聊天延迟
+        body["generationConfig"]["thinkingConfig"] = json!({ "thinkingLevel": "low" });
     }
     body
 }
@@ -263,13 +317,33 @@ pub fn add_search(body: &mut Value) {
     body["tools"] = json!([{ "google_search": {} }]);
 }
 
+fn provider_base<'a>(provider: &str, base_url: &'a str) -> &'a str {
+    let b = base_url.trim();
+    let b = if b.is_empty() {
+        if provider == "openai" { "https://api.openai.com/v1" } else { "https://generativelanguage.googleapis.com/v1beta" }
+    } else {
+        b
+    };
+    b.trim_end_matches('/')
+}
+
+/// 统一按 provider 组装 (URL, 鉴权头名, 鉴权头值)
+fn endpoint(provider: &str, base_url: &str, model: &str, key: &str) -> (String, &'static str, String) {
+    let base = provider_base(provider, base_url);
+    if provider == "openai" {
+        (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}"))
+    } else {
+        (format!("{base}/models/{}:generateContent", encode_component(model)), "x-goog-api-key", key.to_string())
+    }
+}
+
 fn call_gemini(c: &crate::core::config::Config, system: &str, history: &[Value], search: bool) -> Result<String, AiError> {
-    let base = if c.base_url.is_empty() { "https://generativelanguage.googleapis.com/v1beta" } else { c.base_url.as_str() };
-    let base = base.strip_suffix('/').unwrap_or(base);
-    let url = format!("{base}/models/{}:generateContent", encode_component(&c.model));
-    let mut body = gemini_body(&c.model, system, history);
+    let key = c.api_key.trim();
+    let model = c.model.trim();
+    let (url, h_name, h_val) = endpoint("gemini", &c.base_url, model, key);
+    let mut body = gemini_body(model, system, history);
     if search { add_search(&mut body); }
-    let json = post_t(&url, &[("x-goog-api-key", &c.api_key)], &body, if search { SEARCH_TIMEOUT_SECS } else { TIMEOUT_SECS })?;
+    let json = post_t(&url, &[(h_name, &h_val)], &body, if search { SEARCH_TIMEOUT_SECS } else { TIMEOUT_SECS }, key)?;
     parse_gemini(&json)
 }
 
@@ -279,16 +353,24 @@ pub fn parse_gemini(json: &Value) -> Result<String, AiError> {
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
         .and_then(Value::as_array)
-        .map(|parts| parts.iter().map(|p| p.get("text").and_then(Value::as_str).unwrap_or("")).collect())
+        .map(|parts| {
+            parts
+                .iter()
+                // 跳过 Gemini 思考模型的 thought 片段，防止思维链漏进气泡和记忆
+                .filter(|p| p.get("thought").and_then(Value::as_bool) != Some(true))
+                .map(|p| p.get("text").and_then(Value::as_str).unwrap_or(""))
+                .collect()
+        })
         .unwrap_or_default();
-    if text.is_empty() {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         let reason = cand.and_then(|c| c.get("finishReason")).and_then(Value::as_str);
         return Err(AiError::other(match reason {
             Some(r) => format!("空回复（{r}）"),
             None => "空回复".into(),
         }));
     }
-    Ok(text.trim().to_string())
+    Ok(trimmed.to_string())
 }
 
 pub fn openai_body(model: &str, system: &str, history: &[Value]) -> Value {
@@ -296,16 +378,17 @@ pub fn openai_body(model: &str, system: &str, history: &[Value]) -> Value {
     messages.extend(
         history.iter().map(|m| json!({ "role": if is_user(m) { "user" } else { "assistant" }, "content": msg_text(m) })),
     );
-    json!({ "model": model, "temperature": 0.9, "max_tokens": 300, "messages": messages })
+    let max_tokens = if is_reasoning_model(model) { REASONING_MAX_TOKENS } else { CHAT_MAX_TOKENS };
+    json!({ "model": model, "temperature": 0.9, "max_tokens": max_tokens, "messages": messages })
 }
 
 fn call_openai(c: &crate::core::config::Config, system: &str, history: &[Value], search: bool) -> Result<String, AiError> {
-    let base = if c.base_url.is_empty() { "https://api.openai.com/v1" } else { c.base_url.as_str() };
-    let base = base.strip_suffix('/').unwrap_or(base);
-    let auth = format!("Bearer {}", c.api_key);
-    let mut body = openai_body(&c.model, system, history);
+    let key = c.api_key.trim();
+    let model = c.model.trim();
+    let (url, h_name, h_val) = endpoint("openai", &c.base_url, model, key);
+    let mut body = openai_body(model, system, history);
     if search { add_search(&mut body); }
-    let json = post_t(&format!("{base}/chat/completions"), &[("Authorization", &auth)], &body, if search { SEARCH_TIMEOUT_SECS } else { TIMEOUT_SECS })?;
+    let json = post_t(&url, &[(h_name, &h_val)], &body, if search { SEARCH_TIMEOUT_SECS } else { TIMEOUT_SECS }, key)?;
     parse_openai(&json)
 }
 
@@ -316,35 +399,63 @@ pub fn parse_openai(json: &Value) -> Result<String, AiError> {
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(Value::as_str)
-        .unwrap_or("");
+        .unwrap_or("")
+        .trim();
     if text.is_empty() { return Err(AiError::other("空回复")); }
-    Ok(text.trim().to_string())
+    Ok(text.to_string())
 }
 
-/// 一次性提问：不带聊天记录、不写 chat.json、温度 0。给备忘录的时间提取用（services::memo_parse）。
+/// 一次性提问内部实现（ask_once_max / ask_once_reply 共用，避免多处维护 provider 拼装）
+fn ask_once_inner(c: &crate::core::config::Config, system: &str, user: &str, max_tokens: u32) -> Result<String, AiError> {
+    let key = c.api_key.trim();
+    let model = c.model.trim();
+    let history = [json!({ "role": "user", "text": user })];
+    let (url, h_name, h_val) = endpoint(&c.provider, &c.base_url, model, key);
+    if c.provider == "openai" {
+        let mut body = openai_body(model, system, &history);
+        let limit = if is_reasoning_model(model) { max_tokens.max(REASONING_MAX_TOKENS) } else { max_tokens };
+        body["temperature"] = json!(0);
+        body["max_tokens"] = json!(limit);
+        post(&url, &[(h_name, &h_val)], &body, key).and_then(|j| parse_openai(&j))
+    } else {
+        let mut body = gemini_body(model, system, &history);
+        let limit = if is_reasoning_model(model) && !is_gemini_25_flash(model) {
+            max_tokens.max(REASONING_MAX_TOKENS)
+        } else {
+            max_tokens
+        };
+        body["generationConfig"]["temperature"] = json!(0);
+        body["generationConfig"]["maxOutputTokens"] = json!(limit);
+        post(&url, &[(h_name, &h_val)], &body, key).and_then(|j| parse_gemini(&j))
+    }
+}
+
+/// 一次性提问（可指定 max_tokens）：不带聊天记录、不写 chat.json、温度 0。
 /// 返回的错误只是给日志看的描述，不含 Key。
-pub fn ask_once(system: &str, user: &str) -> Result<String, String> {
+pub fn ask_once_max(system: &str, user: &str, max_tokens: u32) -> Result<String, String> {
     let c = crate::core::config::get();
-    if c.api_key.is_empty() {
+    if c.api_key.trim().is_empty() {
         return Err("no api key".into());
     }
-    let history = [json!({ "role": "user", "text": user })];
-    let r = if c.provider == "openai" {
-        let base = if c.base_url.is_empty() { "https://api.openai.com/v1" } else { c.base_url.as_str() };
-        let base = base.strip_suffix('/').unwrap_or(base);
-        let auth = format!("Bearer {}", c.api_key);
-        let mut body = openai_body(&c.model, system, &history);
-        body["temperature"] = json!(0);
-        post(&format!("{base}/chat/completions"), &[("Authorization", &auth)], &body).and_then(|j| parse_openai(&j))
-    } else {
-        let base = if c.base_url.is_empty() { "https://generativelanguage.googleapis.com/v1beta" } else { c.base_url.as_str() };
-        let base = base.strip_suffix('/').unwrap_or(base);
-        let url = format!("{base}/models/{}:generateContent", encode_component(&c.model));
-        let mut body = gemini_body(&c.model, system, &history);
-        body["generationConfig"]["temperature"] = json!(0);
-        post(&url, &[("x-goog-api-key", &c.api_key)], &body).and_then(|j| parse_gemini(&j))
-    };
-    r.map_err(|e| e.detail)
+    ask_once_inner(&c, system, user, max_tokens).map_err(|e| e.detail)
+}
+
+/// 一次性提问：默认 512 tokens（供备忘录时间解析/主动关心用；结构化长 JSON 提取请用 ask_once_max）
+pub fn ask_once(system: &str, user: &str) -> Result<String, String> {
+    ask_once_max(system, user, 512)
+}
+
+/// 一次性提问并返回给用户看的错误提示（区分网络/鉴权/限流错误，避免备忘录 AI 失败后再重复请求一次）
+pub fn ask_once_reply(system: &str, user: &str, max_tokens: u32) -> Result<String, ChatReply> {
+    let c = crate::core::config::get();
+    let key = c.api_key.trim();
+    if key.is_empty() {
+        return Err(ChatReply { ok: false, need_key: true, text: NEED_KEY.into() });
+    }
+    ask_once_inner(&c, system, user, max_tokens).map_err(|e| {
+        crate::core::log::log(&format!("memo ai error {}", redact(&e.detail, key)));
+        ChatReply { ok: false, need_key: false, text: e.user_text().into() }
+    })
 }
 
 // ------------------------------------------------------------------ 设置窗口「测试连接」
@@ -368,19 +479,10 @@ pub fn test_connection(p: &TestParams) -> Result<(u64, String), String> {
     let agent = super::net::agent_with_proxy(&p.proxy, 25);
     let system = "你是连接测试。只回复一个字：喵";
     let history = [json!({ "role": "user", "text": "ping" })];
-    let base_in = p.base_url.trim();
+    let (url, h_name, h_val) = endpoint(&p.provider, &p.base_url, model, key);
+    let body = if p.provider == "openai" { openai_body(model, system, &history) } else { gemini_body(model, system, &history) };
     let t0 = std::time::Instant::now();
-    let r = if p.provider == "openai" {
-        let base = if base_in.is_empty() { "https://api.openai.com/v1" } else { base_in };
-        let base = base.trim_end_matches('/');
-        let auth = format!("Bearer {key}");
-        super::net::post_json_via(&agent, &format!("{base}/chat/completions"), &[("Authorization", &auth)], &openai_body(model, system, &history))
-    } else {
-        let base = if base_in.is_empty() { "https://generativelanguage.googleapis.com/v1beta" } else { base_in };
-        let base = base.trim_end_matches('/');
-        let url = format!("{base}/models/{}:generateContent", encode_component(model));
-        super::net::post_json_via(&agent, &url, &[("x-goog-api-key", key)], &gemini_body(model, system, &history))
-    };
+    let r = super::net::post_json_via(&agent, &url, &[(h_name, &h_val)], &body);
     let ms = t0.elapsed().as_millis() as u64;
     let (status, text) = r.map_err(|e| explain_net(&e))?;
     let json: Option<Value> = serde_json::from_str(&text).ok();
@@ -478,21 +580,46 @@ mod tests {
         assert_eq!(g["contents"][1]["role"], "model");
         assert_eq!(g["contents"][0]["parts"][0]["text"], "hi");
         assert_eq!(g["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
-        assert_eq!(g["generationConfig"]["maxOutputTokens"], 300);
+        assert_eq!(g["generationConfig"]["maxOutputTokens"], CHAT_MAX_TOKENS);
+        // 大小写不敏感
+        assert_eq!(gemini_body("Gemini-2.5-Flash-Lite", "sys", &h)["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
+        // Gemini 2.5 Pro：最低允许 128，且留足 maxOutputTokens 防 MAX_TOKENS 空回复
+        let g25p = gemini_body("gemini-2.5-pro", "sys", &h);
+        assert_eq!(g25p["generationConfig"]["thinkingConfig"]["thinkingBudget"], 128);
+        assert_eq!(g25p["generationConfig"]["maxOutputTokens"], REASONING_MAX_TOKENS);
+        // Gemini 3 思考模型：设 thinkingLevel="low" 降延迟，同时留足 maxOutputTokens
+        let g3 = gemini_body("gemini-3-flash-preview", "sys", &h);
+        assert_eq!(g3["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low");
+        assert_eq!(g3["generationConfig"]["maxOutputTokens"], REASONING_MAX_TOKENS);
         assert!(gemini_body("gemini-2.0-pro", "sys", &h)["generationConfig"].get("thinkingConfig").is_none());
         let o = openai_body("gpt-4o-mini", "sys", &h);
         assert_eq!(o["messages"][0]["role"], "system");
         assert_eq!(o["messages"][2]["role"], "assistant");
-        assert_eq!(o["max_tokens"], 300);
+        assert_eq!(o["max_tokens"], CHAT_MAX_TOKENS);
+        // qwen2.5 不是思考模型，不应误判
+        assert_eq!(openai_body("qwen2.5-72b-instruct", "sys", &h)["max_tokens"], CHAT_MAX_TOKENS);
+        // 经 OpenAI 兼容中转的思考型模型也留足 max_tokens
+        assert_eq!(openai_body("gemini-3.8-flash-tiered", "sys", &h)["max_tokens"], REASONING_MAX_TOKENS);
+        assert_eq!(openai_body("deepseek-reasoner", "sys", &h)["max_tokens"], REASONING_MAX_TOKENS);
+        assert_eq!(openai_body("openai/o3-mini", "sys", &h)["max_tokens"], REASONING_MAX_TOKENS);
     }
 
     #[test]
     fn parse_replies() {
         let g = json!({"candidates":[{"content":{"parts":[{"text":" 你好"},{"text":"喵 "}]}}]});
         assert_eq!(parse_gemini(&g).unwrap(), "你好喵");
+        // 思考型模型的 thought part 不应混进正文，也不应单独当有效正文
+        let g_thought = json!({"candidates":[{"content":{"parts":[{"text":"内心推理","thought":true},{"text":"你好喵"}]}}]});
+        assert_eq!(parse_gemini(&g_thought).unwrap(), "你好喵");
+        let g_only_thought = json!({"candidates":[{"content":{"parts":[{"text":"只有思考","thought":true}]}}]});
+        assert!(parse_gemini(&g_only_thought).is_err());
+        // 纯空白不算有效回复
+        let g_ws = json!({"candidates":[{"content":{"parts":[{"text":"   \n\t "}]}}]});
+        assert!(parse_gemini(&g_ws).is_err());
         let e = parse_gemini(&json!({"candidates":[{"finishReason":"SAFETY"}]})).unwrap_err();
         assert_eq!(e.detail, "空回复（SAFETY）");
         assert_eq!(parse_openai(&json!({"choices":[{"message":{"content":"ok\n"}}]})).unwrap(), "ok");
+        assert!(parse_openai(&json!({"choices":[{"message":{"content":"   \n"}}]})).is_err());
         assert!(parse_openai(&json!({})).is_err());
     }
 

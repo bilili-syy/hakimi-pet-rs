@@ -28,9 +28,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateIcon, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetDlgItem, GetWindowTextLengthW,
     GetWindowTextW, HICON, HMENU, IDC_ARROW, IDC_HAND, IDYES, IDNO, IsDialogMessageW, IsWindow, LoadCursorW,
     MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MSG, MessageBoxW, PostMessageW, RegisterClassExW,
-    SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor, SetForegroundWindow, SetWindowPos,
-    SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT,
-    WM_SETICON, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor, SetForegroundWindow, SetWindowPos,
+    SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_NCDESTROY,
+    WM_SETFONT, WM_SETICON, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 use windows::core::{PCWSTR, w};
 
@@ -285,15 +285,16 @@ pub fn dialog_message(msg: &MSG) -> bool {
     unsafe { IsDialogMessageW(HWND(h as *mut _), msg).as_bool() }
 }
 
-/// 打开设置窗口（已经开着就提到前台）。page：0 AI / 1 语音 / 2 常规
+/// 打开设置窗口（已经开着就恢复并切到对应页提到前台）。page：0 AI / 1 语音 / 2 常规 / 3 备忘录
 pub fn open(page: u8) {
     let h = HWND_ATOMIC.load(Ordering::Relaxed);
     if h != 0 {
         let hwnd = HWND(h as *mut _);
         unsafe {
             if IsWindow(Some(hwnd)).as_bool() {
-                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = ShowWindow(hwnd, SW_RESTORE);
                 let _ = SetForegroundWindow(hwnd);
+                with(|d| d.show_page(page.min(3)));
                 return;
             }
         }
@@ -301,6 +302,19 @@ pub fn open(page: u8) {
     }
     if let Err(e) = create(page) {
         crate::core::log::log(&format!("settings window failed: {e}"));
+    }
+}
+
+/// 主程序退出时关闭已打开的设置窗口
+pub fn close_now() {
+    let h = HWND_ATOMIC.load(Ordering::Acquire);
+    if h != 0 {
+        let hwnd = HWND(h as *mut _);
+        unsafe {
+            if IsWindow(Some(hwnd)).as_bool() {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
     }
 }
 
@@ -328,13 +342,9 @@ fn actctx() -> Option<HANDLE> {
 fn create(page: u8) -> windows::core::Result<()> {
     let ctx = actctx();
     let mut cookie = 0usize;
-    if let Some(c) = ctx {
-        unsafe {
-            let _ = ActivateActCtx(Some(c), &mut cookie);
-        }
-    }
+    let activated = ctx.is_some_and(|c| unsafe { ActivateActCtx(Some(c), &mut cookie).is_ok() });
     let r = create_inner(page);
-    if ctx.is_some() && cookie != 0 {
+    if activated {
         unsafe {
             let _ = DeactivateActCtx(0, cookie);
         }
@@ -371,8 +381,11 @@ fn create_inner(page: u8) -> windows::core::Result<()> {
         let (ww, wh) = (rc.right - rc.left, rc.bottom - rc.top);
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         let mon = MonitorFromWindow(pet.unwrap_or_default(), MONITOR_DEFAULTTONEAREST);
-        let _ = GetMonitorInfoW(mon, &mut mi);
-        let wa = mi.rcWork;
+        let wa = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+        };
         let x = wa.left + ((wa.right - wa.left) - ww).max(0) / 2;
         let y = wa.top + ((wa.bottom - wa.top) - wh).max(0) / 2;
 
@@ -420,7 +433,7 @@ fn create_inner(page: u8) -> windows::core::Result<()> {
             memo_sel: None,
             memo_ver: 0,
         };
-        d.make_fonts();
+        let _ = d.make_fonts();
         if let Some(i) = d.icon {
             SendMessageW(hwnd, WM_SETICON, Some(WPARAM(0)), Some(LPARAM(i.0 as isize)));
             SendMessageW(hwnd, WM_SETICON, Some(WPARAM(1)), Some(LPARAM(i.0 as isize)));
@@ -429,8 +442,6 @@ fn create_inner(page: u8) -> windows::core::Result<()> {
         d.fill(&cfg, d.orig_autostart);
         d.show_page(page.min(3));
         DLG.with(|c| *c.borrow_mut() = Some(d));
-        // 备忘录页：聊天里加了/到点响了，列表每秒跟一下
-        windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 1000, None);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         Ok(())
@@ -510,10 +521,6 @@ fn cue(h: HWND, s: &str) {
 fn enable(h: HWND, on: bool) {
     unsafe {
         let _ = EnableWindow(h, on);
-        // 输入框的圆角框是父窗口画的，禁用时要跟着变灰
-        if let Ok(p) = windows::Win32::UI::WindowsAndMessaging::GetParent(h) {
-            repaint(p);
-        }
     }
 }
 
@@ -533,13 +540,10 @@ impl Dlg {
         (v * self.scale).round() as i32
     }
 
-    fn make_fonts(&mut self) {
+    /// 先创建新字体并替换，返回旧字体列表（由调用方在所有控件 WM_SETFONT 之后再 DeleteObject，避免 UAF）
+    fn make_fonts(&mut self) -> [HFONT; 5] {
+        let old = [self.font, self.bold, self.link, self.nav, self.nav_bold];
         unsafe {
-            for f in [self.font, self.bold, self.link, self.nav, self.nav_bold] {
-                if !f.is_invalid() {
-                    let _ = DeleteObject(HGDIOBJ(f.0));
-                }
-            }
             let (body, bold) = ui_faces();
             let mk = |size: f32, weight: i32, underline: u32| {
                 let face = if weight >= FW_BOLD.0 as i32 { bold } else { body };
@@ -566,6 +570,17 @@ impl Dlg {
             self.link = mk(13.0, FW_NORMAL.0 as i32, 0);
             self.nav = mk(14.5, FW_NORMAL.0 as i32, 0);
             self.nav_bold = mk(14.5, FW_BOLD.0 as i32, 0);
+        }
+        old
+    }
+
+    fn delete_fonts(fonts: [HFONT; 5]) {
+        unsafe {
+            for f in fonts {
+                if !f.is_invalid() {
+                    let _ = DeleteObject(HGDIOBJ(f.0));
+                }
+            }
         }
     }
 
@@ -869,12 +884,14 @@ impl Dlg {
         let mode = MODES[combo_sel(self.c(ID_MODE)).min(2)].0;
         enable(self.c(ID_VOICE), on && mode == "preset");
         enable(self.c(ID_STYLE), on && mode != "clone");
+        repaint(self.hwnd);
     }
 
     fn update_moyu_enable(&self) {
         let on = checked(self.c(ID_MOYU));
         enable(self.c(ID_MOYU_MIN), on);
         enable(self.c(ID_MOYU_POMO), on);
+        repaint(self.hwnd);
     }
 
     fn show_page(&mut self, idx: u8) {
@@ -886,9 +903,14 @@ impl Dlg {
                 let _ = ShowWindow(c.h, if show { SW_SHOW } else { SW_HIDE });
             }
         }
-        // 备忘录页不走「保存」，「恢复默认」藏起来免得误会
+        // 备忘录页不走「保存」，「恢复默认」藏起来免得误会；只在备忘录页开 1 秒刷新定时器
         unsafe {
             let _ = ShowWindow(self.c(ID_DEFAULTS), if self.page == 4 { SW_HIDE } else { SW_SHOW });
+            if self.page == 4 {
+                windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(self.hwnd), 1, 1000, None);
+            } else {
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(self.hwnd), 1);
+            }
         }
         if self.page == 4 {
             self.memo_refresh();
@@ -955,9 +977,11 @@ impl Dlg {
 
     fn relayout(&mut self, scale: f32) {
         self.scale = scale;
-        self.make_fonts();
+        let old_fonts = self.make_fonts();
         for c in &self.ctls {
             let id = unsafe { windows::Win32::UI::WindowsAndMessaging::GetDlgCtrlID(c.h) };
+            // 先换新字体再挪位置（SetWindowPos 会触发重绘），最后统一销毁旧字体
+            send(c.h, WM_SETFONT, self.font_for(id).0 as usize, 0);
             let r = c.r;
             unsafe {
                 let _ = SetWindowPos(
@@ -970,9 +994,10 @@ impl Dlg {
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
-            send(c.h, WM_SETFONT, self.font_for(id).0 as usize, 1);
         }
         send(self.c(ID_LIST), LB_SETITEMHEIGHT, 0, self.px(40.0) as isize);
+        Self::delete_fonts(old_fonts);
+        repaint(self.hwnd);
     }
 }
 
@@ -987,7 +1012,7 @@ fn differs(a: &Config, b: &Config) -> bool {
             c.proxy.clone(),
             c.user_name.clone(),
             format!("{:?}{:?}{:?}{:?}{:?}{:?}{}", c.tts.enabled, c.tts.chat_voice_reply, c.tts.speak, c.tts.api_key, c.tts.mode, c.tts.voice, c.tts.style),
-            ((c.tts.volume * 100.0).round() as i32, (c.scale * 100.0).round() as i32),
+            ((c.tts.volume * 100.0).round() as i32, (c.scale * 100.0).round() as i32, crate::core::config::clamp_fps(c.fps)),
             (c.weather_city.clone(), c.birthday.clone()),
             (c.moyu.enabled, c.moyu.minutes, c.moyu.pomodoro_minutes, c.reminders.water, c.reminders.stand_up),
             c.reminders.off_work.clone(),
@@ -1038,7 +1063,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 set_text(d.c(ID_TEST_RESULT), "");
             });
         }
-        (ID_KEY_SHOW, _) | (ID_TTS_KEY_SHOW, _) => {
+        (ID_KEY_SHOW, 0) | (ID_TTS_KEY_SHOW, 0) => {
             with(|d| {
                 let (edit, chk) = if id == ID_KEY_SHOW { (ID_KEY, ID_KEY_SHOW) } else { (ID_TTS_KEY, ID_TTS_KEY_SHOW) };
                 let e = d.c(edit);
@@ -1048,31 +1073,31 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 }
             });
         }
-        (ID_KEY_LINK, _) => {
+        (ID_KEY_LINK, 0) => {
             if let Some(url) = with(|d| PRESETS[d.preset].key_url)
                 && !url.is_empty()
             {
                 super::sys::open_url(url);
             }
         }
-        (ID_TTS_LINK, _) => super::sys::open_url(MIMO_KEY_URL),
-        (ID_TEST, _) => start_test(),
-        (ID_UPDATE, _) => start_update(hwnd),
-        (ID_PLAY, _) => start_play(),
-        (ID_TTS_ON, _) | (ID_MODE, CBN_SELCHANGE) => {
+        (ID_TTS_LINK, 0) => super::sys::open_url(MIMO_KEY_URL),
+        (ID_TEST, 0) => start_test(),
+        (ID_UPDATE, 0) => start_update(hwnd),
+        (ID_PLAY, 0) => start_play(),
+        (ID_TTS_ON, 0) | (ID_MODE, CBN_SELCHANGE) => {
             with(|d| d.update_tts_enable());
         }
-        (ID_MOYU, _) => {
+        (ID_MOYU, 0) => {
             with(|d| d.update_moyu_enable());
         }
-        (ID_DATADIR, _) => menu("datadir"),
-        (ID_RAWFILE, _) => menu("settings:file"),
-        (ID_FORGET, _) => {
+        (ID_DATADIR, 0) => menu("datadir"),
+        (ID_RAWFILE, 0) => menu("settings:file"),
+        (ID_FORGET, 0) => {
             if msgbox(hwnd, "确定清空和哈基米的聊天记录吗？清空后她就不记得之前聊过什么了。", MB_YESNO | MB_ICONQUESTION) == IDYES.0 {
                 menu("forget");
             }
         }
-        (ID_RELOAD, _) => {
+        (ID_RELOAD, 0) => {
             let c = config::reload();
             let a = super::sys::is_autostart();
             with(|d| {
@@ -1082,7 +1107,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
             });
             menu("settings:reload");
         }
-        (ID_DEFAULTS, _) => {
+        (ID_DEFAULTS, 0) => {
             if msgbox(hwnd, "把这里的设置都恢复成默认值吗？（API Key 会保留；点「保存」后才生效）", MB_YESNO | MB_ICONQUESTION) == IDYES.0 {
                 with(|d| {
                     let cur = d.collect().map(|x| x.0).unwrap_or_else(|_| d.orig.clone());
@@ -1098,7 +1123,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
         (ID_MEMO_LIST, LBN_SELCHANGE) => {
             with(|d| d.memo_pick());
         }
-        (ID_MEMO_NEW, _) => {
+        (ID_MEMO_NEW, 0) => {
             with(|d| {
                 d.memo_clear_form();
                 d.memo_msg("");
@@ -1107,18 +1132,19 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 }
             });
         }
-        (ID_MEMO_SAVE, _) => memo_save_ui(hwnd),
-        (ID_MEMO_DONE, _) => {
+        (ID_MEMO_SAVE, 0) => memo_save_ui(hwnd),
+        (ID_MEMO_DONE, 0) => {
             if let Some(Some(id)) = with(|d| d.memo_sel) {
-                // 走菜单同一条路：她会说一句「划掉啦」
+                // 走菜单同一条路：她会说一句「划掉啦」；50ms 后立刻刷新列表免得等 1 秒
                 menu(&format!("memo:done:{id}"));
                 with(|d| {
                     d.memo_clear_form();
                     d.memo_msg("✔ 划掉啦");
                 });
+                unsafe { windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, 50, None); }
             }
         }
-        (ID_MEMO_DEL, _) => {
+        (ID_MEMO_DEL, 0) => {
             if let Some(Some(id)) = with(|d| d.memo_sel)
                 && msgbox(hwnd, "删掉这条备忘吗？", MB_YESNO | MB_ICONQUESTION) == IDYES.0
             {
@@ -1127,13 +1153,15 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                     d.memo_clear_form();
                     d.memo_msg("已删除");
                 });
+                unsafe { windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, 50, None); }
             }
         }
-        (ID_MEMO_CLEAR, _) => {
+        (ID_MEMO_CLEAR, 0) => {
             menu("memo:clear");
             with(|d| d.memo_msg("已清掉做完的"));
+            unsafe { windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, 50, None); }
         }
-        (IDOK, _) => {
+        (IDOK, 0) => {
             // 备忘录页在输入框里按回车 = 添加/保存这条，不是保存设置并关窗
             let in_memo = with(|d| {
                 let f = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
@@ -1142,7 +1170,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
             .unwrap_or(false);
             if in_memo { memo_save_ui(hwnd) } else { save(hwnd) }
         }
-        (IDCANCEL, _) => close(hwnd, false),
+        (IDCANCEL, 0) => close(hwnd, false),
         _ => {}
     }
 }
@@ -1293,7 +1321,10 @@ fn start_play() {
         let t0 = std::time::Instant::now();
         let (ok, text) = match tts::synth_test(&t, tts::SAMPLE) {
             Ok(wav) => {
-                crate::services::audio::play(TEST_TOKEN, crate::types::Audio(wav), t.volume);
+                // 窗口已经关了就不再出声
+                if HWND_ATOMIC.load(Ordering::Acquire) == hwnd {
+                    crate::services::audio::play(TEST_TOKEN, crate::types::Audio(wav), t.volume);
+                }
                 (true, format!("♪ 正在播放（合成用了 {:.1} 秒）", t0.elapsed().as_secs_f32()))
             }
             Err(e) => (false, format!("✘ {e}")),
@@ -1306,6 +1337,10 @@ fn start_play() {
 }
 
 fn post_result(hwnd: isize, id: i32, tag: u64, ok: bool, text: String) {
+    // 窗口已销毁则丢弃，防止句柄复用后把消息投递给无关窗口
+    if HWND_ATOMIC.load(Ordering::Acquire) != hwnd {
+        return;
+    }
     RESULTS.lock().unwrap_or_else(|e| e.into_inner()).push((id, tag, ok, text));
     unsafe {
         let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_RESULT, WPARAM(0), LPARAM(0));
@@ -1345,9 +1380,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_COMMAND => {
                 let id = (wp.0 & 0xffff) as i32;
                 let code = ((wp.0 >> 16) & 0xffff) as u32;
-                // 输入框聚焦/失焦：重画外框（聚焦时描橙边）
+                // 输入框聚焦/失焦：只重画该输入框的外框区域（避免整窗闪烁）
                 if (code == EN_SETFOCUS || code == EN_KILLFOCUS) && is_edit(HWND(lp.0 as *mut _)) {
-                    repaint(hwnd);
+                    let target = HWND(lp.0 as *mut _);
+                    let rect = with(|d| {
+                        d.frames.iter().find(|(_, h, _)| *h == target).map(|(r, _, _)| RECT {
+                            left: d.px(r[0]) - 2,
+                            top: d.px(r[1]) - 2,
+                            right: d.px(r[0] + r[2]) + 2,
+                            bottom: d.px(r[1] + r[3]) + 2,
+                        })
+                    })
+                    .flatten();
+                    match rect {
+                        Some(rc) => { let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), Some(&rc), true); }
+                        None => repaint(hwnd),
+                    }
                 }
                 on_command(hwnd, id, code);
                 LRESULT(0)
@@ -1371,7 +1419,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(1)
             }
             WM_DRAWITEM => {
-                draw_item(&*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT));
+                if let Some(di) = (lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT).as_ref() {
+                    draw_item(di);
+                }
                 LRESULT(1)
             }
             WM_SETCURSOR => {
@@ -1390,8 +1440,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_TIMER => {
+                if wp.0 == 2 {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2);
+                }
                 with(|d| {
-                    if d.page == 4 && crate::core::memo::version() != d.memo_ver {
+                    if d.page == 4 && (wp.0 == 2 || crate::core::memo::version() != d.memo_ver) {
                         d.memo_refresh();
                     }
                 });
@@ -1399,8 +1452,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_DPICHANGED => {
                 let dpi = (wp.0 & 0xffff) as f32;
-                let r = &*(lp.0 as *const RECT);
-                let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                if let Some(r) = (lp.0 as *const RECT).as_ref() {
+                    let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
                 if dpi > 0.0 {
                     with(|d| d.relayout(dpi / 96.0));
                 }
@@ -1411,13 +1465,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_DESTROY => {
-                HWND_ATOMIC.store(0, Ordering::Relaxed);
-                // 整个销毁：字体、图标、画刷都还回去，不留常驻内存
+                HWND_ATOMIC.store(0, Ordering::Release);
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 1);
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2);
+                RESULTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                if let Some(h) = super::main_hwnd() {
+                    let _ = SetFocus(Some(h));
+                }
+                LRESULT(0)
+            }
+            WM_NCDESTROY => {
+                // 所有子控件都已销毁后再释放字体、图标和画刷，杜绝子控件使用已销毁的 GDI 句柄
                 let d = DLG.with(|c| c.try_borrow_mut().ok().and_then(|mut g| g.take()));
                 if let Some(d) = d {
-                    for f in [d.font, d.bold, d.link, d.nav, d.nav_bold] {
-                        let _ = DeleteObject(HGDIOBJ(f.0));
-                    }
+                    Dlg::delete_fonts([d.font, d.bold, d.link, d.nav, d.nav_bold]);
                     if let Some(i) = d.icon {
                         let _ = DestroyIcon(i);
                     }
@@ -1427,10 +1488,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         let _ = DeleteObject(HGDIOBJ(b as *mut _));
                     }
                 }
-                if let Some(h) = super::main_hwnd() {
-                    let _ = SetFocus(Some(h));
-                }
-                LRESULT(0)
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }

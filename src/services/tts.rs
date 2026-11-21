@@ -182,17 +182,19 @@ fn trim_cache_in(dir: &std::path::Path, max_entries: usize, max_bytes: u64) {
     let mut groups: std::collections::HashMap<(std::time::SystemTime, u64), Vec<PathBuf>> = std::collections::HashMap::new();
     for e in rd.flatten() {
         let Ok(m) = e.metadata() else { continue };
+        if !m.is_file() { continue; }
         let Ok(t) = m.modified() else { continue };
         groups.entry((t, m.len())).or_default().push(e.path());
     }
     let mut groups: Vec<_> = groups.into_iter().collect();
     groups.sort_by_key(|g| std::cmp::Reverse(g.0.0));
-    let (mut n, mut bytes) = (0usize, 0u64);
+    let (mut n, mut bytes, mut full) = (0usize, 0u64, false);
     for ((_, len), paths) in groups {
-        if n < max_entries && bytes + len <= max_bytes {
+        if !full && n < max_entries && bytes.saturating_add(len) <= max_bytes {
             n += 1;
-            bytes += len;
+            bytes = bytes.saturating_add(len);
         } else {
+            full = true;
             for p in paths { let _ = std::fs::remove_file(p); }
         }
     }
@@ -315,7 +317,6 @@ struct State {
     pending: Vec<(u64, u64, EventSender)>,
     /// 等着发的前台请求（只留最新一条）
     fg: Option<Job>,
-    fg_busy: bool,
     cooldown_until: Option<Instant>,
     last_fg: Option<Instant>,
     warm: VecDeque<(String, Option<VoiceMood>)>,
@@ -328,7 +329,6 @@ static STATE: Mutex<State> = Mutex::new(State {
     next_seq: 0,
     pending: Vec::new(),
     fg: None,
-    fg_busy: false,
     cooldown_until: None,
     last_fg: None,
     warm: VecDeque::new(),
@@ -382,7 +382,7 @@ pub fn speak(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMood>
             lat::mark(token, "cache hit");
             return answer(seq, Some(a));
         }
-        if t.api_key.is_empty() { return answer(seq, None); }
+        if t.api_key.trim().is_empty() { return answer(seq, None); }
         let mut st = state();
         if in_cooldown(&st) {
             drop(st);
@@ -405,6 +405,7 @@ pub fn prewarm_now(items: Vec<(String, Option<VoiceMood>)>) {
     for it in items.into_iter().rev() {
         if !st.warm.iter().any(|w| *w == it) { st.warm.push_front(it); }
     }
+    st.warm.truncate(MAX_PREWARM);
     let soon = Instant::now() + Duration::from_millis(500);
     st.warm_at = Some(st.warm_at.map_or(soon, |a| a.min(soon)));
     ensure_worker(&mut st);
@@ -427,7 +428,7 @@ fn ensure_worker(st: &mut State) {
     if std::thread::Builder::new().name("hakimi-tts".into()).spawn(worker).is_ok() { st.worker = true; }
 }
 
-enum Work { Fg(Job), Warm(TtsConfig, String, Option<VoiceMood>) }
+enum Work { Fg(Job), Warm(TtsConfig, String, Option<VoiceMood>, Option<Instant>) }
 
 fn worker() {
     loop {
@@ -435,18 +436,25 @@ fn worker() {
             let mut st = state();
             loop {
                 if let Some(job) = st.fg.take() {
-                    st.fg_busy = true;
                     st.last_fg = Some(Instant::now());
                     break Work::Fg(job);
                 }
                 let now = Instant::now();
                 match st.warm_at {
                     Some(at) if now >= at => {
+                        // 在锁外读配置，避免持有 STATE 锁期间触发磁盘 I/O
+                        drop(st);
                         let t = crate::core::config::get().tts;
-                        if !t.enabled || t.api_key.is_empty() || t.speak == "off" || st.warm.is_empty() {
+                        st = state();
+                        if let Some(job) = st.fg.take() {
+                            st.last_fg = Some(Instant::now());
+                            break Work::Fg(job);
+                        }
+                        if !t.enabled || t.api_key.trim().is_empty() || t.speak == "off" || st.warm.is_empty() {
                             st.warm_at = None;
                             continue;
                         }
+                        let now = Instant::now();
                         // 前台刚念过话（3 秒内）、正在冷却时先让路
                         let mut until = now;
                         if let Some(c) = st.cooldown_until { until = until.max(c); }
@@ -456,7 +464,8 @@ fn worker() {
                             continue;
                         }
                         let (text, mood) = st.warm.pop_front().unwrap_or_default();
-                        break Work::Warm(t, text, mood);
+                        let prev_at = st.warm_at;
+                        break Work::Warm(t, text, mood, prev_at);
                     }
                     Some(at) => {
                         st = WAKE.wait_timeout(st, at - now).unwrap_or_else(|e| e.into_inner()).0;
@@ -469,16 +478,19 @@ fn worker() {
         };
         match work {
             Work::Fg(job) => run_fg(job),
-            Work::Warm(t, raw, mood) => {
+            Work::Warm(t, raw, mood, prev_at) => {
                 let text = clean(&raw);
-                let next = if !text.is_empty() && read_cache(&t, &text, mood).is_none() {
+                let next = if !text.is_empty() && speakable(&text) && read_cache(&t, &text, mood).is_none() {
                     let _ = request_once(&t, &text, mood, 25);
                     Duration::from_secs(6)
                 } else {
                     Duration::from_millis(50)
                 };
                 let mut st = state();
-                if st.warm_at.is_some() { st.warm_at = Some(Instant::now() + next); }
+                // 如果期间 prewarm_now() 插入了更紧急的时间，别覆盖它
+                if st.warm_at == prev_at && st.warm_at.is_some() {
+                    st.warm_at = Some(Instant::now() + next);
+                }
             }
         }
     }
@@ -509,7 +521,6 @@ fn run_fg(job: Job) {
     }
     {
         let mut st = state();
-        st.fg_busy = false;
         st.last_fg = Some(Instant::now());
     }
     match result {
@@ -533,37 +544,39 @@ fn request_once_lat(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_
     r.map(Some)
 }
 
-/// 流式合成一句（preset/design）：收到第一块音频就回复行为层（句柄），之后边收边往缓冲里写；
-/// 收完存 wav 缓存。首块之前被顶掉就直接断开连接（真的掐断，不像一次性请求只能等它跑完）
-fn request_stream(job: &Job, attempt: u32) -> Result<Option<Vec<u8>>, Fail> {
-    let t = &job.t;
-    let mut body = build_body(t, &job.text, job.mood);
-    body["audio"]["format"] = json!("pcm16");
-    body["stream"] = json!(true);
-    let (status, reader) = super::net::post_json_stream(API, &[("api-key", &t.api_key)], &body, STREAM_TIMEOUT).map_err(|e| Fail {
-        retry: true,
-        msg: if matches!(e, ureq::Error::Timeout(_)) { "timeout".into() } else { e.to_string() },
-    })?;
-    lat::mark(job.token, &format!("headers (HTTP {status})"));
-    if status == 429 {
-        state().cooldown_until = Some(Instant::now() + COOLDOWN);
-        return Err(Fail { retry: false, msg: "HTTP 429（限流，冷却 10 秒）".into() });
-    }
-    if !(200..300).contains(&status) {
-        let mut text = String::new();
-        let _ = std::io::Read::read_to_string(&mut std::io::Read::take(reader, 4096), &mut text);
-        let snippet: String = text.chars().take(200).collect();
-        return Err(Fail { retry: status >= 500, msg: format!("HTTP {status}: {snippet}") });
-    }
+struct StreamOutcome {
+    pcm: Vec<u8>,
+    had_sink: bool,
+    chunks: u32,
+    err: Option<String>,
+    retryable_err: bool,
+    superseded: bool,
+}
+
+/// 逐行消费 SSE 音频流；每行前检查 `is_superseded()`，被新台词顶掉立即停止读取并调用 `sink.finish()`
+fn drain_sse_stream<R: BufRead>(
+    reader: R,
+    mut is_superseded: impl FnMut() -> bool,
+    mut still_pending: impl FnMut() -> bool,
+    mut on_first: impl FnMut(Vec<u8>, usize),
+) -> StreamOutcome {
     let mut pcm: Vec<u8> = Vec::new();
     let mut sink: Option<std::sync::Arc<super::audio::PcmStream>> = None;
     let mut chunks = 0u32;
     let mut err: Option<String> = None;
-    for line in std::io::BufReader::new(reader).lines() {
+    let mut retryable_err = false;
+    let mut superseded = false;
+    for line in reader.lines() {
+        // 已被新台词顶掉：立刻退出循环丢弃 reader 断开连接，不阻塞单 worker
+        if is_superseded() {
+            superseded = true;
+            break;
+        }
         let line = match line {
             Ok(l) => l,
             Err(e) => {
                 err = Some(e.to_string());
+                retryable_err = true;
                 break;
             }
         };
@@ -572,12 +585,15 @@ fn request_stream(job: &Job, attempt: u32) -> Result<Option<Vec<u8>>, Fail> {
                 chunks += 1;
                 if sink.is_none() {
                     // 首块之前已经被新台词顶掉：断开连接，不要了
-                    if !is_pending(job.seq) { return Err(Fail { retry: false, msg: "superseded".into() }); }
+                    if !still_pending() {
+                        superseded = true;
+                        break;
+                    }
                     let (handle, w) = super::audio::stream_open(STREAM_RATE);
-                    lat::mark(job.token, &format!("first audio chunk ({} B)", b.len()));
+                    let len = b.len();
                     w.push_pcm16(&b);
                     sink = Some(w);
-                    answer(job.seq, Some(handle.0));
+                    on_first(handle.0, len);
                 } else if let Some(w) = &sink {
                     w.push_pcm16(&b);
                 }
@@ -592,7 +608,46 @@ fn request_stream(job: &Job, attempt: u32) -> Result<Option<Vec<u8>>, Fail> {
         }
     }
     if let Some(w) = &sink { w.finish(); }
-    match (sink.is_some(), err) {
+    StreamOutcome { pcm, had_sink: sink.is_some(), chunks, err, retryable_err, superseded }
+}
+
+/// 流式合成一句（preset/design）：收到第一块音频就回复行为层（句柄），之后边收边往缓冲里写；
+/// 收完存 wav 缓存。首块之前被顶掉就直接断开连接（真的掐断，不像一次性请求只能等它跑完）
+fn request_stream(job: &Job, attempt: u32) -> Result<Option<Vec<u8>>, Fail> {
+    let t = &job.t;
+    let key = t.api_key.trim();
+    let mut body = build_body(t, &job.text, job.mood);
+    body["audio"]["format"] = json!("pcm16");
+    body["stream"] = json!(true);
+    let (status, reader) = super::net::post_json_stream(API, &[("api-key", key)], &body, STREAM_TIMEOUT).map_err(|e| Fail {
+        retry: true,
+        msg: if matches!(e, ureq::Error::Timeout(_)) { "timeout".into() } else { e.to_string() },
+    })?;
+    lat::mark(job.token, &format!("headers (HTTP {status})"));
+    if status == 429 {
+        state().cooldown_until = Some(Instant::now() + COOLDOWN);
+        return Err(Fail { retry: false, msg: "HTTP 429（限流，冷却 10 秒）".into() });
+    }
+    if !(200..300).contains(&status) {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::Read::take(reader, 4096), &mut text);
+        let snippet: String = text.chars().take(200).collect();
+        return Err(Fail { retry: status >= 500, msg: format!("HTTP {status}: {snippet}") });
+    }
+    let out = drain_sse_stream(
+        std::io::BufReader::new(reader),
+        || state().next_seq != job.seq,
+        || is_pending(job.seq),
+        |handle, len| {
+            lat::mark(job.token, &format!("first audio chunk ({len} B)"));
+            answer(job.seq, Some(handle));
+        },
+    );
+    if out.superseded {
+        return if out.had_sink { Ok(None) } else { Err(Fail { retry: false, msg: "superseded".into() }) };
+    }
+    let (pcm, chunks) = (out.pcm, out.chunks);
+    match (out.had_sink, out.err) {
         (true, None) => {
             lat::mark(job.token, &format!("stream done ({chunks} chunks, {} B pcm)", pcm.len()));
             let wav = pcm16_wav(STREAM_RATE, &pcm);
@@ -604,7 +659,7 @@ fn request_stream(job: &Job, attempt: u32) -> Result<Option<Vec<u8>>, Fail> {
             crate::core::log::log(&format!("tts stream cut off after {chunks} chunks: {}", redact(&e, &t.api_key)));
             Ok(None)
         }
-        (false, e) => Err(Fail { retry: attempt == 0 && e.is_some(), msg: e.unwrap_or_else(|| "no audio in stream".into()) }),
+        (false, e) => Err(Fail { retry: attempt == 0 && out.retryable_err, msg: e.unwrap_or_else(|| "no audio in stream".into()) }),
     }
 }
 
@@ -667,7 +722,7 @@ fn request_once(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_secs
 
 fn request_once_at(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_secs: u64, token: Option<u64>) -> Result<Vec<u8>, Fail> {
     let body = build_body(t, text, mood);
-    let r = super::net::post_json(API, &[("api-key", &t.api_key)], &body, timeout_secs);
+    let r = super::net::post_json(API, &[("api-key", t.api_key.trim())], &body, timeout_secs);
     drop(body);
     if let Some(tok) = token { lat::mark(tok, "response read"); }
     let (status, text_body) = r.map_err(|e| Fail {
@@ -708,7 +763,7 @@ pub fn synth_test(t: &TtsConfig, text: &str) -> Result<Vec<u8>, String> {
     let mut t = t.clone();
     t.api_key = t.api_key.trim().to_string();
     request_once(&t, &clean(text), None, 25).map_err(|f| {
-        let m = f.msg;
+        let m = redact(&f.msg, &t.api_key);
         if m.contains("HTTP 401") || m.contains("HTTP 403") {
             "MiMo Key 不对或已失效".into()
         } else if m.contains("429") {
@@ -841,6 +896,59 @@ mod stream_tests {
         lat::end(9_000_001);
         assert!(lat::since(9_000_001).is_none());
         assert!(lat::since(9_000_002).is_none());
+    }
+
+    #[test]
+    fn stream_cancel_stops_reading_and_marks_superseded() {
+        let chunk_b64 = base64::engine::general_purpose::STANDARD.encode([0x01u8, 0x02, 0x03, 0x04]);
+        let sse = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"audio\":{{\"data\":\"{chunk_b64}\"}}}}}}]}}\n\
+             data: {{\"choices\":[{{\"delta\":{{\"audio\":{{\"data\":\"{chunk_b64}\"}}}}}}]}}\n\
+             data: {{\"choices\":[{{\"delta\":{{\"audio\":{{\"data\":\"{chunk_b64}\"}}}}}}]}}\n\
+             data: [DONE]\n"
+        );
+        // 1. 首块发出后被新台词顶掉：立刻中止后续块读取，不再消费剩余 SSE 行
+        let mut seen_lines = 0usize;
+        let mut first_called = 0usize;
+        let out = drain_sse_stream(
+            std::io::Cursor::new(sse.as_bytes()),
+            || {
+                seen_lines += 1;
+                seen_lines >= 2 // 读完第 1 块后下一行即检测到被顶掉
+            },
+            || true,
+            |_, _| first_called += 1,
+        );
+        assert!(out.superseded);
+        assert!(out.had_sink);
+        assert_eq!(out.chunks, 1);
+        assert_eq!(first_called, 1);
+        assert_eq!(out.pcm.len(), 4);
+
+        // 2. 首块之前已被顶掉：不打开音频流也不回调 on_first
+        let mut first_called2 = 0usize;
+        let out2 = drain_sse_stream(
+            std::io::Cursor::new(sse.as_bytes()),
+            || true,
+            || false,
+            |_, _| first_called2 += 1,
+        );
+        assert!(out2.superseded);
+        assert!(!out2.had_sink);
+        assert_eq!(out2.chunks, 0);
+        assert_eq!(first_called2, 0);
+
+        // 3. SSE 返回 error 事件：retryable_err 为 false，避免对业务逻辑错误无意义重试
+        let err_sse = "data: {\"error\":{\"message\":\"bad voice\"}}\n";
+        let out3 = drain_sse_stream(
+            std::io::Cursor::new(err_sse.as_bytes()),
+            || false,
+            || true,
+            |_, _| {},
+        );
+        assert!(!out3.superseded);
+        assert!(!out3.retryable_err);
+        assert_eq!(out3.err.as_deref(), Some("bad voice"));
     }
 }
 

@@ -37,10 +37,11 @@ pub const MENU_OPEN: &str = "skin:@open";
 /// 「刷新皮肤列表」
 pub const MENU_RELOAD: &str = "skin:@reload";
 
-/// 状态名 = assets/sprites 的文件名（不含 .png）
-pub const STATES: [&str; 21] = [
+/// 状态名 = assets/sprites 的文件名（不含 .png，和 types::Face::ALL 保持一致）
+pub const STATES: [&str; 27] = [
     "idle", "blink", "happy", "drag", "sit", "sleep", "eat", "hungry", "think", "walk1", "walk2", "shy", "dizzy",
-    "surprised", "cry", "yawn", "love", "hiss", "stare", "dance", "honey",
+    "surprised", "cry", "yawn", "love", "hiss", "stare", "dance", "honey", "pout", "smug", "confused", "scared",
+    "starry", "puff",
 ];
 /// 支持的叠加层
 pub const OVERLAYS: [&str; 2] = ["blink", "mouthOpen"];
@@ -260,13 +261,19 @@ impl SkinInfo {
     }
 }
 
+fn is_win_reserved_stem(s: &str) -> bool {
+    let u = s.to_ascii_uppercase();
+    matches!(u.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((u.starts_with("COM") || u.starts_with("LPT")) && u.len() == 4 && matches!(u.as_bytes()[3], b'1'..=b'9'))
+}
+
 /// 语音文件名候选：hash 规则、台词原文
 pub fn voice_stems(text: &str) -> Vec<String> {
     let hash = sha1_smol::Sha1::from(text.as_bytes()).digest().to_string();
     let mut v = vec![hash[..16].to_string()];
     let plain: String = text.chars().map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c }).collect();
     let plain = plain.trim().trim_end_matches('.').to_string();
-    if !plain.is_empty() && plain.chars().count() <= 120 { v.push(plain); }
+    if !plain.is_empty() && plain.chars().count() <= 120 && !is_win_reserved_stem(&plain) { v.push(plain); }
     v
 }
 

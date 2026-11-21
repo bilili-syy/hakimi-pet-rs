@@ -239,8 +239,8 @@ pub fn get() -> Config {
     reload()
 }
 
-/// 从文件重新读取（缺字段用默认值），写回完整模板，返回新配置
-pub fn reload() -> Config {
+/// 从文件读取（不加锁，供 reload/update 持有写锁时复用）
+fn load_from_disk() -> Config {
     let path = super::paths::config_file();
     let c = match std::fs::read_to_string(&path) {
         Ok(s) => {
@@ -255,7 +255,14 @@ pub fn reload() -> Config {
     };
     write(&c);
     publish(&c);
-    *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(c.clone());
+    c
+}
+
+/// 从文件重新读取（缺字段用默认值），写回完整模板，返回新配置
+pub fn reload() -> Config {
+    let mut guard = CONFIG.write().unwrap_or_else(|e| e.into_inner());
+    let c = load_from_disk();
+    *guard = Some(c.clone());
     c
 }
 
@@ -264,14 +271,11 @@ pub fn update(f: impl FnOnce(&mut Config)) -> Config {
     let mut guard = CONFIG.write().unwrap_or_else(|e| e.into_inner());
     let mut c = match guard.as_ref() {
         Some(c) => c.clone(),
-        None => {
-            drop(guard);
-            reload();
-            guard = CONFIG.write().unwrap_or_else(|e| e.into_inner());
-            guard.clone().unwrap_or_default()
-        }
+        None => load_from_disk(),
     };
     f(&mut c);
+    c.scale = clamp_scale(c.scale);
+    c.fps = clamp_fps(c.fps);
     write(&c);
     publish(&c);
     *guard = Some(c.clone());
@@ -280,7 +284,9 @@ pub fn update(f: impl FnOnce(&mut Config)) -> Config {
 
 /// 设置窗口「保存」：整份替换（c 是从 get() 拿的副本改出来的，未知字段都还在），原子写回文件。
 /// 返回写盘是否成功。
-pub fn replace(c: Config) -> bool {
+pub fn replace(mut c: Config) -> bool {
+    c.scale = clamp_scale(c.scale);
+    c.fps = clamp_fps(c.fps);
     let mut guard = CONFIG.write().unwrap_or_else(|e| e.into_inner());
     let ok = write(&c);
     publish(&c);

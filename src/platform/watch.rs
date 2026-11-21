@@ -122,13 +122,17 @@ pub fn sample() -> Sample {
         if h.0.is_null() {
             return out;
         }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        // 看她自己（即使 exe 改过名）都不算摸鱼
+        if pid == std::process::id() {
+            return out;
+        }
         let mut buf = [0u16; 512];
         let n = GetWindowTextW(h, &mut buf);
         if n > 0 {
             out.title = String::from_utf16_lossy(&buf[..n as usize]);
         }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(h, Some(&mut pid));
         if pid != 0
             && let Ok(ph) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
         {

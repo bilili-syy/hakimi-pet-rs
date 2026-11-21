@@ -28,11 +28,14 @@ pub fn store(data: &StatsData) {
     }
 }
 
-/// 原子写：同目录写 `<name>.tmp`、刷盘，再 rename 覆盖（Windows 上 std::fs::rename 会替换已有文件）
+/// 原子写：同目录写唯一临时文件、刷盘，再 rename 覆盖（Windows 上 std::fs::rename 会替换已有文件）
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{n}.tmp", std::process::id()));
     let tmp = std::path::PathBuf::from(tmp);
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -40,6 +43,26 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path).inspect_err(|_| { let _ = std::fs::remove_file(&tmp); })
+}
+
+/// 启动时清理上次异常退出遗留的孤儿 `.tmp` 文件（单实例锁之后调用）
+pub fn cleanup_stale_tmps() {
+    cleanup_tmps_in(&super::paths::data_dir());
+}
+
+fn cleanup_tmps_in(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let self_mark = format!(".{}.", std::process::id());
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(".tmp") || name.contains(&self_mark) {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|ft| ft.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -54,6 +77,15 @@ mod tests {
         write_atomic(&p, b"two").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"two");
         assert!(!dir.join("save.json.tmp").exists());
+        // 清理非本进程的孤儿 .tmp，保留正常文件和本进程 .tmp
+        let orphan = dir.join("save.json.99999999.0.tmp");
+        let own = dir.join(format!("save.json.{}.0.tmp", std::process::id()));
+        std::fs::write(&orphan, b"x").unwrap();
+        std::fs::write(&own, b"y").unwrap();
+        cleanup_tmps_in(&dir);
+        assert!(!orphan.exists());
+        assert!(own.exists());
+        assert!(p.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
