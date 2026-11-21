@@ -149,7 +149,7 @@ impl Behavior {
             return self.fake_chat_voice;
         }
         let t = crate::core::config::get().tts;
-        t.enabled && t.chat_voice_reply && t.speak != "off" && t.can_synth()
+        t.enabled && t.chat_voice_reply && t.speak != "off" && crate::services::tts::online_ok(&t)
     }
 
     /// 语音回答关着：聊天回复也不念（只是关掉这一项，不影响别的台词）

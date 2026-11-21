@@ -1,7 +1,37 @@
 //! 聊天窗口：打开、输入、AI 回复
 use super::*;
 
+/// 吃撑了说话的样子：打嗝或者尾音拖长（roll 0~1 随机数）
+pub(super) fn stuffed_text(text: &str, roll: f64) -> String {
+    let t = text.trim_end();
+    if t.contains('嗝') {
+        return t.to_string();
+    }
+    if roll < 0.5 {
+        format!("{t}…嗝～")
+    } else {
+        let base = t.trim_end_matches(['～', '~', '。', '！', '!']);
+        format!("{base}～～～")
+    }
+}
+
+/// 这么多新增粮食（token + 语音字数）给饱食度加多少：1000 份 = +1，一次最多 +10
+pub(super) fn food_to_hunger(delta: u64) -> f64 { (delta as f64 / 1000.0).min(10.0) }
+
 impl Behavior {
+    /// 用量就是粮食：今天新吃了多少就加多少饱食度（跨天数字变小时只重置基准）
+    pub(super) fn feed_from_usage(&mut self, food: u64) {
+        let seen = self.food_seen.replace(food);
+        if let Some(prev) = seen
+            && food > prev
+        {
+            let add = food_to_hunger(food - prev);
+            if add > 0.0 {
+                self.stats.data.hunger = (self.stats.data.hunger + add).min(100.0);
+            }
+        }
+    }
+
     // ============================================================ 聊天
     pub(super) fn open_chat(&mut self) {
         if self.state == St::Sleep {
@@ -73,7 +103,11 @@ impl Behavior {
 
     pub(super) fn on_chat_reply(&mut self, r: ChatReply) {
         // 去掉情绪标签（气泡和 TTS 只拿干净文字）
-        let (r, emo) = self.emotion_split(r);
+        let (mut r, emo) = self.emotion_split(r);
+        // 今天快吃撑了：打嗝、拖长尾音
+        if r.ok && self.io && crate::core::usage::now_fullness() != crate::core::usage::Fullness::Normal {
+            r.text = stuffed_text(&r.text, fastrand::f64());
+        }
         // 语音回答：先合成，字和声音一起出来（chatvoice.rs）；这期间保持思考中
         if r.ok && self.chat_voice_on() {
             self.cv_start(&r.text, emo);

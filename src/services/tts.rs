@@ -382,7 +382,7 @@ pub fn speak(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMood>
             lat::mark(token, "cache hit");
             return answer(seq, Some(a));
         }
-        if !t.can_synth() { return answer(seq, None); }
+        if !online_ok(&t) { return answer(seq, None); }
         let mut st = state();
         if in_cooldown(&st) {
             drop(st);
@@ -450,7 +450,7 @@ fn worker() {
                             st.last_fg = Some(Instant::now());
                             break Work::Fg(job);
                         }
-                        if !t.enabled || !t.can_synth() || t.speak == "off" || st.warm.is_empty() {
+                        if !t.enabled || !online_ok(&t) || t.speak == "off" || st.warm.is_empty() {
                             st.warm_at = None;
                             continue;
                         }
@@ -499,6 +499,9 @@ fn worker() {
 /// clone 一次性请求第一次的超时（秒），按字数给：实测正常时短句 ~2 秒、65 字 ~4–5 秒，
 /// 但偶尔会有单个请求卡 20–40 秒（服务端，下一个请求又正常）。与其干等，不如早点断开重发一次（重发给 25 秒）
 pub fn first_timeout(text: &str) -> u64 { (6 + text.chars().count() as u64 * 15 / 100).clamp(8, 20) }
+
+/// 现在能不能在线合成：要有办法合成（MiMo 要 Key），且 MiMo 今天没吃到上限（本机 GPT-SoVITS 不受限）
+pub fn online_ok(t: &TtsConfig) -> bool { t.can_synth() && (t.mode == "sovits" || !crate::core::usage::over_cap()) }
 
 /// 这个模式的前台台词走不走流式
 pub fn streams(t: &TtsConfig) -> bool { matches!(t.mode.as_str(), "preset" | "design") }
@@ -653,10 +656,12 @@ fn request_stream(job: &Job, attempt: u32) -> Result<Option<Vec<u8>>, Fail> {
             lat::mark(job.token, &format!("stream done ({chunks} chunks, {} B pcm)", pcm.len()));
             let wav = pcm16_wav(STREAM_RATE, &pcm);
             write_cache(t, &job.text, job.mood, &wav);
+            crate::core::usage::add_tts_chars(job.text.chars().count() as u64);
             Ok(None)
         }
         // 播到一半断了：已经收到的照样放完，不进缓存
         (true, Some(e)) => {
+            crate::core::usage::add_tts_chars(job.text.chars().count() as u64);
             crate::core::log::log(&format!("tts stream cut off after {chunks} chunks: {}", redact(&e, &t.api_key)));
             Ok(None)
         }
@@ -756,6 +761,7 @@ fn request_once_at(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_s
         .map_err(|e| Fail { retry: false, msg: format!("bad base64: {e}") })?;
     if let Some(tok) = token { lat::mark(tok, &format!("decoded ({} B)", wav.len())); }
     write_cache(t, text, mood, &wav);
+    crate::core::usage::add_tts_chars(text.chars().count() as u64);
     Ok(wav)
 }
 

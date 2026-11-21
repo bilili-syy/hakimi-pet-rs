@@ -127,6 +127,34 @@ pub fn validate_ai(preset: usize, base: &str, model: &str) -> Option<String> {
     None
 }
 
+/// 每日粮食上限："200000" / "20万" / "200k" / "200,000" → 200000；空 = 0（不限）；看不懂 = None
+pub fn parse_cap(s: &str) -> Option<u64> {
+    let t: String = s.trim().chars().filter(|c| !matches!(c, ',' | '，' | ' ' | '_')).collect();
+    if t.is_empty() {
+        return Some(0);
+    }
+    let (num, mul) = if let Some(n) = t.strip_suffix('万') {
+        (n, 10_000.0)
+    } else if let Some(n) = t.strip_suffix(['k', 'K']) {
+        (n, 1_000.0)
+    } else {
+        (t.as_str(), 1.0)
+    };
+    let v: f64 = num.parse().ok()?;
+    (v.is_finite() && v >= 0.0 && v * mul <= 1e12).then(|| (v * mul).round() as u64)
+}
+
+/// 上限显示成好读的：0 → 空；20000 → "2万"；12345 → "12345"
+pub fn cap_text(v: u64) -> String {
+    if v == 0 {
+        String::new()
+    } else if v.is_multiple_of(10_000) {
+        format!("{}万", v / 10_000)
+    } else {
+        v.to_string()
+    }
+}
+
 /// "45" → 45；空 = 0；超范围/不是数字 = None
 pub fn parse_minutes(s: &str, max: u32) -> Option<u32> {
     let t = s.trim();

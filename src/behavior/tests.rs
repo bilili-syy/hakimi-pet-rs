@@ -555,3 +555,24 @@ fn off_work_remind_deferred_during_fullscreen_and_chat() {
     assert_eq!(b.state, St::Happy);
     assert!(b.scene.bubble.as_ref().is_some_and(|x| lines::OFF_WORK.contains(&x.text.as_str())));
 }
+
+#[test]
+fn usage_feeds_her_and_stuffed_talk() {
+    let mut b = mk();
+    b.stats.data.hunger = 40.0;
+    // 第一次只记基准，不加
+    b.feed_from_usage(5_000);
+    assert_eq!(b.stats.data.hunger, 40.0);
+    // 新吃了 3000 份 → +3
+    b.feed_from_usage(8_000);
+    assert!((b.stats.data.hunger - 43.0).abs() < 1e-9);
+    // 一下吃很多：最多 +10
+    b.feed_from_usage(108_000);
+    assert!((b.stats.data.hunger - 53.0).abs() < 1e-9);
+    // 跨天归零：不扣
+    b.feed_from_usage(10);
+    assert!((b.stats.data.hunger - 53.0).abs() < 1e-9);
+    assert_eq!(super::chat::stuffed_text("好呀～", 0.1), "好呀～…嗝～");
+    assert_eq!(super::chat::stuffed_text("好呀！", 0.9), "好呀～～～");
+    assert_eq!(super::chat::stuffed_text("嗝，吃饱了", 0.9), "嗝，吃饱了");
+}

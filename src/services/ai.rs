@@ -10,6 +10,13 @@ pub const MAX_HISTORY: usize = 20;
 /// 原版 AbortController 30 秒
 /// 普通聊天的超时。带思考的新模型（如 gemini-3.x）经中转常要 30 多秒，30 秒会误报超时
 const TIMEOUT_SECS: u64 = 60;
+/// 今天吃到上限后，聊天回的固定台词（不再请求云端模型）
+pub const FULL_LINES: [&str; 4] = [
+    "嗝～今天吃太撑了，脑子转不动啦，明天再陪你聊复杂的好不好～",
+    "呜…今天的粮食吃完了，现在只能听你说，回不了大道理喵～",
+    "肚子圆滚滚的…让哈基米消化一下，明天再聊～",
+    "今天吃到上限啦，再吃要撑坏了喵！想继续聊可以去设置里调高上限～",
+];
 /// 本机 / 局域网模型（Ollama 等）的超时：冷启动加载模型可能很慢
 const LOCAL_TIMEOUT_SECS: u64 = 180;
 /// 联网搜索要先搜再答，实测 70 秒上下
@@ -73,6 +80,11 @@ pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
     let c = crate::core::config::get();
     if crate::core::config::ai_key_missing(&c) {
         return ChatReply { ok: false, need_key: true, text: NEED_KEY.into() };
+    }
+    // 今天吃到上限：云端模型先歇着，回一句固定的（本机模型不受限）
+    if !crate::core::config::ai_is_local(&c) && crate::core::usage::over_cap() {
+        crate::core::log::log("daily food cap reached, chat degraded to fixed lines");
+        return ChatReply { ok: true, need_key: false, text: FULL_LINES[fastrand::usize(..FULL_LINES.len())].into() };
     }
     let _net_guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
     let (hist_gen, mut history) = {
@@ -241,7 +253,14 @@ fn post_t(url: &str, headers: &[(&str, &str)], body: &Value, timeout: u64, key: 
         let short: String = safe_msg.trim().chars().take(200).collect();
         return Err(AiError { kind: ErrKind::Status(status), detail: format!("HTTP {status}: {short}") });
     }
-    json.ok_or_else(|| AiError::other("bad json"))
+    let json = json.ok_or_else(|| AiError::other("bad json"))?;
+    // 记今天吃了多少：本机模型不花钱不记；接口没给 usage 就按字数估
+    if !crate::core::config::is_local_url(url) {
+        let n = crate::core::usage::tokens_in(&json)
+            .unwrap_or_else(|| crate::core::usage::estimate_tokens(body.to_string().chars().count() / 2 + text.chars().count() / 2));
+        crate::core::usage::add_tokens(n);
+    }
+    Ok(json)
 }
 
 /// encodeURIComponent
@@ -443,6 +462,9 @@ pub fn ask_once_max(system: &str, user: &str, max_tokens: u32) -> Result<String,
     if crate::core::config::ai_key_missing(&c) {
         return Err("no api key".into());
     }
+    if !crate::core::config::ai_is_local(&c) && crate::core::usage::over_cap() {
+        return Err("daily food cap reached".into());
+    }
     ask_once_inner(&c, system, user, max_tokens).map_err(|e| e.detail)
 }
 
@@ -457,6 +479,9 @@ pub fn ask_once_reply(system: &str, user: &str, max_tokens: u32) -> Result<Strin
     let key = c.api_key.trim();
     if crate::core::config::ai_key_missing(&c) {
         return Err(ChatReply { ok: false, need_key: true, text: NEED_KEY.into() });
+    }
+    if !crate::core::config::ai_is_local(&c) && crate::core::usage::over_cap() {
+        return Err(ChatReply { ok: false, need_key: false, text: FULL_LINES[0].into() });
     }
     ask_once_inner(&c, system, user, max_tokens).map_err(|e| {
         crate::core::log::log(&format!("memo ai error {}", redact(&e.detail, key)));

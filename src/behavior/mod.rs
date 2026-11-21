@@ -240,6 +240,8 @@ pub struct Behavior {
     routine: Option<dance::Routine>,
     /// 跟着外面在放的歌跳：后台节拍线程的结果槽
     listen: Option<beat::LiveFeed>,
+    /// 上次看到的今日粮食数（token 用量喂饱食度用；None = 还没看过）
+    food_seen: Option<u64>,
 
     bubble: Option<Bubble>,
     bubble_fade: Fade,
@@ -345,6 +347,7 @@ impl Behavior {
             dance: None,
             routine: None,
             listen: None,
+            food_seen: None,
             bubble: None,
             bubble_fade: Fade::OFF,
             status: None,
@@ -734,6 +737,10 @@ impl Behavior {
         // 用真实当前时间续排，防止电脑休眠醒来后补跑上千次 tick 和上千次 save.json 写盘
         self.next_tick = real_now.max(self.now) + 20_000;
         self.stats.tick(self.state == St::Sleep);
+        if self.io {
+            let food = crate::core::usage::today().food();
+            self.feed_from_usage(food);
+        }
         self.save();
         let (hunger, energy) = (self.stats.data.hunger, self.stats.data.energy);
         let free = matches!(self.state, St::Idle | St::Sit | St::Walk);

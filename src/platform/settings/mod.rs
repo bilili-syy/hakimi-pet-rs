@@ -140,6 +140,8 @@ const ID_PLAY: i32 = 141;
 const ID_PLAY_RESULT: i32 = 142;
 const ID_VOICE_LABEL: i32 = 143;
 const ID_SOVITS_URL: i32 = 167;
+const ID_FOOD_CAP: i32 = 168;
+const ID_USAGE: i32 = 169;
 const ID_AUTOSTART: i32 = 150;
 const ID_FS_HIDE: i32 = 166;
 const ID_SCALE: i32 = 151;
@@ -711,6 +713,11 @@ impl Dlg {
         self.button(p, ID_TEST, "测试连接", 0, [FX, 352.0, 110.0, 30.0]);
         self.hint(p, "不用先保存，直接试", [FX + 118.0, 352.0, FW - 118.0, 30.0]);
         self.add(p, w!("STATIC"), "", 0, 0, ID_TEST_RESULT, [FX, 390.0, FW, 64.0]);
+        // 每日粮食上限（云端聊天 token + MiMo 语音字数），旁边显示今天用了多少
+        self.label(p, "每日上限", [X0, 462.0, LW, 26.0]);
+        let cap = self.edit(p, ID_FOOD_CAP, 0, [FX, 462.0, 90.0, 26.0]);
+        cue(cap, "不限");
+        self.add(p, w!("STATIC"), "", SS_CENTERIMAGE, 0, ID_USAGE, [FX + 98.0, 462.0, FW - 98.0, 26.0]);
 
         // ---------------- 语音
         let p = 2;
@@ -843,6 +850,8 @@ impl Dlg {
         combo_set(self.c(ID_MODE), MODES.iter().position(|x| x.0 == c.tts.mode).unwrap_or(0));
         set_text(self.c(ID_VOICE), &c.tts.voice);
         set_text(self.c(ID_SOVITS_URL), &c.tts.sovits_url);
+        set_text(self.c(ID_FOOD_CAP), &cap_text(c.daily_food_cap));
+        set_text(self.c(ID_USAGE), &crate::core::usage::summary(&crate::core::usage::today()));
         set_text(self.c(ID_STYLE), &c.tts.style);
         let v = (c.tts.volume.clamp(0.0, 1.0) * 100.0).round() as isize;
         send(self.c(ID_VOLUME), TBM_SETPOS, 1, v);
@@ -965,6 +974,8 @@ impl Dlg {
         if let Some(e) = validate_ai(self.preset, &c.base_url, &c.model) {
             return Err((0, e));
         }
+        c.daily_food_cap = parse_cap(&get_text(self.c(ID_FOOD_CAP)))
+            .ok_or((0, "「每日上限」填数字就行，比如 200000 或 20万；空着 = 不限".to_string()))?;
 
         c.tts.enabled = checked(self.c(ID_TTS_ON));
         c.tts.chat_voice_reply = checked(self.c(ID_CHAT_VOICE));
@@ -1049,7 +1060,7 @@ fn differs(a: &Config, b: &Config) -> bool {
             (c.weather_city.clone(), c.birthday.clone()),
             (c.moyu.enabled, c.moyu.minutes, c.moyu.pomodoro_minutes, c.reminders.water, c.reminders.stand_up),
             c.reminders.off_work.clone(),
-            c.fullscreen_hide,
+            (c.fullscreen_hide, c.daily_food_cap),
         )
     };
     pick(a) != pick(b)
@@ -1644,6 +1655,16 @@ mod tests {
         assert!(validate_ai(CUSTOM, "https://api.x.com/v1", "m").is_none());
         assert!(validate_ai(0, "", "").is_some());
         assert!(validate_ai(0, "", "gemini-2.5-flash").is_none());
+        assert_eq!(parse_cap(""), Some(0));
+        assert_eq!(parse_cap("20万"), Some(200_000));
+        assert_eq!(parse_cap("1.5万"), Some(15_000));
+        assert_eq!(parse_cap("200k"), Some(200_000));
+        assert_eq!(parse_cap("200,000"), Some(200_000));
+        assert_eq!(parse_cap("abc"), None);
+        assert_eq!(parse_cap("-5"), None);
+        assert_eq!(cap_text(0), "");
+        assert_eq!(cap_text(200_000), "20万");
+        assert_eq!(cap_text(12_345), "12345");
         assert_eq!(parse_minutes("45", 1440), Some(45));
         assert_eq!(parse_minutes(" ", 1440), Some(0));
         assert_eq!(parse_minutes("-1", 1440), None);

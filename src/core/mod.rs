@@ -10,3 +10,4 @@ pub mod save;
 pub mod session;
 pub mod skin;
 pub mod stats;
+pub mod usage;

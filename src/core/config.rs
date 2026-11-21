@@ -136,6 +136,8 @@ pub struct Config {
     pub fps: u32,
     /// 全屏程序（游戏、全屏视频）在前台时自动藏起来，退出全屏再出来
     pub fullscreen_hide: bool,
+    /// 每天最多吃多少「粮食」（云端聊天 token + MiMo 语音字数）；0 = 不限。到了先降级，不直接停
+    pub daily_food_cap: u64,
     /// 未知字段（_说明 之类）原样保留
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -174,6 +176,7 @@ impl Default for Config {
             scale: 1.0,
             fps: 60,
             fullscreen_hide: true,
+            daily_food_cap: 0,
             extra,
         }
     }
