@@ -10,6 +10,8 @@ pub const MAX_HISTORY: usize = 20;
 /// 原版 AbortController 30 秒
 /// 普通聊天的超时。带思考的新模型（如 gemini-3.x）经中转常要 30 多秒，30 秒会误报超时
 const TIMEOUT_SECS: u64 = 60;
+/// 本机 / 局域网模型（Ollama 等）的超时：冷启动加载模型可能很慢
+const LOCAL_TIMEOUT_SECS: u64 = 180;
 /// 联网搜索要先搜再答，实测 70 秒上下
 const SEARCH_TIMEOUT_SECS: u64 = 100;
 
@@ -69,7 +71,7 @@ pub fn chat(tx: &EventSender, text: String, ctx: ChatCtx) {
 /// 同步版本（在调用线程上阻塞），返回给用户看的结果
 pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
     let c = crate::core::config::get();
-    if c.api_key.trim().is_empty() {
+    if crate::core::config::ai_key_missing(&c) {
         return ChatReply { ok: false, need_key: true, text: NEED_KEY.into() };
     }
     let _net_guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
@@ -212,6 +214,8 @@ fn post(url: &str, headers: &[(&str, &str)], body: &Value, key: &str) -> Result<
 }
 
 fn post_t(url: &str, headers: &[(&str, &str)], body: &Value, timeout: u64, key: &str) -> Result<Value, AiError> {
+    // 本机模型第一次要把模型读进显存，可能要几十秒
+    let timeout = if crate::core::config::is_local_url(url) { timeout.max(LOCAL_TIMEOUT_SECS) } else { timeout };
     let (status, text) = super::net::post_json(url, headers, body, timeout).map_err(|e| {
         let kind = if matches!(e, ureq::Error::Timeout(_)) {
             ErrKind::Timeout
@@ -331,6 +335,8 @@ fn provider_base<'a>(provider: &str, base_url: &'a str) -> &'a str {
 fn endpoint(provider: &str, base_url: &str, model: &str, key: &str) -> (String, &'static str, String) {
     let base = provider_base(provider, base_url);
     if provider == "openai" {
+        // 本机模型不要 Key：随便给一个，免得有的本地服务见到空 Bearer 报错
+        let key = if key.is_empty() { "local" } else { key };
         (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}"))
     } else {
         (format!("{base}/models/{}:generateContent", encode_component(model)), "x-goog-api-key", key.to_string())
@@ -434,7 +440,7 @@ fn ask_once_inner(c: &crate::core::config::Config, system: &str, user: &str, max
 /// 返回的错误只是给日志看的描述，不含 Key。
 pub fn ask_once_max(system: &str, user: &str, max_tokens: u32) -> Result<String, String> {
     let c = crate::core::config::get();
-    if c.api_key.trim().is_empty() {
+    if crate::core::config::ai_key_missing(&c) {
         return Err("no api key".into());
     }
     ask_once_inner(&c, system, user, max_tokens).map_err(|e| e.detail)
@@ -449,7 +455,7 @@ pub fn ask_once(system: &str, user: &str) -> Result<String, String> {
 pub fn ask_once_reply(system: &str, user: &str, max_tokens: u32) -> Result<String, ChatReply> {
     let c = crate::core::config::get();
     let key = c.api_key.trim();
-    if key.is_empty() {
+    if crate::core::config::ai_key_missing(&c) {
         return Err(ChatReply { ok: false, need_key: true, text: NEED_KEY.into() });
     }
     ask_once_inner(&c, system, user, max_tokens).map_err(|e| {
@@ -473,10 +479,12 @@ pub struct TestParams {
 /// 发一条很短的请求，成功返回 (耗时毫秒, 回复)；失败返回给新手看的中文原因。不写日志、不碰 chat.json。
 pub fn test_connection(p: &TestParams) -> Result<(u64, String), String> {
     let key = p.api_key.trim();
-    if key.is_empty() { return Err("还没填 API Key".into()); }
+    let local = p.provider == "openai" && crate::core::config::is_local_url(&p.base_url);
+    if key.is_empty() && !local { return Err("还没填 API Key".into()); }
     let model = p.model.trim();
     if model.is_empty() { return Err("还没填模型名".into()); }
-    let agent = super::net::agent_with_proxy(&p.proxy, 25);
+    let url_probe = provider_base(&p.provider, &p.base_url).to_string();
+    let agent = super::net::agent_with_proxy(&p.proxy, if local { 120 } else { 25 }, &url_probe);
     let system = "你是连接测试。只回复一个字：喵";
     let history = [json!({ "role": "user", "text": "ping" })];
     let (url, h_name, h_val) = endpoint(&p.provider, &p.base_url, model, key);
@@ -484,7 +492,7 @@ pub fn test_connection(p: &TestParams) -> Result<(u64, String), String> {
     let t0 = std::time::Instant::now();
     let r = super::net::post_json_via(&agent, &url, &[(h_name, &h_val)], &body);
     let ms = t0.elapsed().as_millis() as u64;
-    let (status, text) = r.map_err(|e| explain_net(&e))?;
+    let (status, text) = r.map_err(|e| if local { explain_local(&e) } else { explain_net(&e) })?;
     let json: Option<Value> = serde_json::from_str(&text).ok();
     if !(200..300).contains(&status) {
         let msg = json
@@ -501,6 +509,48 @@ pub fn test_connection(p: &TestParams) -> Result<(u64, String), String> {
         // 通了但没有正文（思考型模型 token 不够、被安全拦截等）：算连上了
         Err(e) => Ok((ms, format!("（连上了，但回复是空的：{}）", e.detail))),
     }
+}
+
+/// 本机模型连不上时的说法
+fn explain_local(e: &ureq::Error) -> String {
+    if matches!(e, ureq::Error::Timeout(_)) {
+        return "本机模型太慢没回话：第一次加载大模型可能要一两分钟，再点一次试试，或换个小点的模型".into();
+    }
+    "连不上本机的模型服务：Ollama 打开了吗？（装好后右下角托盘里有个羊驼图标）地址一般是 http://127.0.0.1:11434/v1".into()
+}
+
+/// 列出 OpenAI 兼容接口上能用的模型（本机 Ollama / LM Studio 用：GET {base}/models）
+pub fn list_models(p: &TestParams) -> Result<Vec<String>, String> {
+    let base = provider_base(&p.provider, &p.base_url).to_string();
+    let local = crate::core::config::is_local_url(&base);
+    let agent = super::net::agent_with_proxy(&p.proxy, 10, &base);
+    let key = p.api_key.trim();
+    let auth = format!("Bearer {}", if key.is_empty() { "local" } else { key });
+    let mut res = agent
+        .get(&format!("{base}/models"))
+        .header("Authorization", &auth)
+        .call()
+        .map_err(|e| if local { explain_local(&e) } else { explain_net(&e) })?;
+    let status = res.status().as_u16();
+    let text = res.body_mut().with_config().limit(1 << 20).read_to_string().map_err(|e| explain_net(&e))?;
+    if !(200..300).contains(&status) { return Err(explain_status(status, "")); }
+    parse_models(&text).ok_or_else(|| "服务器返回的模型列表看不懂，接口地址可能填错了（要填到 /v1 这一级）".into())
+}
+
+/// {"data":[{"id":"qwen3:8b"},…]} → ["qwen3:8b", …]（去掉嵌入模型，按名字排）
+pub fn parse_models(text: &str) -> Option<Vec<String>> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let mut out: Vec<String> = v
+        .get("data")?
+        .as_array()?
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .filter(|id| !id.to_ascii_lowercase().contains("embed"))
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    Some(out)
 }
 
 /// 把服务器错误里可能带的 Key 片段遮掉，再截短
@@ -645,6 +695,49 @@ mod tests {
         assert!(redact(&"x".repeat(200), "k").chars().count() <= 91);
         let p = TestParams { provider: "openai".into(), base_url: String::new(), api_key: " ".into(), model: "m".into(), proxy: String::new() };
         assert_eq!(test_connection(&p).unwrap_err(), "还没填 API Key");
+    }
+
+    #[test]
+    fn models_list_parsing() {
+        let t = r#"{"object":"list","data":[{"id":"qwen3:8b"},{"id":"nomic-embed-text:latest"},{"id":"llama3.2:3b"},{"id":"qwen3:8b"}]}"#;
+        assert_eq!(parse_models(t).unwrap(), vec!["llama3.2:3b".to_string(), "qwen3:8b".to_string()]);
+        assert!(parse_models("not json").is_none());
+        assert!(parse_models(r#"{"error":"x"}"#).is_none());
+    }
+
+    /// 本机起一个假的 OpenAI 兼容服务（像 Ollama），走真网络栈：列模型 + 测试连接都不要 Key、不走代理
+    #[test]
+    fn local_server_end_to_end() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut s, _)) = l.accept() else { return };
+                let mut buf = vec![0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if req.starts_with("GET /v1/models") {
+                    r#"{"data":[{"id":"qwen3:4b"},{"id":"qwen3:8b"}]}"#
+                } else {
+                    r#"{"choices":[{"message":{"content":"喵"}}]}"#
+                };
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        let p = TestParams { provider: "openai".into(), base_url: format!("http://127.0.0.1:{port}/v1"), api_key: String::new(), model: "qwen3:8b".into(), proxy: "http://127.0.0.1:1".into() };
+        assert_eq!(list_models(&p).unwrap(), vec!["qwen3:4b".to_string(), "qwen3:8b".to_string()]);
+        let (_, reply) = test_connection(&p).unwrap();
+        assert_eq!(reply, "喵");
+    }
+
+    #[test]
+    fn local_needs_no_key() {
+        let (_, _, h) = endpoint("openai", "http://127.0.0.1:11434/v1", "qwen3:8b", "");
+        assert_eq!(h, "Bearer local");
+        // 本机没开服务：不报「没填 Key」，而是说连不上（端口 9 基本不会有人监听）
+        let p = TestParams { provider: "openai".into(), base_url: "http://127.0.0.1:9/v1".into(), api_key: String::new(), model: "m".into(), proxy: String::new() };
+        assert!(test_connection(&p).unwrap_err().contains("Ollama"));
     }
 
     #[test]

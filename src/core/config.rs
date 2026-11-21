@@ -225,8 +225,34 @@ pub fn clamp_scale(s: f32) -> f32 {
     if s.is_finite() && s > 0.0 { s.clamp(0.5, 2.0) } else { 1.0 }
 }
 
-/// 没填聊天 API Key（新手第一次打开聊天时提示去设置）
-pub fn ai_key_missing(c: &Config) -> bool { c.api_key.trim().is_empty() }
+/// 没填聊天 API Key（新手第一次打开聊天时提示去设置）。本机 / 局域网的 OpenAI 兼容接口（Ollama、LM Studio）不需要 Key
+pub fn ai_key_missing(c: &Config) -> bool { c.api_key.trim().is_empty() && !ai_is_local(c) }
+
+/// 聊天模型跑在本机 / 局域网（Ollama 等）：不要 Key、不走代理、超时放宽
+pub fn ai_is_local(c: &Config) -> bool { c.provider == "openai" && is_local_url(&c.base_url) }
+
+/// URL 指向本机或局域网：localhost / 127.x / ::1 / 10.x / 172.16-31.x / 192.168.x / 169.254.x / fc00::/7 / fe80:: / *.local
+pub fn is_local_url(url: &str) -> bool {
+    let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url.trim());
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = if let Some(h) = host_port.strip_prefix('[') {
+        h.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    if host.is_empty() { return false; }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") { return true; }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let seg = v6.segments()[0];
+            v6.is_loopback() || (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
+    }
+}
 
 /// 把文件文本解析成配置（坏文件 = 全默认，和原版一致）
 pub fn parse(text: &str) -> Config {
@@ -412,6 +438,10 @@ mod tests {
         assert!((parse(r#"{"scale":"big"}"#).scale - 1.0).abs() < 1e-6);
         assert!(ai_key_missing(&c));
         assert!(!ai_key_missing(&parse(r#"{"apiKey":"x"}"#)));
+        // 本机 Ollama 不要 Key；gemini 填本机地址也还是要 Key
+        assert!(!ai_key_missing(&parse(r#"{"provider":"openai","baseUrl":"http://127.0.0.1:11434/v1"}"#)));
+        assert!(ai_key_missing(&parse(r#"{"provider":"gemini","baseUrl":"http://127.0.0.1:11434/v1"}"#)));
+        assert!(ai_key_missing(&parse(r#"{"provider":"openai","baseUrl":"https://api.deepseek.com/v1"}"#)));
     }
 
     #[test]
@@ -431,5 +461,16 @@ mod tests {
         assert_eq!(c.provider, "gemini");
         let c = parse("\u{feff}{\"apiKey\":\"bom\"}");
         assert_eq!(c.api_key, "bom");
+    }
+
+    #[test]
+    fn local_urls() {
+        for u in ["http://127.0.0.1:11434/v1", "http://localhost:1234/v1", "http://[::1]:11434", "http://192.168.1.20:11434/v1",
+            "http://10.0.0.5/v1", "http://172.20.1.1:8080", "http://my-pc.local:11434", "http://user:pw@127.0.0.1:1/v1"] {
+            assert!(is_local_url(u), "{u}");
+        }
+        for u in ["https://api.openai.com/v1", "https://localhost.example.com/v1", "http://172.32.0.1", "http://8.8.8.8", "", "https://192.168.evil.com"] {
+            assert!(!is_local_url(u), "{u}");
+        }
     }
 }

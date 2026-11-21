@@ -64,6 +64,14 @@ pub const PRESETS: &[Preset] = &[
         note: "需要海外付费账户；国内要开代理。",
     },
     Preset {
+        name: "Ollama（本机运行，免费）",
+        provider: "openai",
+        base: "http://127.0.0.1:11434/v1",
+        models: &["qwen3:8b", "qwen3:4b", "gemma3:4b", "llama3.2:3b"],
+        key_url: "https://ollama.com/download",
+        note: "模型跑在你自己电脑上：装好 Ollama，命令行运行 ollama pull qwen3:8b。不要 Key、不走代理，聊天不出本机。点「测试连接」会列出已装的模型。",
+    },
+    Preset {
         name: "自定义（OpenAI 兼容接口）",
         provider: "openai",
         base: "",
@@ -100,6 +108,9 @@ pub fn switch_base(old: usize, new: usize, current: &str) -> String {
     let was_preset = old != CUSTOM && norm_url(current) == norm_url(PRESETS[old].base);
     if was_preset { String::new() } else { current.trim().to_string() }
 }
+
+/// 这个预设是本机模型（不要 Key、链接是下载页）
+pub fn preset_is_local(i: usize) -> bool { crate::core::config::is_local_url(PRESETS[i.min(PRESETS.len() - 1)].base) }
 
 /// AI 页校验
 pub fn validate_ai(preset: usize, base: &str, model: &str) -> Option<String> {

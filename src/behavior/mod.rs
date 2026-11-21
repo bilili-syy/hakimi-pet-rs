@@ -677,7 +677,7 @@ impl Behavior {
             Later::Intro(n) => {
                 let n = n as usize;
                 // 第三句教填 Key：已经填了就不说
-                let has_key = !self.io || !crate::core::config::get().api_key.trim().is_empty();
+                let has_key = !self.io || !crate::core::config::ai_key_missing(&crate::core::config::get());
                 if n >= lines::INTRO.len() || (n == lines::INTRO.len() - 1 && has_key && self.io) {
                     self.intro = false;
                     return;

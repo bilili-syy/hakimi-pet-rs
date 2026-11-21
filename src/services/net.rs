@@ -26,18 +26,8 @@ pub fn redact_proxy(proxy: &str) -> String {
     proxy.to_string()
 }
 
-/// 判断目标 URL 是否指向本机回环地址（跟随系统代理时跳过代理，支持本地 Ollama / LM Studio 等）
-pub fn is_loopback_url(url: &str) -> bool {
-    let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url.trim());
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
-    let host = if let Some(h) = host_port.strip_prefix('[') {
-        h.split(']').next().unwrap_or("")
-    } else {
-        host_port.split(':').next().unwrap_or("")
-    };
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
-}
+/// 目标 URL 指向本机或局域网（Ollama / LM Studio 等）：一律直连不走代理
+pub fn is_loopback_url(url: &str) -> bool { crate::core::config::is_local_url(url) }
 
 fn cached_agent(proxy: &str) -> ureq::Agent {
     {
@@ -63,10 +53,11 @@ fn cached_agent(proxy: &str) -> ureq::Agent {
 fn agent_for_url(url: &str) -> ureq::Agent {
     let cfg = crate::core::config::get().proxy;
     let cfg = cfg.trim();
-    let proxy = if !cfg.is_empty() {
-        normalize(cfg).unwrap_or_default()
-    } else if is_loopback_url(url) {
+    // 本机 / 局域网（Ollama 等）永远直连：代理软件转发 127.0.0.1 会转到代理自己那里去
+    let proxy = if is_loopback_url(url) {
         String::new()
+    } else if !cfg.is_empty() {
+        normalize(cfg).unwrap_or_default()
     } else {
         system_proxy().and_then(|s| normalize(&s)).unwrap_or_default()
     };
@@ -106,7 +97,8 @@ fn build(proxy: &str, timeout_secs: u64) -> ureq::Agent {
 }
 
 /// 按「设置窗口里还没保存的代理设置」建 Agent（测试连接用）。setting 为空 = 跟随系统代理
-pub fn agent_with_proxy(setting: &str, timeout_secs: u64) -> ureq::Agent {
+pub fn agent_with_proxy(setting: &str, timeout_secs: u64, url: &str) -> ureq::Agent {
+    if is_loopback_url(url) { return build("", timeout_secs); }
     let s = setting.trim();
     let proxy = if s.is_empty() { system_proxy().and_then(|p| normalize(&p)) } else { normalize(s) };
     build(&proxy.unwrap_or_default(), timeout_secs)

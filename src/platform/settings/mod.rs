@@ -266,6 +266,8 @@ static HWND_ATOMIC: AtomicIsize = AtomicIsize::new(0);
 static GEN: AtomicU64 = AtomicU64::new(1);
 /// (控件 id, 代号, 成功?, 文字)
 static RESULTS: Mutex<Vec<(i32, u64, bool, String)>> = Mutex::new(Vec::new());
+/// 测试连接时从本机模型服务读到的模型表：(代号, 模型名们, 选中的)
+static FOUND_MODELS: Mutex<Option<(u64, Vec<String>, String)>> = Mutex::new(None);
 static ACTCTX: AtomicIsize = AtomicIsize::new(0);
 
 fn hinst() -> HINSTANCE {
@@ -870,6 +872,9 @@ impl Dlg {
             let _ = ShowWindow(link, if !p.key_url.is_empty() && self.page == 1 { SW_SHOW } else { SW_HIDE });
         }
         set_text(self.c(ID_NOTE), p.note);
+        let local = preset_is_local(self.preset);
+        set_text(link, if local { "还没装 Ollama？（点这里打开下载页）" } else { "如何获取 API Key？（点这里打开官网）" });
+        cue(self.c(ID_KEY), if local { "本机模型不用填" } else { "" });
         let base = self.c(ID_BASE);
         cue(base, if p.provider == "gemini" { "留空 = 用官方地址（一般不用改）" } else { "https://…/v1" });
     }
@@ -1276,9 +1281,28 @@ fn start_test() {
         return;
     };
     let spawned = std::thread::Builder::new().name("hakimi-settings-test".into()).spawn(move || {
+        let mut params = params;
+        let mut extra = String::new();
+        // 本机 / 局域网的服务（Ollama 等）：先列出装了哪些模型，模型没填或填的没装就换成第一个
+        if params.provider == "openai" && crate::core::config::is_local_url(&params.base_url) {
+            match crate::services::ai::list_models(&params) {
+                Ok(list) if list.is_empty() => {
+                    return post_result(hwnd, ID_TEST_RESULT, tag, false, "✘ 服务开着，但还没有模型：命令行运行 ollama pull qwen3:8b 再试".into());
+                }
+                Ok(list) => {
+                    let cur = params.model.trim().to_string();
+                    let chosen = if list.contains(&cur) { cur } else { list[0].clone() };
+                    params.model = chosen.clone();
+                    let shown: Vec<&str> = list.iter().take(6).map(String::as_str).collect();
+                    extra = format!("\n已装 {} 个：{}{}", list.len(), shown.join("、"), if list.len() > 6 { "…" } else { "" });
+                    *FOUND_MODELS.lock().unwrap_or_else(|e| e.into_inner()) = Some((tag, list, chosen));
+                }
+                Err(e) => return post_result(hwnd, ID_TEST_RESULT, tag, false, format!("✘ {e}")),
+            }
+        }
         let (ok, text) = match crate::services::ai::test_connection(&params) {
-            Ok((ms, reply)) => (true, format!("✔ 连接成功！用时 {:.1} 秒。她回了：{reply}", ms as f64 / 1000.0)),
-            Err(e) => (false, format!("✘ {e}")),
+            Ok((ms, reply)) => (true, format!("✔ 连接成功！用时 {:.1} 秒。她回了：{reply}{extra}", ms as f64 / 1000.0)),
+            Err(e) => (false, format!("✘ {e}{extra}")),
         };
         post_result(hwnd, ID_TEST_RESULT, tag, ok, text);
     });
@@ -1367,6 +1391,18 @@ fn on_results() {
             let (want, btn, slot) = if id == ID_TEST_RESULT { (d.test_gen, ID_TEST, 0) } else { (d.play_gen, ID_PLAY, 1) };
             if tag != want {
                 continue;
+            }
+            if id == ID_TEST_RESULT
+                && let Some((t, list, chosen)) = FOUND_MODELS.lock().unwrap_or_else(|e| e.into_inner()).take()
+                && t == tag
+            {
+                let h = d.c(ID_MODEL);
+                let names: Vec<&str> = list.iter().map(String::as_str).collect();
+                combo_fill(h, &names);
+                match list.iter().position(|m| *m == chosen) {
+                    Some(i) => combo_set(h, i),
+                    None => set_text(h, &chosen),
+                }
             }
             RESULT_COLOR.with(|c| {
                 let mut v = c.get();
@@ -1535,7 +1571,7 @@ mod tests {
                 assert!(p.key_url.starts_with("https://"), "{}", p.name);
             }
             if p.provider == "openai" && !p.base.is_empty() {
-                assert!(p.base.starts_with("https://"));
+                assert!(p.base.starts_with("https://") || crate::core::config::is_local_url(p.base), "{}", p.name);
                 assert!(!p.base.ends_with('/'));
             }
             if p.key_url.is_empty() {

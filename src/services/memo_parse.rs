@@ -763,7 +763,7 @@ pub fn route_ai(tx: &EventSender, text: String, ctx: ChatCtx) {
     let spawned = std::thread::Builder::new().name("hakimi-memo".into()).spawn(move || {
         let _g = MEMO_AI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let now = Now::get().dt;
-        if crate::core::config::get().api_key.trim().is_empty() {
+        if crate::core::config::ai_key_missing(&crate::core::config::get()) {
             worker_tx.send(AppEvent::Memo(MemoEv::Reply { ok: false, text: NO_KEY_LINE.into() }));
             return;
         }
