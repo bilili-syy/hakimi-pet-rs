@@ -708,15 +708,13 @@ mod tests {
     /// 本机起一个假的 OpenAI 兼容服务（像 Ollama），走真网络栈：列模型 + 测试连接都不要 Key、不走代理
     #[test]
     fn local_server_end_to_end() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for _ in 0..2 {
                 let Ok((mut s, _)) = l.accept() else { return };
-                let mut buf = vec![0u8; 8192];
-                let n = s.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let req = super::super::net::read_http_request(&mut s);
                 let body = if req.starts_with("GET /v1/models") {
                     r#"{"data":[{"id":"qwen3:4b"},{"id":"qwen3:8b"}]}"#
                 } else {

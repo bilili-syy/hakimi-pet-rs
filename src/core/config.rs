@@ -33,7 +33,7 @@ impl Default for Reminders {
 pub struct TtsConfig {
     pub enabled: bool,
     pub api_key: String,
-    /// clone / preset / design
+    /// clone / preset / design / sovits（本机 GPT-SoVITS）
     pub mode: String,
     pub voice: String,
     pub style: String,
@@ -42,9 +42,19 @@ pub struct TtsConfig {
     pub volume: f32,
     /// 语音回答：聊天回复等语音合成好了再和文字一起出来（关了 = 文字立刻出、聊天回复不念）
     pub chat_voice_reply: bool,
+    /// 本机 GPT-SoVITS api_v2 地址（mode = sovits 时用）
+    pub sovits_url: String,
+    /// GPT-SoVITS 参考音频（服务那台机器上的路径）；空 = 用内置的哈基米录音（导出到数据目录）
+    pub sovits_ref: String,
+    /// 参考音频里说的话；空 = 无参考文本模式
+    pub sovits_prompt: String,
     /// 未知字段原样保留
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+impl TtsConfig {
+    /// 有没有办法在线合成：本机 GPT-SoVITS 不要 Key，MiMo 要
+    pub fn can_synth(&self) -> bool { self.mode == "sovits" || !self.api_key.trim().is_empty() }
 }
 impl Default for TtsConfig {
     fn default() -> Self {
@@ -57,6 +67,9 @@ impl Default for TtsConfig {
             speak: "all".into(),
             volume: 0.9,
             chat_voice_reply: true,
+            sovits_url: "http://127.0.0.1:9880".into(),
+            sovits_ref: String::new(),
+            sovits_prompt: String::new(),
             extra: Map::new(),
         }
     }

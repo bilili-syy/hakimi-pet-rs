@@ -118,9 +118,9 @@ pub fn bundled_playable() -> bool {
     })
 }
 
-/// 内置台词（哈基米默认声线，只在 clone 模式用）
+/// 内置台词（哈基米默认声线，clone 和本机 GPT-SoVITS 模式用：都是她本人的声音）
 pub fn bundled(t: &TtsConfig, text: &str) -> Option<&'static [u8]> {
-    if t.mode != "clone" { return None; }
+    if t.mode != "clone" && t.mode != "sovits" { return None; }
     crate::assets::get(&format!("voice/lines/{}.ogg", &sha1_hex(text)[..16]))
 }
 
@@ -382,7 +382,7 @@ pub fn speak(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMood>
             lat::mark(token, "cache hit");
             return answer(seq, Some(a));
         }
-        if t.api_key.trim().is_empty() { return answer(seq, None); }
+        if !t.can_synth() { return answer(seq, None); }
         let mut st = state();
         if in_cooldown(&st) {
             drop(st);
@@ -450,7 +450,7 @@ fn worker() {
                             st.last_fg = Some(Instant::now());
                             break Work::Fg(job);
                         }
-                        if !t.enabled || t.api_key.trim().is_empty() || t.speak == "off" || st.warm.is_empty() {
+                        if !t.enabled || !t.can_synth() || t.speak == "off" || st.warm.is_empty() {
                             st.warm_at = None;
                             continue;
                         }
@@ -512,7 +512,8 @@ fn run_fg(job: Job) {
         result = if stream {
             request_stream(&job, attempt)
         } else {
-            request_once_lat(&job.t, &job.text, job.mood, if attempt == 0 { first_timeout(&job.text) } else { 25 }, job.token)
+            let secs = if job.t.mode == "sovits" { SOVITS_TIMEOUT } else if attempt == 0 { first_timeout(&job.text) } else { 25 };
+            request_once_lat(&job.t, &job.text, job.mood, secs, job.token)
         };
         match &result {
             Err(f) if f.retry => continue,
@@ -721,6 +722,12 @@ fn request_once(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_secs
 }
 
 fn request_once_at(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_secs: u64, token: Option<u64>) -> Result<Vec<u8>, Fail> {
+    if t.mode == "sovits" {
+        let wav = sovits_request(t, text, timeout_secs)?;
+        if let Some(tok) = token { lat::mark(tok, &format!("sovits ({} B)", wav.len())); }
+        write_cache(t, text, mood, &wav);
+        return Ok(wav);
+    }
     let body = build_body(t, text, mood);
     let r = super::net::post_json(API, &[("api-key", t.api_key.trim())], &body, timeout_secs);
     drop(body);
@@ -752,6 +759,59 @@ fn request_once_at(t: &TtsConfig, text: &str, mood: Option<VoiceMood>, timeout_s
     Ok(wav)
 }
 
+// ------------------------------------------------------------------ 本机 GPT-SoVITS（api_v2：POST /tts，直接回 wav）
+
+/// 本机合成慢（CPU 上一句可能十几秒），超时给宽一点
+const SOVITS_TIMEOUT: u64 = 60;
+
+/// 参考音频路径：用户填了就用；没填就把内置的哈基米录音导出到数据目录（只导一次）
+fn sovits_ref_path(t: &TtsConfig) -> Option<String> {
+    let r = t.sovits_ref.trim();
+    if !r.is_empty() { return Some(r.to_string()); }
+    let path = crate::core::paths::data_dir().join("sovits-ref.mp3");
+    let want = crate::assets::get("voice/hakimi-voice.mp3")?;
+    let same = std::fs::metadata(&path).map(|m| m.len() == want.len() as u64).unwrap_or(false);
+    if !same && std::fs::write(&path, want).is_err() { return None; }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// 请求体（不带心情标签：GPT-SoVITS 会把「(开心)」当字念出来）
+pub fn sovits_body(t: &TtsConfig, text: &str, ref_path: &str) -> Value {
+    json!({
+        "text": text,
+        "text_lang": "zh",
+        "ref_audio_path": ref_path,
+        "prompt_text": t.sovits_prompt.trim(),
+        "prompt_lang": "zh",
+        "media_type": "wav",
+        "streaming_mode": false,
+        "text_split_method": "cut5",
+    })
+}
+
+fn sovits_url(t: &TtsConfig) -> String {
+    let base = t.sovits_url.trim().trim_end_matches('/');
+    let base = if base.is_empty() { "http://127.0.0.1:9880" } else { base };
+    if base.ends_with("/tts") { base.to_string() } else { format!("{base}/tts") }
+}
+
+fn sovits_request(t: &TtsConfig, text: &str, timeout_secs: u64) -> Result<Vec<u8>, Fail> {
+    let refp = sovits_ref_path(t).ok_or_else(|| Fail { retry: false, msg: "sovits: no reference audio".into() })?;
+    let body = sovits_body(t, text, &refp);
+    let (status, bytes) = super::net::post_json_bytes(&sovits_url(t), &body, timeout_secs).map_err(|e| Fail {
+        retry: false,
+        msg: if matches!(e, ureq::Error::Timeout(_)) { "timeout".into() } else { format!("sovits: {e}") },
+    })?;
+    if !(200..300).contains(&status) {
+        let snippet: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
+        return Err(Fail { retry: false, msg: format!("HTTP {status}: {snippet}") });
+    }
+    if bytes.len() < 64 || !super::audio::can_decode(&bytes) {
+        return Err(Fail { retry: false, msg: "sovits: response is not audio".into() });
+    }
+    Ok(bytes)
+}
+
 // ------------------------------------------------------------------ 设置窗口「试听」
 
 /// 试听用的一句（内置录音里也有，没填 Key 时 clone 模式直接放内置的）
@@ -759,6 +819,20 @@ pub const SAMPLE: &str = "喵？找哈基米有事吗～";
 
 /// 用设置窗口里还没保存的语音设置合成一句（阻塞，后台线程调）。失败返回中文原因（不含 Key）
 pub fn synth_test(t: &TtsConfig, text: &str) -> Result<Vec<u8>, String> {
+    if t.mode == "sovits" {
+        return sovits_request(t, &clean(text), SOVITS_TIMEOUT).map_err(|f| {
+            if f.msg == "timeout" {
+                "本机 GPT-SoVITS 太慢没回话（超过 60 秒）".into()
+            } else if f.msg.starts_with("HTTP ") {
+                let s: String = f.msg.chars().take(80).collect();
+                format!("GPT-SoVITS 合成失败：{s}")
+            } else if f.msg.contains("not audio") {
+                "地址上的服务回的不是声音：确认开的是 GPT-SoVITS 的 api_v2.py".into()
+            } else {
+                "连不上本机 GPT-SoVITS：先运行 python api_v2.py（默认端口 9880）".into()
+            }
+        });
+    }
     if t.api_key.trim().is_empty() { return Err("还没填 MiMo Key".into()); }
     let mut t = t.clone();
     t.api_key = t.api_key.trim().to_string();
@@ -800,6 +874,43 @@ mod tests {
         assert_eq!(cache_key(&t, "你好", Some(VoiceMood::Happy)), "829763512f6496c609ff0635be51f93d6cb31730");
         assert_eq!(text_key(&t, "你好"), "T783e6dcc5275504b2cdd82cf0981b0805e4c67f9");
         assert_eq!(&sha1_hex("喵？找哈基米有事吗～")[..16], "2b60dc85bb8a2964");
+    }
+
+    #[test]
+    fn sovits_request_shape() {
+        let mut t = TtsConfig { mode: "sovits".into(), ..TtsConfig::default() };
+        assert!(t.can_synth());
+        assert!(bundled(&t, SAMPLE).is_some(), "本机声线也用内置录音");
+        let b = sovits_body(&t, "你好呀", "C:/x/ref.mp3");
+        assert_eq!(b["text"], "你好呀");
+        assert_eq!(b["ref_audio_path"], "C:/x/ref.mp3");
+        assert_eq!(b["media_type"], "wav");
+        assert_eq!(sovits_url(&t), "http://127.0.0.1:9880/tts");
+        t.sovits_url = "http://192.168.1.5:9880/tts/".into();
+        assert_eq!(sovits_url(&t), "http://192.168.1.5:9880/tts");
+        t.mode = "preset".into();
+        assert!(!t.can_synth());
+    }
+
+    /// 假的本机 GPT-SoVITS：回一段 wav，走真网络
+    #[test]
+    fn sovits_end_to_end() {
+        use std::io::Write;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let wav = pcm16_wav(16000, &vec![0u8; 3200]);
+        let body = wav.clone();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = l.accept() else { return };
+            let _ = super::super::net::read_http_request(&mut s);
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = s.write_all(&body);
+        });
+        let t = TtsConfig { mode: "sovits".into(), sovits_url: format!("http://127.0.0.1:{port}"), sovits_ref: "C:/ref.mp3".into(), ..TtsConfig::default() };
+        assert!(sovits_request(&t, "喵", 10).ok() == Some(wav));
+        // 没开服务：中文提示
+        let t = TtsConfig { mode: "sovits".into(), sovits_url: "http://127.0.0.1:9".into(), sovits_ref: "C:/ref.mp3".into(), ..TtsConfig::default() };
+        assert!(synth_test(&t, "喵").unwrap_err().contains("api_v2"));
     }
 
     #[test]

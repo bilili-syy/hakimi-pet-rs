@@ -138,6 +138,8 @@ const ID_VOLUME: i32 = 139;
 const ID_VOLUME_LABEL: i32 = 140;
 const ID_PLAY: i32 = 141;
 const ID_PLAY_RESULT: i32 = 142;
+const ID_VOICE_LABEL: i32 = 143;
+const ID_SOVITS_URL: i32 = 167;
 const ID_AUTOSTART: i32 = 150;
 const ID_FS_HIDE: i32 = 166;
 const ID_SCALE: i32 = 151;
@@ -178,8 +180,13 @@ const ID_LABEL0: i32 = 400;
 const PAGES: [&str; 4] = ["AI 聊天", "语音", "常规", "备忘录"];
 const REPEATS: [(Repeat, &str); 4] = [(Repeat::None, "不重复"), (Repeat::Daily, "每天"), (Repeat::Workday, "工作日"), (Repeat::Weekly, "每周")];
 const SPEAK: [(&str, &str); 3] = [("all", "所有气泡都念"), ("chat", "只念聊天回复"), ("off", "都不念")];
-const MODES: [(&str, &str); 3] =
-    [("clone", "哈基米本人的声音（推荐）"), ("preset", "MiMo 预置音色"), ("design", "按下面的文字描述现设计")];
+const MODES: [(&str, &str); 4] = [
+    ("clone", "哈基米本人的声音（推荐）"),
+    ("preset", "MiMo 预置音色"),
+    ("design", "按下面的文字描述现设计"),
+    ("sovits", "本机 GPT-SoVITS（不要 Key，用她的录音）"),
+];
+fn mode_at(i: usize) -> &'static str { MODES[i.min(MODES.len() - 1)].0 }
 const VOICES: [&str; 2] = ["冰糖", "茉莉"];
 const SCALES: [(f32, &str); 5] =
     [(0.7, "小（70%）"), (0.85, "偏小（85%）"), (1.0, "标准（100%）"), (1.2, "偏大（120%）"), (1.5, "大（150%）")];
@@ -721,9 +728,12 @@ impl Dlg {
         self.label(p, "声线", [X0, 200.0, LW, 26.0]);
         let mode = self.combo(p, ID_MODE, false, [FX, 200.0, FW, 0.0]);
         combo_fill(mode, &MODES.map(|x| x.1));
-        self.label(p, "预置音色", [X0, 236.0, LW, 26.0]);
+        self.add(p, w!("STATIC"), "预置音色", SS_CENTERIMAGE, 0, ID_VOICE_LABEL, [X0, 236.0, LW, 26.0]);
         let voice = self.combo(p, ID_VOICE, true, [FX, 236.0, FW, 0.0]);
         combo_fill(voice, &VOICES);
+        // 本机 GPT-SoVITS 地址：和预置音色同一格，按声线切换显示
+        let surl = self.edit(p, ID_SOVITS_URL, 0, [FX, 236.0, FW, 26.0]);
+        cue(surl, "http://127.0.0.1:9880");
         self.label(p, "声音描述", [X0, 272.0, LW, 26.0]);
         // 三行高：不带滚动条，写长了用滚轮/方向键翻
         self.edit(p, ID_STYLE, ES_MULTILINE | ES_AUTOVSCROLL, [FX, 272.0, FW, 78.0]);
@@ -832,6 +842,7 @@ impl Dlg {
         set_text(self.c(ID_TTS_KEY), &c.tts.api_key);
         combo_set(self.c(ID_MODE), MODES.iter().position(|x| x.0 == c.tts.mode).unwrap_or(0));
         set_text(self.c(ID_VOICE), &c.tts.voice);
+        set_text(self.c(ID_SOVITS_URL), &c.tts.sovits_url);
         set_text(self.c(ID_STYLE), &c.tts.style);
         let v = (c.tts.volume.clamp(0.0, 1.0) * 100.0).round() as isize;
         send(self.c(ID_VOLUME), TBM_SETPOS, 1, v);
@@ -889,9 +900,18 @@ impl Dlg {
         for id in [ID_CHAT_VOICE, ID_SPEAK, ID_MODE, ID_VOICE, ID_STYLE, ID_VOLUME] {
             enable(self.c(id), on);
         }
-        let mode = MODES[combo_sel(self.c(ID_MODE)).min(2)].0;
+        let mode = mode_at(combo_sel(self.c(ID_MODE)));
+        let sovits = mode == "sovits";
+        unsafe {
+            if self.page == 2 {
+                let _ = ShowWindow(self.c(ID_VOICE), if sovits { SW_HIDE } else { SW_SHOW });
+                let _ = ShowWindow(self.c(ID_SOVITS_URL), if sovits { SW_SHOW } else { SW_HIDE });
+            }
+        }
+        set_text(self.c(ID_VOICE_LABEL), if sovits { "本机地址" } else { "预置音色" });
+        enable(self.c(ID_SOVITS_URL), on && sovits);
         enable(self.c(ID_VOICE), on && mode == "preset");
-        enable(self.c(ID_STYLE), on && mode != "clone");
+        enable(self.c(ID_STYLE), on && (mode == "preset" || mode == "design"));
         repaint(self.hwnd);
     }
 
@@ -925,6 +945,8 @@ impl Dlg {
         }
         // 自定义服务商没有官网链接
         self.update_ai_hints();
+        // 语音页：预置音色 / 本机地址 只显示一个
+        self.update_tts_enable();
         repaint(self.hwnd);
     }
 
@@ -948,7 +970,9 @@ impl Dlg {
         c.tts.chat_voice_reply = checked(self.c(ID_CHAT_VOICE));
         c.tts.speak = SPEAK[combo_sel(self.c(ID_SPEAK)).min(2)].0.into();
         c.tts.api_key = get_text(self.c(ID_TTS_KEY)).trim().to_string();
-        c.tts.mode = MODES[combo_sel(self.c(ID_MODE)).min(2)].0.into();
+        c.tts.mode = mode_at(combo_sel(self.c(ID_MODE))).into();
+        let surl = get_text(self.c(ID_SOVITS_URL)).trim().to_string();
+        c.tts.sovits_url = if surl.is_empty() { "http://127.0.0.1:9880".into() } else { surl };
         let voice = get_text(self.c(ID_VOICE)).trim().to_string();
         c.tts.voice = if voice.is_empty() { "冰糖".into() } else { voice };
         let style = get_text(self.c(ID_STYLE)).trim().to_string();
@@ -1020,7 +1044,7 @@ fn differs(a: &Config, b: &Config) -> bool {
             c.model.clone(),
             c.proxy.clone(),
             c.user_name.clone(),
-            format!("{:?}{:?}{:?}{:?}{:?}{:?}{}", c.tts.enabled, c.tts.chat_voice_reply, c.tts.speak, c.tts.api_key, c.tts.mode, c.tts.voice, c.tts.style),
+            format!("{:?}{:?}{:?}{:?}{:?}{:?}{}", c.tts.enabled, c.tts.chat_voice_reply, c.tts.speak, c.tts.api_key, c.tts.mode, c.tts.voice, c.tts.style) + &c.tts.sovits_url,
             ((c.tts.volume * 100.0).round() as i32, (c.scale * 100.0).round() as i32, crate::core::config::clamp_fps(c.fps)),
             (c.weather_city.clone(), c.birthday.clone()),
             (c.moyu.enabled, c.moyu.minutes, c.moyu.pomodoro_minutes, c.reminders.water, c.reminders.stand_up),
@@ -1316,7 +1340,11 @@ fn start_play() {
         d.play_gen = GEN.fetch_add(1, Ordering::Relaxed);
         let mut t = d.orig.tts.clone();
         t.api_key = get_text(d.c(ID_TTS_KEY)).trim().to_string();
-        t.mode = MODES[combo_sel(d.c(ID_MODE)).min(2)].0.into();
+        t.mode = mode_at(combo_sel(d.c(ID_MODE))).into();
+        let surl = get_text(d.c(ID_SOVITS_URL)).trim().to_string();
+        if !surl.is_empty() {
+            t.sovits_url = surl;
+        }
         let v = get_text(d.c(ID_VOICE)).trim().to_string();
         if !v.is_empty() {
             t.voice = v;
@@ -1334,8 +1362,8 @@ fn start_play() {
         return;
     };
     use crate::services::tts;
-    // 没填 Key：哈基米声线有内置录音，直接放（试试音量）
-    if t.api_key.is_empty() {
+    // 没填 Key：哈基米声线有内置录音，直接放（试试音量）。本机 GPT-SoVITS 不要 Key，真去合成
+    if !t.can_synth() {
         let (ok, text) = match tts::bundled(&t, tts::SAMPLE) {
             Some(b) => {
                 crate::services::audio::play(TEST_TOKEN, crate::types::Audio(b.to_vec()), t.volume);

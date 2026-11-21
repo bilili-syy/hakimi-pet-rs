@@ -199,6 +199,16 @@ pub fn post_json(url: &str, headers: &[(&str, &str)], body: &serde_json::Value, 
     Ok((status, text))
 }
 
+/// POST JSON，返回 (HTTP 状态码, 原始字节)：给直接回音频文件的接口用（本机 GPT-SoVITS）
+pub fn post_json_bytes(url: &str, body: &serde_json::Value, timeout_secs: u64) -> Result<(u16, Vec<u8>), ureq::Error> {
+    let agent = agent_for_url(url);
+    let req = agent.post(url).config().timeout_global(req_timeout(timeout_secs)).build().header("Content-Type", "application/json");
+    let mut res = req.send(serde_json::to_vec(body).unwrap_or_default())?;
+    let status = res.status().as_u16();
+    let bytes = res.body_mut().with_config().limit(MAX_BODY).read_to_vec()?;
+    Ok((status, bytes))
+}
+
 /// 同 post_json，但用指定的 Agent
 pub fn post_json_via(agent: &ureq::Agent, url: &str, headers: &[(&str, &str)], body: &serde_json::Value) -> Result<(u16, String), ureq::Error> {
     let mut req = agent.post(url).header("Content-Type", "application/json");
@@ -254,6 +264,28 @@ pub fn is_network_error(e: &ureq::Error) -> bool {
             | ureq::Error::ConnectProxyFailed(_)
             | ureq::Error::InvalidProxyUrl
     )
+}
+
+/// 测试用：读完一个 HTTP 请求（头 + Content-Length 那么长的身体），免得没读完就关连接被对面当成 reset
+#[cfg(test)]
+pub fn read_http_request(s: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = s.read(&mut chunk).unwrap_or(0);
+        if n == 0 { break; }
+        buf.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&buf).to_string();
+        if let Some(end) = text.find("\r\n\r\n") {
+            let len = text[..end]
+                .lines()
+                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + len { break; }
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
 }
 
 #[cfg(test)]
