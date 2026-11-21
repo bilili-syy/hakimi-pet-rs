@@ -3,6 +3,7 @@
 pub mod ai;
 pub mod audio;
 pub mod emotion;
+pub mod livebeat;
 pub mod memo_parse;
 pub mod mind;
 pub mod net;

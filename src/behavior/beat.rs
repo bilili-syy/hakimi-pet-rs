@@ -9,7 +9,9 @@
 //!
 //! 解码只看开头 max_secs 秒，内存只有能量数组（30 秒 ≈ 3000 个 f32）和包络（≈ 600 字节）。
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub const MIN_BPM: f64 = 70.0;
 pub const MAX_BPM: f64 = 180.0;
@@ -152,6 +154,57 @@ impl Pending {
     pub fn put(&self, r: Option<BeatInfo>) {
         if let Ok(mut g) = self.0.lock() { *g = Some(r); }
     }
+}
+
+// ------------------------------------------------------------------ 跟着外面在放的歌跳
+/// 实时节拍的格子长度（毫秒）。电平表采样受系统定时器影响大约 15 ms 一次，20 ms 一格够稳
+pub const LIVE_HOP_MS: f64 = 20.0;
+
+/// 后台线程（services/livebeat.rs）每隔一会儿报一次：最近几秒系统声音的节拍
+#[derive(Clone, Debug)]
+pub struct LiveReport {
+    /// 节拍检测结果（相位相对 start）；数据还不够时为 None
+    pub info: Option<BeatInfo>,
+    /// 这段数据第一格的时刻
+    pub start: Instant,
+    /// 已经连续安静了多久（毫秒）
+    pub quiet_ms: u64,
+    /// 开始以来听到过声音没有
+    pub heard: bool,
+    /// 电平表打不开（没有输出设备等）
+    pub failed: bool,
+}
+
+/// 行为层和后台线程之间的结果槽 + 停止开关
+#[derive(Clone, Default)]
+pub struct LiveFeed {
+    slot: Arc<Mutex<Option<LiveReport>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl LiveFeed {
+    pub fn put(&self, r: LiveReport) {
+        if let Ok(mut g) = self.slot.lock() { *g = Some(r); }
+    }
+    /// 取最新一次报告（取走就没了）
+    pub fn poll(&self) -> Option<LiveReport> { self.slot.lock().ok()?.take() }
+    pub fn stop(&self) { self.stop.store(true, Ordering::Relaxed); }
+    pub fn stopped(&self) -> bool { self.stop.load(Ordering::Relaxed) }
+}
+
+/// 不规则采样 (毫秒, 峰值) → 等间隔格子：每格取最大值，空格沿用上一格
+pub fn bin_peaks(samples: &[(f64, f32)], hop_ms: f64) -> Vec<f32> {
+    let Some(&(t0, _)) = samples.first() else { return Vec::new() };
+    if !hop_ms.is_finite() || hop_ms <= 0.0 { return Vec::new(); }
+    let last = samples.last().map(|s| s.0).unwrap_or(t0);
+    let n = ((last - t0) / hop_ms).floor() as usize + 1;
+    let mut out: Vec<Option<f32>> = vec![None; n];
+    for &(t, v) in samples {
+        let i = (((t - t0) / hop_ms).floor() as usize).min(n - 1);
+        out[i] = Some(out[i].map_or(v, |o| o.max(v)));
+    }
+    let mut prev = 0.0;
+    out.into_iter().map(|c| { if let Some(v) = c { prev = v; } prev }).collect()
 }
 
 /// 后台线程解码歌曲开头 max_secs 秒做节拍检测
@@ -371,5 +424,29 @@ mod tests {
         let info = got.expect("finished").expect("decoded");
         assert!((info.bpm().unwrap() - 120.0).abs() < 2.0, "{:?}", info.bpm());
         assert_eq!(info.env.len(), 6000 / ENV_MS as usize);
+    }
+
+    #[test]
+    fn bin_peaks_fills_gaps() {
+        let s = [(0.0, 0.1), (5.0, 0.3), (31.0, 0.2), (75.0, 0.5)];
+        assert_eq!(bin_peaks(&s, 20.0), vec![0.3, 0.2, 0.2, 0.5]);
+        assert!(bin_peaks(&[], 20.0).is_empty());
+    }
+
+    #[test]
+    fn live_peaks_find_tempo() {
+        // 120 BPM 的鼓点，电平表大约 15.6 ms 采一次（带抖动），每拍后 80 ms 衰减
+        let mut s = Vec::new();
+        let mut t = 0.0f64;
+        fastrand::seed(5);
+        while t < 8000.0 {
+            let ph = t % 500.0;
+            let v = if ph < 80.0 { 0.8 - ph as f32 / 200.0 } else { 0.05 + fastrand::f32() * 0.02 };
+            s.push((t, v));
+            t += 15.6 + fastrand::f64() * 2.0;
+        }
+        let info = analyze(&bin_peaks(&s, LIVE_HOP_MS), LIVE_HOP_MS);
+        let bpm = info.bpm().expect("tempo");
+        assert!((bpm - 120.0).abs() < 3.0, "bpm {bpm}");
     }
 }

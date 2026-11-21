@@ -238,6 +238,8 @@ pub struct Behavior {
     dance: Option<Dance>,
     /// 右键「跳个舞」的整支舞（behavior/dance.rs）
     routine: Option<dance::Routine>,
+    /// 跟着外面在放的歌跳：后台节拍线程的结果槽
+    listen: Option<beat::LiveFeed>,
 
     bubble: Option<Bubble>,
     bubble_fade: Fade,
@@ -342,6 +344,7 @@ impl Behavior {
             glow: false,
             dance: None,
             routine: None,
+            listen: None,
             bubble: None,
             bubble_fade: Fade::OFF,
             status: None,

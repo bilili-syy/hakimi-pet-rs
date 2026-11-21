@@ -7,7 +7,7 @@
 //! 时钟：舞步按「拍位置」走。拍位置每帧按当前周期累加；有节拍网格（内置鼓点 = 精确网格，
 //! 歌曲 = 后台节拍检测的结果）时，用一个简单的锁相环把拍相位往网格上拉、周期往检测值上滑，
 //! 所以检测结果晚到一两秒也不会突然跳拍。歌曲的音量包络决定动作力度。
-use super::beat::{self, BeatInfo, Pending};
+use super::beat::{self, BeatInfo, LiveReport, Pending};
 use super::fx::FxKind;
 use super::{Behavior, Shot, St, pick};
 use crate::core::stats::Stats;
@@ -163,6 +163,16 @@ const TOO_TIRED: &[&str] = &["跳不动了喵…让哈基米先歇一会儿嘛�
 const NO_SONG: &str = "（songs 文件夹里还没有歌，先用哈基米牌鼓点喵）";
 /// 菜单「🎵 跟着我的歌跳」：随机一支舞，配 songs 文件夹里随机一首歌；别的舞都用自己的内置鼓点
 pub const SONG_ID: &str = "song";
+/// 菜单「🎧 跟着正在放的歌跳」：随机一支舞，跟系统里正在放的声音的节拍（services/livebeat.rs）
+pub const LISTEN_ID: &str = "listen";
+/// 跟外面的歌跳最长多久
+const LISTEN_MAX_MS: u64 = 10 * 60_000;
+/// 开跳后这么久还没听到声音就算了
+const LISTEN_DEAF_MS: u64 = 4500;
+/// 歌停了这么久就收场
+const LISTEN_QUIET_MS: u64 = 5000;
+const LISTEN_INTRO: &[&str] = &["竖起耳朵——听到音乐啦，哈基米跟着跳！", "这首有节奏喵！跟上跟上～", "你放歌，哈基米来跳！"];
+const LISTEN_DEAF: &[&str] = &["诶？没听到在放歌喵…先放首歌再叫我嘛", "安安静静的…哈基米听不到音乐喵"];
 
 /// id → 舞谱；"" 或不认识的 id 随机挑一支
 pub fn find(id: &str) -> &'static Score {
@@ -240,6 +250,8 @@ pub struct Routine {
     pub fallback: bool,
     /// 坐在窗口顶上跳：原地跳，不挪窗口
     pub still: bool,
+    /// 跟着外面在放的歌跳（没有固定时长，歌停了才收场）
+    pub listen: bool,
 }
 
 impl Routine {
@@ -263,6 +275,7 @@ impl Routine {
             song: false,
             fallback: false,
             still: false,
+            listen: false,
         }
     }
 
@@ -284,6 +297,22 @@ impl Routine {
             self.grid = Some((p, self.audio_start as f64 + phase + AUDIO_LATENCY_MS));
         }
         self.info = Some(info);
+    }
+
+    /// 跟外面的歌跳：采用一段实时节拍（start_ms = 这段数据开头，行为层时钟）
+    pub fn adopt_live(&mut self, info: BeatInfo, start_ms: u64) {
+        if info.tempo.is_none() { return; }
+        self.audio_start = start_ms;
+        self.adopt(info);
+    }
+
+    /// 结算用的完成度：跟外面的歌跳按跳满一支舞的时长算
+    pub fn done_frac(&self, now: u64) -> f64 {
+        if self.listen {
+            (now.saturating_sub(self.start) as f64 / (self.score.secs as f64 * 1000.0).max(1.0)).clamp(0.0, 1.0)
+        } else {
+            self.progress(now)
+        }
     }
 
     #[cfg(test)]
@@ -454,7 +483,8 @@ impl Behavior {
     /// 菜单「跳个舞」
     pub(super) fn start_routine(&mut self, id: &str) {
         let use_song = id == SONG_ID;
-        let score = find(if use_song { "" } else { id });
+        let use_listen = id == LISTEN_ID;
+        let score = find(if use_song || use_listen { "" } else { id });
         // 跟逗猫棒一样：正在玩/输入框里打了字/等 AI 回复时不开跳
         if self.play.game.is_some() || self.chat_busy() || self.waiting { return; }
         self.yield_chat();
@@ -472,6 +502,19 @@ impl Behavior {
         let now = self.now;
         let mut r = Routine::new(score, now);
         r.still = self.play.perch.is_some();
+        if use_listen {
+            // 不放任何声音：先按舞谱速度跳，听出节拍后锁相环慢慢拉过去
+            r.listen = true;
+            r.end = now + LISTEN_MAX_MS;
+            r.lock_builtin(now);
+            let feed = beat::LiveFeed::default();
+            if self.io { crate::services::livebeat::start(feed.clone()); }
+            self.listen = Some(feed);
+            self.call(format!("dance-listen:{}", score.id));
+            self.routine = Some(r);
+            // 只出气泡不念：念出来会混进电平表，也会盖住歌
+            return self.say_opts(&pick(LISTEN_INTRO), 3200, false, crate::types::SpeakKind::Line);
+        }
         let path = if self.io && use_song { crate::services::songs::pick() } else { None };
         let tok = self.next_token();
         self.song = Some(tok);
@@ -509,6 +552,9 @@ impl Behavior {
     /// 每帧推进（frame_at 里调）
     pub(super) fn dance_tick(&mut self) {
         let now = self.now;
+        if let Some(rep) = self.listen.as_ref().and_then(|f| f.poll()) {
+            self.on_listen_report(rep);
+        }
         let Some(r) = self.routine.as_mut() else { return };
         if r.finished(now) { return self.finish_routine(false); }
         let cues = r.update(now);
@@ -516,6 +562,25 @@ impl Behavior {
             if let Cue::Nudge(dir) = c {
                 self.cmds.push(WinCmd::Walk { dir, distance: NUDGE_PX * self.scale, speed: 1.2 * self.scale });
             }
+        }
+    }
+
+    /// 跟外面的歌跳：后台线程报来最近几秒的节拍 / 安静了多久
+    pub(super) fn on_listen_report(&mut self, rep: LiveReport) {
+        let now = self.now;
+        let Some(r) = self.routine.as_mut() else { return };
+        if !r.listen { return; }
+        let elapsed = now.saturating_sub(r.start);
+        if rep.failed || (!rep.heard && elapsed >= LISTEN_DEAF_MS) {
+            self.cancel_routine();
+            return self.react(St::Confused, 2600, Some(pick(LISTEN_DEAF)));
+        }
+        if rep.heard && rep.quiet_ms >= LISTEN_QUIET_MS {
+            return self.finish_routine(false);
+        }
+        if let Some(info) = rep.info {
+            let start_ms = rep.start.saturating_duration_since(self.t0).as_millis() as u64;
+            r.adopt_live(info, start_ms);
         }
     }
 
@@ -535,7 +600,7 @@ impl Behavior {
     /// 跳完或被点停：结算 + 收尾台词
     pub(super) fn finish_routine(&mut self, by_click: bool) {
         let Some(r) = self.routine.take() else { return };
-        let frac = r.progress(self.now);
+        let frac = r.done_frac(self.now);
         self.wrap_up(&r);
         reward(&mut self.stats, frac);
         self.save();
@@ -552,13 +617,14 @@ impl Behavior {
     /// 被别的事打断（拖拽、喂食、提醒……）：安静收场，按跳了多少结算
     pub(super) fn cancel_routine(&mut self) {
         let Some(r) = self.routine.take() else { return };
-        let frac = r.progress(self.now);
+        let frac = r.done_frac(self.now);
         self.wrap_up(&r);
         reward(&mut self.stats, frac);
         self.call(format!("dance-end:{}:cancel", r.score.id));
     }
 
     fn wrap_up(&mut self, r: &Routine) {
+        if let Some(f) = self.listen.take() { f.stop(); }
         if r.nudged() {
             self.cmds.push(WinCmd::WalkStop);
             if let Some(dir) = r.return_nudge() {
@@ -856,5 +922,47 @@ mod tests {
         ev(&mut b, AppEvent::Menu(MenuAction::Dance(String::new())), 3000);
         assert!(b.routine.is_none());
         assert_eq!(b.state, St::Sit);
+    }
+
+    fn listen_report(b: &Behavior, start_ms: u64, info: Option<BeatInfo>, quiet_ms: u64, heard: bool) -> LiveReport {
+        LiveReport { info, start: b.t0 + std::time::Duration::from_millis(start_ms), quiet_ms, heard, failed: false }
+    }
+
+    #[test]
+    fn listen_follows_live_tempo_and_stops_when_quiet() {
+        let mut b = mk();
+        b.stats.data.energy = 100.0;
+        let mut out = Vec::new();
+        b.frame_at(1000, &mut out);
+        b.start_routine(LISTEN_ID);
+        assert!(b.routine.as_ref().unwrap().listen && b.listen.is_some() && b.song.is_none());
+        // 后台报来 150 BPM
+        let info = BeatInfo { tempo: Some((400.0, 100.0)), confidence: 3.0, env: vec![200; 160] };
+        b.listen.as_ref().unwrap().put(listen_report(&b, 2000, Some(info), 0, true));
+        b.frame_at(9000, &mut out);
+        let feed = b.listen.clone().unwrap();
+        for t in (9000..12000).step_by(16) { b.frame_at(t, &mut out); }
+        assert!((b.routine.as_ref().unwrap().period() - 400.0).abs() < 5.0);
+        // 歌停了 5 秒 → 收场，线程收到停止
+        feed.put(listen_report(&b, 6000, None, LISTEN_QUIET_MS, true));
+        b.frame_at(12100, &mut out);
+        assert!(b.routine.is_none() && b.listen.is_none() && feed.stopped());
+    }
+
+    #[test]
+    fn listen_gives_up_when_nothing_plays() {
+        let mut b = mk();
+        b.stats.data.energy = 100.0;
+        let mut out = Vec::new();
+        b.frame_at(1000, &mut out);
+        b.start_routine(LISTEN_ID);
+        let feed = b.listen.clone().unwrap();
+        feed.put(listen_report(&b, 1000, None, 2000, false));
+        b.frame_at(2500, &mut out);
+        assert!(b.routine.is_some(), "刚开始没声音先等等");
+        feed.put(listen_report(&b, 1000, None, 5000, false));
+        b.frame_at(6000, &mut out);
+        assert!(b.routine.is_none() && feed.stopped());
+        assert_eq!(b.state, St::Confused);
     }
 }
