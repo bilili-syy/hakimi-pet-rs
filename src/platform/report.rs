@@ -1,19 +1,24 @@
 //! 每周报告图：整理数据 → 画（render/report.rs）→ 存到「图片\哈基米」并复制到剪贴板。
-//! 设置窗口「周报」页调这里。
+//! 设置窗口「周报」页调这里。另外放「导出聊天记录」（同样是往用户文件夹里存一份东西）。
 use crate::render::report;
 use std::path::PathBuf;
 
 /// 报告存放的文件夹：图片\哈基米（拿不到「图片」文件夹就放数据目录）
 pub fn dir() -> PathBuf {
-    pictures().unwrap_or_else(crate::core::paths::data_dir).join("哈基米")
+    known(&windows::Win32::UI::Shell::FOLDERID_Pictures).unwrap_or_else(crate::core::paths::data_dir).join("哈基米")
 }
 
-fn pictures() -> Option<PathBuf> {
+/// 聊天记录导出到：文档\哈基米
+pub fn docs_dir() -> PathBuf {
+    known(&windows::Win32::UI::Shell::FOLDERID_Documents).unwrap_or_else(crate::core::paths::data_dir).join("哈基米")
+}
+
+fn known(id: &windows::core::GUID) -> Option<PathBuf> {
     use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{FOLDERID_Pictures, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
     // SAFETY: 返回的字符串用完交给 CoTaskMemFree
     unsafe {
-        let p = SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DEFAULT, None).ok()?;
+        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
         let s = p.to_string().ok();
         CoTaskMemFree(Some(p.0 as *const _));
         s.map(PathBuf::from)
@@ -41,6 +46,54 @@ fn date_of_ms(ms: f64) -> String {
         }
     }
     format!("{:04}-{:02}-{:02}", local.wYear, local.wMonth, local.wDay)
+}
+
+/// 毫秒时间戳 → 当地「11-21 14:05」
+fn clock_of_ms(ms: f64) -> String {
+    let d = date_of_ms_full(ms);
+    if d.is_empty() { String::new() } else { d[5..].to_string() }
+}
+
+/// 毫秒时间戳 → 当地「2026-11-21 14:05」
+fn date_of_ms_full(ms: f64) -> String {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    let ft100 = (ms.max(0.0) as u64).saturating_mul(10_000) + 116_444_736_000_000_000;
+    let ft = FILETIME { dwLowDateTime: ft100 as u32, dwHighDateTime: (ft100 >> 32) as u32 };
+    let (mut utc, mut local) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+    // SAFETY: 都是本地栈上的结构体
+    unsafe {
+        if FileTimeToSystemTime(&ft, &mut utc).is_err() || SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_err() {
+            return String::new();
+        }
+    }
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute)
+}
+
+/// 把完整聊天记录导出成 Markdown（文档\哈基米\和哈基米的聊天-日期时间.md），返回路径
+pub fn export_chat() -> Result<PathBuf, String> {
+    let items = crate::services::ai::load_log();
+    if items.is_empty() {
+        return Err("还没有聊天记录".into());
+    }
+    let n = crate::core::memo::Now::get().dt;
+    let stamp = format!("{:04}-{:02}-{:02} {:02}:{:02}", n.y, n.mo, n.d, n.h, n.mi);
+    let md = crate::services::ai::log_markdown(&items, &stamp, clock_of_ms);
+    let d = docs_dir();
+    std::fs::create_dir_all(&d).map_err(|e| format!("建文件夹失败：{e}"))?;
+    let path = d.join(format!("和哈基米的聊天-{:04}{:02}{:02}-{:02}{:02}.md", n.y, n.mo, n.d, n.h, n.mi));
+    // 带 BOM：记事本老版本也认得是 UTF-8
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(md.as_bytes());
+    std::fs::write(&path, bytes).map_err(|e| format!("存文件失败：{e}"))?;
+    Ok(path)
+}
+
+/// 资源管理器里打开文件夹并选中这个文件
+pub fn reveal(path: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    let arg = format!("/select,\"{}\"", path.display());
+    let _ = std::process::Command::new("explorer.exe").raw_arg(arg).spawn();
 }
 
 /// 画好、存盘、复制。成功返回文件路径
@@ -133,6 +186,13 @@ mod tests {
         assert_eq!(d.len(), 40 + 16);
         assert_eq!(&d[0..4], &40u32.to_le_bytes());
         assert_eq!(&d[40..44], &[30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn clock_of_ms_shape() {
+        let s = clock_of_ms(1_795_262_400_000.0);
+        assert_eq!(s.len(), 11, "{s}");
+        assert_eq!(&s[2..3], "-");
     }
 
     #[test]

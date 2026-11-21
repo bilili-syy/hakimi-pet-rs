@@ -576,3 +576,28 @@ fn usage_feeds_her_and_stuffed_talk() {
     assert_eq!(super::chat::stuffed_text("好呀！", 0.9), "好呀～～～");
     assert_eq!(super::chat::stuffed_text("嗝，吃饱了", 0.9), "嗝，吃饱了");
 }
+
+#[test]
+fn esc_while_waiting_drops_the_reply() {
+    let mut b = mk();
+    tick(&mut b, 3000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 3000);
+    ev(&mut b, AppEvent::ChatSubmit("讲个长故事".into()), 3500);
+    assert_eq!(b.state, St::Think);
+    let out = ev(&mut b, AppEvent::ChatStop, 4000);
+    assert!(out.contains(&WinCmd::ChatInput(ChatInputCmd::Enable(true))));
+    assert!(b.chatting, "Esc 只是不等了，输入框还开着");
+    assert_ne!(b.state, St::Think);
+    assert!(b.scene.bubble.as_ref().is_some_and(|x| lines::CHAT_STOP.contains(&x.text.as_str())));
+    // 晚到的回复丢掉
+    ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, text: "从前有座山".into(), need_key: false }), 9000);
+    assert!(b.calls.iter().any(|c| c == "chat:dropped"));
+    assert!(!b.scene.bubble.as_ref().is_some_and(|x| x.text.contains("从前有座山")));
+    // 下一句正常
+    ev(&mut b, AppEvent::ChatSubmit("那算了".into()), 10_000);
+    ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, text: "好嘛～".into(), need_key: false }), 11_000);
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "好嘛～");
+    // 没在等时 ChatStop = 关闭
+    ev(&mut b, AppEvent::ChatStop, 20_000);
+    assert!(!b.chatting);
+}

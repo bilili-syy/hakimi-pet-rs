@@ -263,6 +263,8 @@ pub struct Behavior {
     /// 测试用：io=false 时假装的语音音量（真机读 services::audio::level）
     pub(crate) fake_level: f32,
     waiting: bool,
+    /// Esc 取消了还在路上的回复：它到了就丢掉
+    drop_reply: bool,
     pomo_running: bool,
 
     token_seq: u64,
@@ -364,6 +366,7 @@ impl Behavior {
             fake_chat_text: false,
             fake_level: 0.0,
             waiting: false,
+            drop_reply: false,
             pomo_running: false,
             token_seq: 0,
             voice_req: 0,
@@ -431,6 +434,11 @@ impl Behavior {
                 self.on_chat_submit(t)
             }
             AppEvent::ChatCancel => self.close_chat(),
+            AppEvent::ChatStop => self.chat_stop(),
+            AppEvent::ChatExported(ok) => {
+                let l = if ok { "聊天记录导出好啦，在「文档\\哈基米」里～" } else { "还没有聊天记录可以导出喵" };
+                self.say_opts(l, 3200, false, SpeakKind::Line);
+            }
             AppEvent::ChatReply(r) => self.on_chat_reply(r),
             AppEvent::Speech { token, audio } if self.cv_wants(token) => self.cv_on_speech(token, audio),
             AppEvent::Speech { token, audio } => {

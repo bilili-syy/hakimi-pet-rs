@@ -87,6 +87,7 @@ pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
         return ChatReply { ok: true, need_key: false, text: FULL_LINES[fastrand::usize(..FULL_LINES.len())].into() };
     }
     let _net_guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let cancel_gen = CANCEL_GEN.load(std::sync::atomic::Ordering::SeqCst);
     let (hist_gen, mut history) = {
         let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let g = HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst);
@@ -111,7 +112,12 @@ pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
     match r {
         Ok(reply) => {
             let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            if HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst) == hist_gen {
+            // 主人按了 Esc 取消：这一轮不进历史，回复由行为层丢掉
+            let cancelled = CANCEL_GEN.load(std::sync::atomic::Ordering::SeqCst) != cancel_gen;
+            if HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst) == hist_gen && !cancelled {
+                if let Some(u) = history.last().cloned() {
+                    append_log(&[u, json!({ "role": "model", "text": reply, "t": now_ms() })]);
+                }
                 history.push(json!({ "role": "model", "text": reply, "t": now_ms() }));
                 save_history(&history);
             }
@@ -124,11 +130,54 @@ pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
     }
 }
 
-/// 清空 chat.json（原版 saveHistory([])，写一个空数组）。绝不等待在途 HTTP 请求
+/// 清空 chat.json（原版 saveHistory([])，写一个空数组）和完整聊天记录。绝不等待在途 HTTP 请求
 pub fn clear_history() {
     let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     HISTORY_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     save_history(&[]);
+    let _ = std::fs::remove_file(log_file());
+}
+
+/// 取消在途的这一轮聊天（Esc）：回复到了也不进历史
+static CANCEL_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn cancel_current() { CANCEL_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+
+/// 完整聊天记录（导出用；chat.json 只留最近 20 条给模型当上下文）：一行一条 JSON
+pub fn log_file() -> std::path::PathBuf { crate::core::paths::data_dir().join("chat-log.jsonl") }
+
+fn append_log(items: &[Value]) {
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file()) else { return };
+    for v in items {
+        let _ = writeln!(f, "{v}");
+    }
+}
+
+/// 读完整聊天记录；还没有（这版以前的）就用 chat.json 里最近的
+pub fn load_log() -> Vec<Value> {
+    let v: Vec<Value> = std::fs::read_to_string(log_file())
+        .map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+        .unwrap_or_default();
+    if v.is_empty() { load_history() } else { v }
+}
+
+/// 聊天记录 → Markdown。time(ms) 把时间戳变成「11-21 14:05」
+pub fn log_markdown(items: &[Value], title_time: &str, time: impl Fn(f64) -> String) -> String {
+    let mut out = format!("# 和哈基米的聊天记录\n\n导出于 {title_time}，共 {} 条\n", items.len());
+    let mut last_day = String::new();
+    for m in items {
+        let t = m.get("t").and_then(Value::as_f64).map(&time).unwrap_or_default();
+        let day = t.split(' ').next().unwrap_or("").to_string();
+        if !day.is_empty() && day != last_day {
+            out.push_str(&format!("\n## {day}\n"));
+            last_day = day;
+        }
+        let who = if is_user(m) { "你" } else { "哈基米" };
+        let text = if is_user(m) { msg_text(m).to_string() } else { crate::services::emotion::split(msg_text(m)).text };
+        let clock = t.split(' ').nth(1).map(|c| format!(" {c}")).unwrap_or_default();
+        out.push_str(&format!("\n**{who}**{clock}\n\n{}\n", text.trim().replace('\n', "  \n")));
+    }
+    out
 }
 
 // ------------------------------------------------------------------ 历史
@@ -622,6 +671,24 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chat_log_to_markdown() {
+        use serde_json::json;
+        let items = [
+            json!({"role":"user","text":"早上好","t":1000.0}),
+            json!({"role":"model","text":"[happy]早安喵～\n今天也要加油","t":2000.0}),
+            json!({"role":"user","text":"晚安","t":90_000_000.0}),
+        ];
+        let md = super::log_markdown(&items, "2026-11-21 15:00", |t| if t < 1e7 { "11-20 08:00".into() } else { "11-21 23:00".into() });
+        assert!(md.starts_with("# 和哈基米的聊天记录"));
+        assert!(md.contains("共 3 条"));
+        assert!(md.contains("## 11-20"));
+        assert!(md.contains("## 11-21"));
+        assert!(md.contains("**你** 08:00\n\n早上好"));
+        assert!(md.contains("早安喵～  \n今天也要加油"), "{md}");
+        assert!(!md.contains("[happy]"));
+    }
+
     #[test]
     fn search_only_for_gemini_and_live_questions() {
         assert!(super::wants_search("gemini-3.8-flash-tiered", "帮我查一下今日金价"));

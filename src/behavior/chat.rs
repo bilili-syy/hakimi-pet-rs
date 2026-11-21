@@ -101,7 +101,32 @@ impl Behavior {
         if self.io { crate::services::ai::chat(&self.tx, text, ctx); }
     }
 
+    /// 等回复时按 Esc：不等了。回复到了丢掉、不进历史；正在合成第一段语音的也停
+    pub(super) fn chat_stop(&mut self) {
+        if !self.waiting {
+            return self.close_chat();
+        }
+        self.waiting = false;
+        if self.cv.is_some() {
+            self.cv = None;
+            self.emotion_cv_clear();
+        } else {
+            self.drop_reply = true;
+            if self.io {
+                crate::services::ai::cancel_current();
+            }
+        }
+        self.call("chat:stop".into());
+        self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(true)));
+        self.set_state(St::Idle, None);
+        self.say_opts(&pick(lines::CHAT_STOP), 2200, false, SpeakKind::Line);
+    }
+
     pub(super) fn on_chat_reply(&mut self, r: ChatReply) {
+        if std::mem::take(&mut self.drop_reply) {
+            self.call("chat:dropped".into());
+            return;
+        }
         // 去掉情绪标签（气泡和 TTS 只拿干净文字）
         let (mut r, emo) = self.emotion_split(r);
         // 今天快吃撑了：打嗝、拖长尾音

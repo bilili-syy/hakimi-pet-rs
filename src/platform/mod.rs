@@ -751,6 +751,14 @@ fn after(a: MenuAction) {
         MenuAction::Memo(crate::types::MemoAct::OpenFile) => open_path(&crate::core::memo::ensure_file()),
         MenuAction::Memo(crate::types::MemoAct::OpenWindow) => settings::open(3),
         MenuAction::Report => settings::open(4),
+        MenuAction::ExportChat => {
+            let r = report::export_chat();
+            match &r {
+                Ok(p) => report::reveal(p),
+                Err(e) => crate::core::log::log(&format!("chat export: {e}")),
+            }
+            post_event(AppEvent::ChatExported(r.is_ok()));
+        }
         MenuAction::Mind(crate::types::MindAct::OpenFile) => open_path(&crate::core::memory::ensure_file()),
         // 清空记忆：推迟到 pump() 外弹模态确认框，避免在 PUMPING=true 期间阻塞事件队列
         MenuAction::Mind(crate::types::MindAct::ClearAsk) => {

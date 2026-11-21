@@ -101,7 +101,7 @@ impl Behavior {
             MenuAction::Memo(m) => self.on_memo_menu(m),
             MenuAction::Mind(m) => self.on_mind_menu(m),
             // 平台层打开设置窗口的周报页
-            MenuAction::Report => {}
+            MenuAction::Report | MenuAction::ExportChat => {}
             MenuAction::ForgetChat => {
                 if self.io { crate::services::ai::clear_history(); }
                 self.play(Shot::Shake);

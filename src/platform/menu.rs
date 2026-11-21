@@ -78,6 +78,7 @@ const TOOLS: &[Node] = &[
     Item("checkin", "📅 今日签到"),
     Item("weather", "🌦️ 天气播报"),
     Item("report", "📊 本周陪伴报告"),
+    Item("chatexport", "💬 导出聊天记录"),
 ];
 const COSTUME: &[Node] = &[
     // 和 core::costume::COSTUMES 一一对应（table_integrity 会检查）
@@ -451,6 +452,7 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
         "checkin" => A::CheckIn,
         "weather" => A::WeatherReport,
         "report" => A::Report,
+        "chatexport" => A::ExportChat,
         "climb" => A::Climb,
         "pat" => A::Pat,
         "honey" => A::Honey,

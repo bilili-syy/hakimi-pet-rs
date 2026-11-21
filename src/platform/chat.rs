@@ -3,6 +3,9 @@
 //! 贴在她脚边（原版 #chat：左右各 6px、底部 6px），跟着她移动。
 //! 没有 comctl32 v6 清单时 EM_SETCUEBANNER 不生效，所以灰色提示字由我们自己画（edit_proc 的 WM_PAINT）；
 //! 右侧画一个「×」关闭按钮，点了等同 Esc（发 ChatCancel）。
+//! 多行：Shift+回车换行，框往上长（最多 MAX_LINES 行，再多就滚动）；回车发送。
+//! 等她回复时输入框变只读，Esc = 不等了（发 ChatStop）；平时 Esc 关闭。
+//! ↑/↓ 翻以前发过的话（光标在第一行/最后一行时），从完整聊天记录里取。
 use super::sys::wide;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use crate::types::{AppEvent, WIN_W};
@@ -15,7 +18,8 @@ use windows::Win32::Graphics::Gdi::{
     SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_RETURN,
+    GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_RETURN,
+    VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -25,8 +29,25 @@ const HOST_CLASS: PCWSTR = w!("HakimiPetRsChat");
 /// 输入框逻辑高度：7+7 内边距 + 一行字 + 2+2 边框
 const H: f32 = 32.0;
 const MARGIN: f32 = 6.0;
-const MAX_LEN: usize = 200;
+const MAX_LEN: usize = 1000;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
+const EM_SETSEL: u32 = 0x00B1;
+const EM_GETLINECOUNT: u32 = 0x00BA;
+const EM_LINEFROMCHAR: u32 = 0x00C9;
+const EM_REPLACESEL: u32 = 0x00C2;
+const EM_SETREADONLY: u32 = 0x00CF;
+const ES_MULTILINE_: u32 = 0x0004;
+const ES_AUTOVSCROLL_: u32 = 0x0040;
+/// 框最多长到几行，再多就在框里滚动
+const MAX_LINES: i32 = 4;
+/// 一行字的逻辑高度
+const LINE: f32 = 17.0;
+/// 现在框有几行高
+static LINES: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+/// 在等她回复（输入框只读，Esc = 不等了）
+static BUSY: AtomicBool = AtomicBool::new(false);
+/// 发过的话（↑/↓ 翻）
+static HIST: std::sync::Mutex<Option<InputHistory>> = std::sync::Mutex::new(None);
 /// host_proc 里 WM_CTLCOLOREDIT 要用的底色画刷
 static BG_BRUSH: AtomicIsize = AtomicIsize::new(0);
 /// 输入框里有没有字（EN_CHANGE 时更新）。行为层用它决定别的动作要不要顺手关掉输入框
@@ -38,7 +59,9 @@ static CLOSE_HOT: AtomicBool = AtomicBool::new(false);
 /// 「×」按钮的逻辑宽度（贴右侧内边距里）
 const CLOSE_W: f32 = 18.0;
 /// 灰色提示字（原版 placeholder 是「和哈基米说点什么…（回车发送，Esc 关闭）」，228px 宽放不下，缩短）
-const CUE: &str = "说点什么…回车发送，Esc 关闭";
+const CUE: &str = "回车发送 · Shift+回车换行 · ↑翻旧话";
+/// 等回复时的提示字
+const CUE_BUSY: &str = "她在想…按 Esc 不等了";
 const CUE_COLOR: COLORREF = rgb(0xb0, 0x9c, 0x8c);
 const CLOSE_COLOR: COLORREF = rgb(0xa8, 0x8e, 0x7c);
 const CLOSE_HOT_COLOR: COLORREF = rgb(0xea, 0x43, 0x35);
@@ -93,7 +116,7 @@ impl Chat {
                 WINDOW_EX_STYLE(0),
                 w!("EDIT"),
                 PCWSTR::null(),
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_MULTILINE_ | ES_AUTOVSCROLL_),
                 0,
                 0,
                 10,
@@ -152,37 +175,9 @@ impl Chat {
     pub fn layout(&self, pet_x: i32, pet_y: i32, pet_h: i32) {
         let s = self.scale;
         let w = ((WIN_W as f32 - 2.0 * MARGIN) * s).round() as i32;
-        let h = (H * s).round() as i32;
         let x = pet_x + (MARGIN * s).round() as i32;
-        let y = pet_y + pet_h - (MARGIN * s).round() as i32 - h;
-        let pad_x = (10.0 * s).round() as i32;
-        let close_w = (CLOSE_W * s).round() as i32;
-        let line = (17.0 * s).round() as i32;
-        unsafe {
-            // 只是挪位置（她在走路）时不重建圆角区域、不重画，免得闪
-            let mut old = RECT::default();
-            let _ = GetWindowRect(self.host, &mut old);
-            let resized = old.right - old.left != w || old.bottom - old.top != h;
-            let _ = SetWindowPos(self.host, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
-            if !resized {
-                return;
-            }
-            let _ = SetWindowPos(
-                self.edit,
-                None,
-                pad_x,
-                (h - line) / 2,
-                w - 2 * pad_x - close_w,
-                line,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            let r = (28.0 * s).round() as i32;
-            let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r);
-            if SetWindowRgn(self.host, Some(rgn), true) == 0 {
-                let _ = DeleteObject(HGDIOBJ(rgn.0));
-            }
-            let _ = InvalidateRect(Some(self.host), None, true);
-        }
+        let bottom = pet_y + pet_h - (MARGIN * s).round() as i32;
+        place(self.host, self.edit, s, x, bottom, w, false);
     }
 
     pub fn open(&mut self) {
@@ -210,9 +205,11 @@ impl Chat {
         }
     }
 
+    /// 等回复时 on=false：不禁用（那样收不到 Esc），改成只读
     pub fn enable(&self, on: bool) {
+        BUSY.store(!on, Ordering::Relaxed);
         unsafe {
-            let _ = EnableWindow(self.edit, on);
+            SendMessageW(self.edit, EM_SETREADONLY, Some(WPARAM(!on as usize)), None);
             if on && self.visible {
                 let _ = SetFocus(Some(self.edit));
             }
@@ -235,6 +232,132 @@ impl Drop for Chat {
         }
     }
 }
+
+/// 摆框：底边固定在 bottom，高度跟着行数长。force = 行数变了，就算大小没变也重摆输入框
+fn place(host: HWND, edit: HWND, s: f32, x: i32, bottom: i32, w: i32, force: bool) {
+    let n = LINES.load(Ordering::Relaxed).clamp(1, MAX_LINES);
+    let line = (LINE * s).round() as i32;
+    let h = (H * s).round() as i32 + (n - 1) * line;
+    let y = bottom - h;
+    let pad_x = (10.0 * s).round() as i32;
+    let close_w = (CLOSE_W * s).round() as i32;
+    unsafe {
+        // 只是挪位置（她在走路）时不重建圆角区域、不重画，免得闪
+        let mut old = RECT::default();
+        let _ = GetWindowRect(host, &mut old);
+        let resized = old.right - old.left != w || old.bottom - old.top != h;
+        let _ = SetWindowPos(host, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
+        if !resized && !force {
+            return;
+        }
+        let _ = SetWindowPos(edit, None, pad_x, (h - line * n) / 2, w - 2 * pad_x - close_w, line * n, SWP_NOZORDER | SWP_NOACTIVATE);
+        let r = (28.0 * s).round() as i32;
+        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r);
+        if SetWindowRgn(host, Some(rgn), true) == 0 {
+            let _ = DeleteObject(HGDIOBJ(rgn.0));
+        }
+        let _ = InvalidateRect(Some(host), None, true);
+    }
+}
+
+/// 字变了：行数变了就把框往上长/缩
+fn fit_lines(host: HWND, edit: HWND) {
+    let n = unsafe { SendMessageW(edit, EM_GETLINECOUNT, None, None).0 as i32 }.clamp(1, MAX_LINES);
+    if LINES.swap(n, Ordering::Relaxed) == n {
+        return;
+    }
+    let mut r = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(host, &mut r);
+    }
+    place(host, edit, super::current_scale(), r.left, r.bottom, r.right - r.left, true);
+}
+
+/// ↑/↓ 翻发过的话（纯逻辑，可测）
+#[derive(Default)]
+pub struct InputHistory {
+    items: Vec<String>,
+    /// 正在看第几条；None = 没在翻
+    pos: Option<usize>,
+    /// 开始翻之前框里没发出去的字
+    draft: String,
+}
+const HIST_MAX: usize = 50;
+impl InputHistory {
+    pub fn new(items: Vec<String>) -> Self {
+        let start = items.len().saturating_sub(HIST_MAX);
+        Self { items: items[start..].to_vec(), ..Self::default() }
+    }
+    pub fn push(&mut self, s: &str) {
+        self.pos = None;
+        self.draft.clear();
+        if self.items.last().map(String::as_str) != Some(s) {
+            self.items.push(s.to_string());
+            if self.items.len() > HIST_MAX {
+                self.items.remove(0);
+            }
+        }
+    }
+    /// 往前翻一条；已经到最早的就停在那（返回 None = 不动）
+    pub fn up(&mut self, current: &str) -> Option<String> {
+        let p = match self.pos {
+            None if self.items.is_empty() => return None,
+            None => {
+                self.draft = current.to_string();
+                self.items.len() - 1
+            }
+            Some(0) => return None,
+            Some(p) => p - 1,
+        };
+        self.pos = Some(p);
+        Some(self.items[p].clone())
+    }
+    /// 往后翻；翻过最新的一条回到没发出去的字
+    pub fn down(&mut self) -> Option<String> {
+        let p = self.pos?;
+        if p + 1 < self.items.len() {
+            self.pos = Some(p + 1);
+            Some(self.items[p + 1].clone())
+        } else {
+            self.pos = None;
+            Some(std::mem::take(&mut self.draft))
+        }
+    }
+}
+
+fn with_hist<R>(f: impl FnOnce(&mut InputHistory) -> R) -> R {
+    let mut g = HIST.lock().unwrap_or_else(|e| e.into_inner());
+    let h = g.get_or_insert_with(|| {
+        // 第一次用：从完整聊天记录里拿主人说过的话
+        let mine = crate::services::ai::load_log()
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .filter_map(|m| m.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            .collect();
+        InputHistory::new(mine)
+    });
+    f(h)
+}
+
+fn set_edit(edit: HWND, text: &str) {
+    let w = wide(&text.replace('\n', "\r\n"));
+    unsafe {
+        let _ = SetWindowTextW(edit, PCWSTR(w.as_ptr()));
+        // 光标放到最后
+        SendMessageW(edit, EM_SETSEL, Some(WPARAM(usize::MAX >> 1)), Some(LPARAM(-1)));
+    }
+}
+
+/// 光标在第几行 / 一共几行（包括自动折行）
+fn caret_line(edit: HWND) -> (i32, i32) {
+    unsafe {
+        let cur = SendMessageW(edit, EM_LINEFROMCHAR, Some(WPARAM(usize::MAX)), None).0 as i32;
+        let n = SendMessageW(edit, EM_GETLINECOUNT, None, None).0 as i32;
+        (cur, n.max(1))
+    }
+}
+
+fn key_down(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> bool { unsafe { GetKeyState(vk.0 as i32) < 0 } }
 
 /// 输入框里有没有打了字（不算空白）。行为层判断「别的动作要不要顺手关掉空输入框」用
 pub fn has_text() -> bool { HAS_TEXT.load(Ordering::Relaxed) }
@@ -295,7 +418,7 @@ unsafe fn paint_cue(edit: HWND) {
         let mut rc = RECT::default();
         let _ = GetClientRect(edit, &mut rc);
         rc.left += 2; // 和 Edit 默认左边距对齐，光标落在提示字开头
-        let mut text = wide(CUE);
+        let mut text = wide(if BUSY.load(Ordering::Relaxed) { CUE_BUSY } else { CUE });
         text.pop(); // 去掉结尾的 0
         DrawTextW(hdc, &mut text, &mut rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
         SelectObject(hdc, of);
@@ -316,19 +439,50 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     unsafe {
         match msg {
             WM_KEYDOWN if wp.0 == VK_RETURN.0 as usize => {
-                let text = edit_text(hwnd).trim().to_string();
+                if BUSY.load(Ordering::Relaxed) {
+                    return LRESULT(0);
+                }
+                if key_down(VK_SHIFT) {
+                    // Shift+回车：换行
+                    let nl = wide("\r\n");
+                    SendMessageW(hwnd, EM_REPLACESEL, Some(WPARAM(1)), Some(LPARAM(nl.as_ptr() as isize)));
+                    return LRESULT(0);
+                }
+                let text = edit_text(hwnd).replace("\r\n", "\n").trim().to_string();
                 if !text.is_empty() {
+                    with_hist(|h| h.push(&text));
                     let _ = SetWindowTextW(hwnd, w!(""));
                     super::post_event(AppEvent::ChatSubmit(text));
                 }
                 return LRESULT(0);
             }
             WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
-                super::chat_escape();
+                if BUSY.load(Ordering::Relaxed) {
+                    super::post_event(AppEvent::ChatStop);
+                } else {
+                    super::chat_escape();
+                }
                 return LRESULT(0);
             }
-            // 吞掉回车/Esc 的 WM_CHAR，否则单行 Edit 会“叮”一声
-            WM_CHAR if wp.0 == 0x0d || wp.0 == 0x1b => return LRESULT(0),
+            WM_KEYDOWN if (wp.0 == VK_UP.0 as usize || wp.0 == VK_DOWN.0 as usize) && !BUSY.load(Ordering::Relaxed) => {
+                let (cur, n) = caret_line(hwnd);
+                let up = wp.0 == VK_UP.0 as usize;
+                // 光标在第一行按 ↑ / 最后一行按 ↓ 才翻；多行里面上下照常挪光标
+                if (up && cur == 0) || (!up && cur >= n - 1) {
+                    let now = edit_text(hwnd).replace("\r\n", "\n");
+                    if let Some(t) = with_hist(|h| if up { h.up(&now) } else { h.down() }) {
+                        set_edit(hwnd, &t);
+                    }
+                    return LRESULT(0);
+                }
+            }
+            // Ctrl+A 全选（多行 Edit 默认不认）
+            WM_KEYDOWN if wp.0 == 'A' as usize && key_down(VK_CONTROL) => {
+                SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+                return LRESULT(0);
+            }
+            // 吞掉回车/Esc/Ctrl+A/Ctrl+回车 的 WM_CHAR，否则会“叮”一声或插进怪字符
+            WM_CHAR if [0x0d, 0x1b, 0x01, 0x0a].contains(&wp.0) => return LRESULT(0),
             WM_PAINT => {
                 let r = DefSubclassProc(hwnd, msg, wp, lp);
                 paint_cue(hwnd);
@@ -386,6 +540,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 let edit = HWND(lp.0 as *mut _);
                 let has = !edit_text(edit).trim().is_empty();
                 HAS_TEXT.store(has, Ordering::Relaxed);
+                fit_lines(hwnd, edit);
                 // 从有字变空 / 从空变有字：提示字要出现或消失，整个重画
                 let _ = InvalidateRect(Some(edit), None, true);
                 LRESULT(0)
@@ -451,6 +606,27 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_history_up_down() {
+        let mut h = InputHistory::new(vec!["a".into(), "b".into()]);
+        assert_eq!(h.down(), None, "没在翻时 ↓ 不动");
+        assert_eq!(h.up("草稿").as_deref(), Some("b"));
+        assert_eq!(h.up("b").as_deref(), Some("a"));
+        assert_eq!(h.up("a"), None, "到最早的停住");
+        assert_eq!(h.down().as_deref(), Some("b"));
+        assert_eq!(h.down().as_deref(), Some("草稿"), "翻回来恢复没发的字");
+        assert_eq!(h.down(), None);
+        h.push("c");
+        h.push("c");
+        assert_eq!(h.up("").as_deref(), Some("c"));
+        assert_eq!(h.up("c").as_deref(), Some("b"), "连续两次一样的只记一条");
+        let mut e = InputHistory::new(Vec::new());
+        assert_eq!(e.up("x"), None);
+        let big = InputHistory::new((0..80).map(|i| i.to_string()).collect());
+        assert_eq!(big.items.len(), HIST_MAX);
+        assert_eq!(big.items[0], "30");
+    }
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
     fn pump(ms: u64) {

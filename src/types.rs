@@ -121,6 +121,8 @@ pub enum MenuAction {
     Mind(MindAct),
     /// 「📊 本周陪伴报告」：打开设置窗口的周报页
     Report,
+    /// 「💬 导出聊天记录」：平台层存成 Markdown，完了发 ChatExported
+    ExportChat,
 }
 
 // ---------------------------------------------------------------- 事件
@@ -245,6 +247,10 @@ pub enum AppEvent {
     ChatSubmit(String),
     /// 聊天输入框 Esc / 失焦关闭
     ChatCancel,
+    /// 等回复时在输入框按 Esc：不等了（输入框不关）
+    ChatStop,
+    /// 导出聊天记录的结果（true = 存好了）
+    ChatExported(bool),
     ChatReply(ChatReply),
     /// tts::speak 的结果；None = 不念（关了/没 key/失败/限流）
     Speech { token: u64, audio: Option<Audio> },
