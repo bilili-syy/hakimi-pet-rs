@@ -6,6 +6,7 @@ pub mod play;
 mod memo;
 pub use memo::memo_voices;
 mod sense;
+mod external;
 pub use sense::norm_birthday;
 mod emotion;
 mod skin;
@@ -272,6 +273,8 @@ pub struct Behavior {
     play: play::Play,
     memo: memo::MemoUi,
     sense: sense::SenseUi,
+    /// 外部事件（忙的时候先存着）
+    ext: external::ExtUi,
     /// 情绪表情 + 长期记忆（behavior/emotion.rs）
     mind: emotion::MindUi,
     /// 语音回答进行中（behavior/chatvoice.rs）
@@ -370,6 +373,7 @@ impl Behavior {
             pending_off_work: None,
             memo: memo::MemoUi::default(),
             sense: sense::SenseUi::default(),
+            ext: external::ExtUi::default(),
             mind: emotion::MindUi::default(),
         };
         b.mood_cls = b.stats.mood();
@@ -476,6 +480,7 @@ impl Behavior {
             AppEvent::Memo(m) => self.on_memo(m),
             AppEvent::Mind(m) => self.on_mind(m),
             AppEvent::Sense(e) => self.on_sense(e),
+            AppEvent::External(e) => self.on_external(e),
         }
         self.sync_play();
         self.build_scene();
@@ -486,6 +491,7 @@ impl Behavior {
         self.now = now;
         self.run_timers();
         self.sense_frame();
+        self.external_frame();
         self.dance_tick();
         self.sync_play();
         self.build_scene();

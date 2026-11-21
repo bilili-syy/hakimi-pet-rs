@@ -21,6 +21,7 @@ mod settings;
 mod sys;
 mod timers;
 mod hrtimer;
+pub mod ipc;
 mod toy;
 mod watch;
 #[cfg(test)]
@@ -89,6 +90,11 @@ pub(crate) fn main_hwnd() -> Option<HWND> {
 
 pub(crate) fn current_scale() -> f32 {
     f32::from_bits(SCALE_BITS.load(Ordering::Relaxed))
+}
+
+thread_local! {
+    /// 外部事件限流（platform/ipc.rs）
+    static EXT_THROTTLE: RefCell<ipc::Throttle> = RefCell::new(ipc::Throttle::default());
 }
 
 /// 单调毫秒时钟（起点 1000ms，永不回拨、永不为 0），驱动帧循环/物理/提醒间隔
@@ -1379,6 +1385,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     pump();
                 }
                 LRESULT(0)
+            }
+            WM_COPYDATA => {
+                // 外部事件（platform/ipc.rs）。处理了返回 1，发送方据此判断送到没有
+                let cds = lp.0 as *const windows::Win32::System::DataExchange::COPYDATASTRUCT;
+                if cds.is_null() {
+                    return LRESULT(0);
+                }
+                let c = &*cds;
+                let n = c.cbData as usize;
+                if c.lpData.is_null() || n == 0 || n > ipc::MAX_PAYLOAD {
+                    return LRESULT(0);
+                }
+                let data = std::slice::from_raw_parts(c.lpData as *const u8, n);
+                let Some(ev) = ipc::decode(c.dwData, data) else { return LRESULT(0) };
+                if EXT_THROTTLE.with(|t| t.borrow_mut().allow(&ev, now_ms())) {
+                    crate::core::log::log(&format!("external {:?} from {:?}", ev.kind, ev.source));
+                    emit(AppEvent::External(ev));
+                    pump();
+                }
+                LRESULT(1)
             }
             WM_APP_SECOND => {
                 // 再双击一次程序 = 把她叫到屏幕中间

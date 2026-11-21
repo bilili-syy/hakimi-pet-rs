@@ -275,6 +275,32 @@ pub enum AppEvent {
     Mind(MindEv),
     /// 场景感知（platform/sense.rs）
     Sense(SenseEv),
+    /// 外部程序发来的事件（`hakimi-pet.exe --event`，platform/ipc.rs）
+    External(ExtEvent),
+}
+
+/// 外部事件的种类
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtKind {
+    /// 跑完了
+    Done,
+    /// 出错了
+    Error,
+    /// 在等你回话 / 确认
+    Wait,
+    /// 随便说一句
+    Info,
+}
+
+/// 外部程序发来的事件。source = 谁发的（"Claude Code"），msg = 附带的一句话（只显示不念）
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExtEvent {
+    pub kind: ExtKind,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub msg: String,
 }
 
 /// 场景感知事件：只在状态变化时发

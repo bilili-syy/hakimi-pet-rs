@@ -12,6 +12,12 @@ mod services;
 mod types;
 
 fn main() {
+    // `--event ...`：把事件交给正在跑的那只后退出，不起宠物（platform/ipc.rs）
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(ev) = platform::ipc::parse_args(&args) {
+        let ok = ev.is_ok_and(|ev| platform::ipc::send(&ev));
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     core::log::log(&format!("start {}", env!("CARGO_PKG_VERSION")));
     // release 是 windows 子系统，panic 没有控制台可写，以前闪退什么都不留；记进日志方便排查
     std::panic::set_hook(Box::new(|info| {
