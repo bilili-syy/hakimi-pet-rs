@@ -107,11 +107,19 @@ impl Behavior {
                 self.play(Shot::Shake);
                 self.say(&pick(lines::FORGOT), 2600);
             }
-            // 平台层自己处理：番茄钟（会发 AppEvent::Pomodoro）、显示/隐藏/叫到中间（会发 Peek）、
+            MenuAction::ToggleVisible => {
+                // 藏起来时顺手停掉正在跳的舞和外放，免得窗口隐藏还在背后出鼓点/跑高帧率跟拍
+                if self.routine.is_some() {
+                    self.finish_routine(false);
+                } else if self.state == St::Dance {
+                    self.end_dance();
+                }
+            }
+            // 平台层自己处理：番茄钟（会发 AppEvent::Pomodoro）、叫到中间（会发 Peek）、
             // 打开文件/文件夹、自启、退出（会调 Handler::quit）
             MenuAction::PomodoroStart(_) | MenuAction::PomodoroStop | MenuAction::OpenSongDir | MenuAction::OpenSettings
             | MenuAction::OpenConfigFile
-            | MenuAction::OpenDataDir | MenuAction::AutoStart(_) | MenuAction::ToggleVisible | MenuAction::CallToCenter
+            | MenuAction::OpenDataDir | MenuAction::AutoStart(_) | MenuAction::CallToCenter
             | MenuAction::Quit => {}
         }
     }

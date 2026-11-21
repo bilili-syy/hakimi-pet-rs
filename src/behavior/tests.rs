@@ -618,3 +618,47 @@ fn screen_roast_waits_like_chat() {
     ev(&mut b, AppEvent::RoastNote("你在录屏呢".into()), 20_000);
     assert_eq!(b.scene.bubble.as_ref().unwrap().text, "你在录屏呢");
 }
+
+#[test]
+fn req_id_cancel_never_swallows_newer_reply_and_dance_stops_on_song_or_fullscreen() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 3_000);
+    ev(&mut b, AppEvent::ChatSubmit("慢问题".into()), 3_200);
+    let req1 = b.active_chat_req;
+    assert!(req1 > 0);
+    // 按 Esc 取消 req1，紧接着发 req2；哪怕 req2 比旧的 req1 先返回，也必须收下 req2 并丢弃晚到的 req1
+    ev(&mut b, AppEvent::ChatStop, 3_500);
+    ev(&mut b, AppEvent::ChatSubmit("快问题".into()), 3_600);
+    let req2 = b.active_chat_req;
+    assert!(req2 > req1);
+    let out = ev(&mut b, AppEvent::ChatReplyId(req2, ChatReply { ok: true, text: "快回答喵".into(), need_key: false }), 4_000);
+    assert!(!b.waiting);
+    assert!(out.contains(&WinCmd::ChatInput(ChatInputCmd::Enable(true))));
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "快回答喵");
+    ev(&mut b, AppEvent::ChatReplyId(req1, ChatReply { ok: true, text: "已取消的旧回答".into(), need_key: false }), 5_000);
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "快回答喵");
+
+    // 跳 Routine 中途点「哈基米之歌」或进入全屏：必须停掉 Routine
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Dance(String::new())), 3_200);
+    assert!(b.routine.is_some());
+    ev(&mut b, AppEvent::Menu(MenuAction::Song), 3_500);
+    assert!(b.routine.is_none());
+
+    ev(&mut b, AppEvent::Menu(MenuAction::Dance(String::new())), 12_000);
+    assert!(b.routine.is_some());
+    ev(&mut b, AppEvent::Sense(crate::types::SenseEv::Fullscreen(true)), 12_500);
+    assert!(b.routine.is_none());
+
+    // 外部事件：逗猫棒进行中或前一条气泡还在时排队，不打断游戏、不秒顶前一条气泡
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    b.scene.bubble = None;
+    b.bubble = None;
+    ev(&mut b, AppEvent::Menu(MenuAction::Game), 4_000);
+    ev(&mut b, AppEvent::External(crate::types::ExtEvent { kind: crate::types::ExtKind::Done, source: "Claude".into(), msg: "构建完成".into() }), 4_200);
+    assert!(b.play.game.is_some());
+    assert!(!b.scene.bubble.as_ref().is_some_and(|x| x.text.contains("构建完成")));
+}

@@ -263,8 +263,10 @@ pub struct Behavior {
     /// 测试用：io=false 时假装的语音音量（真机读 services::audio::level）
     pub(crate) fake_level: f32,
     waiting: bool,
-    /// Esc 取消了还在路上的回复：它到了就丢掉
-    drop_reply: bool,
+    /// 当前正在等待的异步请求序号（0 = 没有），用于精准丢弃 Esc 取消后的旧回复
+    active_chat_req: u64,
+    /// 测试兼容（io=false 时外部直接注入无序号 ChatReply）：待丢弃的已取消回复个数
+    drop_replies: u32,
     pomo_running: bool,
 
     token_seq: u64,
@@ -366,7 +368,8 @@ impl Behavior {
             fake_chat_text: false,
             fake_level: 0.0,
             waiting: false,
-            drop_reply: false,
+            active_chat_req: 0,
+            drop_replies: 0,
             pomo_running: false,
             token_seq: 0,
             voice_req: 0,
@@ -411,6 +414,11 @@ impl Behavior {
     }
 
     pub fn quit(&mut self) {
+        self.cancel_routine();
+        if self.state == St::Dance {
+            self.dance = None;
+            self.stop_song();
+        }
         self.save();
         if self.io { crate::services::audio::stop(); }
     }
@@ -437,14 +445,23 @@ impl Behavior {
             AppEvent::ChatStop => self.chat_stop(),
             AppEvent::ScreenRoast(png) => self.on_roast(png),
             AppEvent::RoastNote(t) => {
-                self.play(Shot::Shake);
-                self.say_opts(&t, 3200, false, SpeakKind::Line);
+                if !self.memo_ringing() {
+                    self.play(Shot::Shake);
+                    self.say_opts(&t, 3200, false, SpeakKind::Line);
+                }
             }
-            AppEvent::ChatExported(ok) => {
-                let l = if ok { "聊天记录导出好啦，在「文档\\哈基米」里～" } else { "还没有聊天记录可以导出喵" };
-                self.say_opts(l, 3200, false, SpeakKind::Line);
+            AppEvent::ChatExported(res) => {
+                if !self.memo_ringing() {
+                    let l = match res {
+                        Ok(()) => "聊天记录导出好啦，在「文档\\哈基米」里～",
+                        Err(true) => "还没有聊天记录可以导出喵",
+                        Err(false) => "导出聊天记录失败了喵…看看磁盘或权限？",
+                    };
+                    self.say_opts(l, 3200, false, SpeakKind::Line);
+                }
             }
-            AppEvent::ChatReply(r) => self.on_chat_reply(r),
+            AppEvent::ChatReply(r) => self.on_chat_reply_id(0, r),
+            AppEvent::ChatReplyId(req_id, r) => self.on_chat_reply_id(req_id, r),
             AppEvent::Speech { token, audio } if self.cv_wants(token) => self.cv_on_speech(token, audio),
             AppEvent::Speech { token, audio } => {
                 self.emotion_speech(token, audio.is_some());
@@ -845,7 +862,11 @@ impl Behavior {
         let token = if voice { self.next_token() } else { 0 };
         self.bubble = Some(Bubble { text: text.to_string(), shown: self.now, hide_at: Some(self.now + ms), dur: ms, token });
         self.bubble_fade.set(true, self.now);
-        if voice { self.voice(text, kind, token) } else { self.stop_voice() }
+        if voice {
+            self.voice(text, kind, token);
+        } else if !self.memo_voice_busy(0) {
+            self.stop_voice();
+        }
     }
 
     /// 只换气泡、不出声，也不掐正在念的台词（小游戏里抓到/扑空的短句，别把开场白打断）
@@ -976,6 +997,8 @@ impl Behavior {
 
     /// 哈基米之歌：原地跳舞（舞步图左右翻着跳），飘音符
     fn go_dance(&mut self, ms: u64, line: Option<String>) {
+        // 若之前正在跳 Routine（如实时跟歌跳），set_state(St::Dance) 不会自动取消，这里先停干净
+        self.cancel_routine();
         self.set_state(St::Dance, None);
         let l = line.unwrap_or_else(|| pick(lines::SONG));
         self.say(&l, ms);

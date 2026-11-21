@@ -39,18 +39,40 @@ fn clean(ev: ExtEvent) -> ExtEvent {
     ExtEvent { kind: ev.kind, source: clip(&ev.source, MAX_SOURCE), msg: clip(&ev.msg, MAX_MSG) }
 }
 
-/// 解析命令行。没有 `--event` 返回 None（正常启动宠物）；有但写错了返回 Some(Err)。
+fn is_ipc_flag(s: &str) -> bool {
+    matches!(s, "--event" | "--source" | "--msg")
+        || s.starts_with("--event=")
+        || s.starts_with("--source=")
+        || s.starts_with("--msg=")
+}
+
+/// 解析命令行。没有 `--event`（含 `--event=...`）返回 None（正常启动宠物）；有但写错了返回 Some(Err)。
 pub fn parse_args(args: &[String]) -> Option<Result<ExtEvent, String>> {
-    let i = args.iter().position(|a| a == "--event")?;
-    let Some(kind) = args.get(i + 1).and_then(|k| kind_of(k)) else {
+    let tail = args.get(1..)?;
+    let raw_kind = tail.iter().enumerate().find_map(|(i, a)| {
+        if a == "--event" {
+            Some(tail.get(i + 1).map(String::as_str).unwrap_or(""))
+        } else {
+            a.strip_prefix("--event=")
+        }
+    })?;
+    let Some(kind) = kind_of(raw_kind) else {
         return Some(Err("用法：--event done|error|wait|info [--source 名字] [--msg 内容]".into()));
     };
-    // 值可以是多个参数（调用方没加引号时 "Claude Code" 会被拆开）：一直取到下一个 --开关
-    let val = |flag: &str| {
-        args.iter()
-            .position(|a| a == flag)
-            .map(|j| args[j + 1..].iter().take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" "))
-            .unwrap_or_default()
+    // 值支持 `--flag 值`（多词自动拼接，直到遇到下一个已知 IPC 开关）和 `--flag=值`（保留以 `--` 开头的消息正文）
+    let val = |flag: &str| -> String {
+        let eq = format!("{flag}=");
+        for (j, a) in tail.iter().enumerate() {
+            if let Some(rest) = a.strip_prefix(&eq) {
+                let mut parts = vec![rest.to_string()];
+                parts.extend(tail[j + 1..].iter().take_while(|x| !is_ipc_flag(x)).cloned());
+                return parts.join(" ");
+            }
+            if a == flag {
+                return tail[j + 1..].iter().take_while(|x| !is_ipc_flag(x)).cloned().collect::<Vec<_>>().join(" ");
+            }
+        }
+        String::new()
     };
     Some(Ok(clean(ExtEvent { kind, source: val("--source"), msg: val("--msg") })))
 }
@@ -80,6 +102,9 @@ impl Throttle {
         self.last.retain(|(_, _, t)| now.saturating_sub(*t) < THROTTLE_MS);
         if self.last.iter().any(|(s, k, _)| *s == ev.source && *k == ev.kind) {
             return false;
+        }
+        if self.last.len() >= 64 {
+            self.last.remove(0);
         }
         self.last.push((ev.source.clone(), ev.kind, now));
         true
@@ -132,6 +157,10 @@ mod tests {
         assert!(parse_args(&a(&["pet.exe", "--event", "boom"])).unwrap().is_err());
         let ev = parse_args(&a(&["pet.exe", "--event", "error"])).unwrap().unwrap();
         assert_eq!((ev.kind, ev.source.as_str(), ev.msg.as_str()), (ExtKind::Error, "", ""));
+        // 支持 `--flag=value` 写法，且 `--msg` 里带 `--` 前缀的参数不会被截空
+        let ev = parse_args(&a(&["pet.exe", "--event=done", "--source=Claude Code", "--msg", "--release check passed"])).unwrap().unwrap();
+        assert_eq!((ev.kind, ev.source.as_str(), ev.msg.as_str()), (ExtKind::Done, "Claude Code", "--release check passed"));
+        assert!(parse_args(&a(&["pet.exe", "--event="])).unwrap().is_err());
     }
 
     #[test]

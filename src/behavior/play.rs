@@ -805,7 +805,11 @@ impl Behavior {
         self.play.weather_at = now;
         if let Some((manual, _)) = self.play.report_pending.take() {
             self.play.weather = Some(w);
-            if manual || self.free_for_chatter() { return self.weather_report(manual); }
+            if manual {
+                self.sense_touch();
+                return self.weather_report(true);
+            }
+            if self.free_for_chatter() { return self.weather_report(false); }
             return;
         }
         let hot = w.temp_c >= 30.0;

@@ -27,7 +27,7 @@ pub struct Day {
 }
 impl Day {
     /// 粮食总数：token + 语音字数
-    pub fn food(&self) -> u64 { self.tokens + self.tts_chars }
+    pub fn food(&self) -> u64 { self.tokens.saturating_add(self.tts_chars) }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -66,21 +66,23 @@ pub fn fullness(food: u64, cap: u64) -> Fullness {
 
 impl Book {
     fn day_mut(&mut self, today: &str) -> &mut Day {
-        if self.days.last().map(|d| d.date.as_str()) != Some(today) {
-            self.days.push(Day { date: today.to_string(), ..Day::default() });
-            if self.days.len() > KEEP_DAYS {
-                let cut = self.days.len() - KEEP_DAYS;
-                self.days.drain(..cut);
-            }
+        // 先查是否已有同一天记录，避免改系统时间/跨时区跳变后重复 push 同一天并把已有统计遮蔽清零
+        if let Some(idx) = self.days.iter().rposition(|d| d.date == today) {
+            return &mut self.days[idx];
+        }
+        self.days.push(Day { date: today.to_string(), ..Day::default() });
+        if self.days.len() > KEEP_DAYS {
+            let cut = self.days.len() - KEEP_DAYS;
+            self.days.drain(..cut);
         }
         self.days.last_mut().expect("just pushed")
     }
     pub fn add(&mut self, today: &str, tokens: u64, tts_chars: u64) {
         let d = self.day_mut(today);
-        d.tokens += tokens;
-        d.tts_chars += tts_chars;
+        d.tokens = d.tokens.saturating_add(tokens);
+        d.tts_chars = d.tts_chars.saturating_add(tts_chars);
         if tokens > 0 {
-            d.requests += 1;
+            d.requests = d.requests.saturating_add(1);
         }
     }
     /// 改今天那一条
@@ -139,11 +141,7 @@ fn save(book: &Book) {
         return;
     }
     if let Ok(text) = serde_json::to_string(book) {
-        let p = path();
-        let tmp = p.with_extension("json.tmp");
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, &p);
-        }
+        let _ = super::save::write_atomic(&path(), text.as_bytes());
     }
 }
 
@@ -179,10 +177,15 @@ fn bump_now(f: impl FnOnce(&mut Day)) {
     });
 }
 /// 她开着又过了 secs 秒（每 20 秒记一次，存盘也跟着这个节奏）
-pub fn add_seconds(secs: u64) { bump_now(|d| d.seconds += secs) }
-pub fn add_feed() { bump_now(|d| d.feeds += 1) }
-pub fn add_chat() { bump_now(|d| d.chats += 1) }
-pub fn add_face(name: &str) { bump_now(|d| *d.faces.entry(name.to_string()).or_insert(0) += 1) }
+pub fn add_seconds(secs: u64) { bump_now(|d| d.seconds = d.seconds.saturating_add(secs)) }
+pub fn add_feed() { bump_now(|d| d.feeds = d.feeds.saturating_add(1)) }
+pub fn add_chat() { bump_now(|d| d.chats = d.chats.saturating_add(1)) }
+pub fn add_face(name: &str) {
+    bump_now(|d| {
+        let e = d.faces.entry(name.to_string()).or_insert(0);
+        *e = e.saturating_add(1);
+    });
+}
 /// 最近 7 天
 pub fn week() -> Vec<Day> {
     let t = today_str();
@@ -269,5 +272,12 @@ mod tests {
     fn summary_text() {
         let d = Day { date: "x".into(), tokens: 11_000, tts_chars: 800, requests: 3, ..Day::default() };
         assert_eq!(summary(&d), "今天已用 1.2 万（聊天 1.1 万 token · 语音 800 字）");
+        // 系统时钟往前跳一天再调回今天：不应生成重复今日记录导致统计与每日上限被清零
+        let mut b = Book::default();
+        b.add("2026-11-21", 5000, 200);
+        b.add("2026-11-22", 100, 0);
+        b.add("2026-11-21", 1000, 50);
+        assert_eq!(b.days.iter().filter(|x| x.date == "2026-11-21").count(), 1);
+        assert_eq!(b.get("2026-11-21").food(), 6250);
     }
 }

@@ -3,10 +3,11 @@
 //! 截图只在内存里，不落盘；关掉开关时热键注销；在录屏（OBS）或模型不能看图时菜单灰掉。
 use crate::types::AppEvent;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmFlush, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, SetFocus, UnregisterHotKey,
 };
@@ -26,6 +27,7 @@ const ID_OK: usize = 1;
 const ID_NO: usize = 2;
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
+static DLG_HWND: AtomicIsize = AtomicIsize::new(0);
 
 struct Pending {
     png: Vec<u8>,
@@ -121,8 +123,30 @@ pub fn sync_hotkey(hwnd: HWND) {
     }
 }
 
+/// 退出时注销热键并关闭确认框
+pub fn shutdown(hwnd: HWND) {
+    close_existing();
+    if REGISTERED.swap(false, Ordering::Relaxed) {
+        unsafe {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+        }
+    }
+}
+
+/// 主消息循环：转发 Tab / 回车 / Esc 给看屏吐槽确认框
+pub fn dialog_message(msg: &MSG) -> bool {
+    let h = DLG_HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return false;
+    }
+    let dlg = HWND(h as *mut _);
+    unsafe { IsWindow(Some(dlg)).as_bool() && IsDialogMessageW(dlg, msg).as_bool() }
+}
+
 /// 热键 / 菜单：截图并弹确认框
 pub fn trigger() {
+    // 先关掉上一张未处理的确认框，避免把它自己拍进新截图里
+    close_existing();
     if let Some(why) = blocked() {
         super::post_event(AppEvent::RoastNote(note_for(why).into()));
         return;
@@ -138,7 +162,7 @@ pub fn trigger() {
     let Some(pm) = shrink(rgba, w, h, MAX_W, MAX_H) else { return };
     let Ok(png) = pm.encode_png() else { return };
     let bgra: Vec<u8> = pm.data().as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], 255]).collect();
-    show_confirm(png, bgra, pm.width() as i32, pm.height() as i32);
+    show_confirm(target, png, bgra, pm.width() as i32, pm.height() as i32);
 }
 
 fn own(h: HWND) -> bool {
@@ -207,7 +231,7 @@ fn frame(h: HWND) -> Option<RECT> {
     }
 }
 
-/// 从屏幕上拷这个窗口那块（不带 CAPTUREBLT，分层窗口——也就是她自己——不会被拍进去）。返回 RGBA
+/// 从屏幕上拷这个窗口那块（截图前后临时给自身可见窗口挂 WDA_EXCLUDEFROMCAPTURE，保证 DWM 合成桌面里不含桌宠/聊天框/道具）。返回 RGBA
 fn capture(h: HWND) -> Option<(Vec<u8>, u32, u32)> {
     unsafe {
         let r = frame(h)?;
@@ -220,35 +244,67 @@ fn capture(h: HWND) -> Option<(Vec<u8>, u32, u32)> {
         if w < 8 || hgt < 8 {
             return None;
         }
+        let byte_len = (w as usize).checked_mul(hgt as usize).and_then(|n| n.checked_mul(4))?;
+        let own_wins = super::own_visible_windows();
+        for &ow in &own_wins {
+            let _ = SetWindowDisplayAffinity(ow, WDA_EXCLUDEFROMCAPTURE);
+        }
+        if !own_wins.is_empty() {
+            let _ = DwmFlush();
+        }
         let screen = GetDC(None);
-        let mem = CreateCompatibleDC(Some(screen));
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -hgt,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let out = match CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
-            Ok(bmp) if !bits.is_null() => {
-                let old = SelectObject(mem, HGDIOBJ(bmp.0));
-                let ok = BitBlt(mem, 0, 0, w, hgt, Some(screen), l, t, SRCCOPY).is_ok();
-                let px = std::slice::from_raw_parts(bits as *const u8, (w * hgt * 4) as usize);
-                let rgba: Vec<u8> = if ok { px.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], 255]).collect() } else { Vec::new() };
-                SelectObject(mem, old);
-                let _ = DeleteObject(HGDIOBJ(bmp.0));
-                ok.then_some((rgba, w as u32, hgt as u32))
+        if screen.is_invalid() {
+            for &ow in &own_wins {
+                let _ = SetWindowDisplayAffinity(ow, WDA_NONE);
             }
-            _ => None,
+            return None;
+        }
+        let mem = CreateCompatibleDC(Some(screen));
+        let out = if mem.is_invalid() {
+            None
+        } else {
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -hgt,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let res = match CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+                Ok(bmp) => {
+                    let got = if !bits.is_null() {
+                        let old = SelectObject(mem, HGDIOBJ(bmp.0));
+                        let ok = BitBlt(mem, 0, 0, w, hgt, Some(screen), l, t, SRCCOPY).is_ok();
+                        let _ = GdiFlush();
+                        let rgba: Vec<u8> = if ok {
+                            let px = std::slice::from_raw_parts(bits as *const u8, byte_len);
+                            px.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], 255]).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        SelectObject(mem, old);
+                        ok.then_some((rgba, w as u32, hgt as u32))
+                    } else {
+                        None
+                    };
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                    got
+                }
+                Err(_) => None,
+            };
+            let _ = DeleteDC(mem);
+            res
         };
-        let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
+        for &ow in &own_wins {
+            let _ = SetWindowDisplayAffinity(ow, WDA_NONE);
+        }
         out
     }
 }
@@ -272,10 +328,12 @@ pub fn shrink(rgba: Vec<u8>, w: u32, h: u32, max_w: u32, max_h: u32) -> Option<t
 const CLASS: PCWSTR = w!("HakimiRoastConfirm");
 const ASK: &str = "给哈基米看这一张？只发给你设的聊天模型，不存盘。";
 
-fn dpi_scale() -> f32 {
-    // SAFETY: 无参数
-    let d = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() };
-    if d == 0 { 1.0 } else { d as f32 / 96.0 }
+fn dpi_for(hwnd: HWND) -> u32 {
+    let d = unsafe {
+        let wd = if !hwnd.is_invalid() { GetDpiForWindow(hwnd) } else { 0 };
+        if wd > 0 { wd } else { GetDpiForSystem() }
+    };
+    if d == 0 { 96 } else { d }
 }
 
 /// 缩略图在确认框里的大小（物理像素）
@@ -284,7 +342,7 @@ fn thumb_size(w: i32, h: i32, s: f32) -> (i32, i32) {
     (((w as f32 * k).round() as i32).max(1), ((h as f32 * k).round() as i32).max(1))
 }
 
-fn close_existing() {
+pub fn close_existing() {
     let old = PENDING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.dlg);
     if let Some(h) = old {
         unsafe {
@@ -293,9 +351,10 @@ fn close_existing() {
     }
 }
 
-fn show_confirm(png: Vec<u8>, bgra: Vec<u8>, w: i32, h: i32) {
+fn show_confirm(target: HWND, png: Vec<u8>, bgra: Vec<u8>, w: i32, h: i32) {
     close_existing();
-    let s = dpi_scale();
+    let dpi = dpi_for(target);
+    let s = dpi as f32 / 96.0;
     let (tw, th) = thumb_size(w, h, s);
     let pad = (16.0 * s).round() as i32;
     let text_h = (24.0 * s).round() as i32;
@@ -317,13 +376,21 @@ fn show_confirm(png: Vec<u8>, bgra: Vec<u8>, w: i32, h: i32) {
         RegisterClassExW(&wc);
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
         let mut r = RECT { left: 0, top: 0, right: cw, bottom: ch };
-        let _ = AdjustWindowRectEx(&mut r, style, false, WS_EX_TOPMOST);
+        let _ = AdjustWindowRectExForDpi(&mut r, style, false, WS_EX_TOPMOST, dpi);
         let (ww, wh) = (r.right - r.left, r.bottom - r.top);
-        let x = (GetSystemMetrics(SM_CXSCREEN) - ww) / 2;
-        let y = (GetSystemMetrics(SM_CYSCREEN) - wh) / 2;
+        let mon = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let (x, y) = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let wa = mi.rcWork;
+            (wa.left + (wa.right - wa.left - ww) / 2, wa.top + (wa.bottom - wa.top - wh) / 2)
+        } else {
+            ((GetSystemMetrics(SM_CXSCREEN) - ww) / 2, (GetSystemMetrics(SM_CYSCREEN) - wh) / 2)
+        };
         let Ok(dlg) = CreateWindowExW(WS_EX_TOPMOST, CLASS, w!("哈基米 · 看屏吐槽"), style, x, y, ww, wh, None, None, Some(hinst.into()), None) else {
             return;
         };
+        let _ = SetWindowDisplayAffinity(dlg, WDA_EXCLUDEFROMCAPTURE);
+        DLG_HWND.store(dlg.0 as isize, Ordering::Relaxed);
         let font = CreateFontW(
             -(13.0 * s).round() as i32, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FF_DONTCARE.0 as u32, w!("Microsoft YaHei"),
@@ -354,7 +421,7 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                let s = dpi_scale();
+                let s = dpi_for(hwnd) as f32 / 96.0;
                 let pad = (16.0 * s).round() as i32;
                 let text_h = (24.0 * s).round() as i32;
                 let mut rc = RECT::default();
@@ -384,6 +451,7 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                         ..Default::default()
                     };
                     SetStretchBltMode(hdc, HALFTONE);
+                    let _ = SetBrushOrgEx(hdc, 0, 0, None);
                     StretchDIBits(hdc, tx, ty, tw, th, 0, 0, p.w, p.h, Some(p.bgra.as_ptr() as *const _), &bmi, DIB_RGB_COLORS, SRCCOPY);
                     // 细边框
                     let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(0xc8c8c8));
@@ -416,14 +484,17 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = DLG_HWND.compare_exchange(hwnd.0 as isize, 0, Ordering::Relaxed, Ordering::Relaxed);
+                LRESULT(0)
+            }
+            WM_NCDESTROY => {
+                // 等子按钮全部销毁后再释放共享 HFONT 和内存截图，避免 GDI UAF
                 let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-                if g.as_ref().is_some_and(|p| p.dlg == hwnd) {
-                    // 截图跟着框一起丢掉
-                    if let Some(p) = g.take()
-                        && !p.font.is_invalid()
-                    {
-                        let _ = DeleteObject(HGDIOBJ(p.font.0));
-                    }
+                if g.as_ref().is_some_and(|p| p.dlg == hwnd)
+                    && let Some(p) = g.take()
+                    && !p.font.is_invalid()
+                {
+                    let _ = DeleteObject(HGDIOBJ(p.font.0));
                 }
                 LRESULT(0)
             }

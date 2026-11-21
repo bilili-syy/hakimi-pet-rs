@@ -135,6 +135,7 @@ impl Behavior {
         match ev {
             MemoEv::Due(hits) => self.memo_due(hits),
             MemoEv::Reply { ok, text } => self.on_chat_reply(ChatReply { ok, text, need_key: false }),
+            MemoEv::ReplyId { req_id, ok, text } => self.on_chat_reply_id(req_id, ChatReply { ok, text, need_key: false }),
         }
     }
 
@@ -336,9 +337,11 @@ impl Behavior {
             }
             Parsed::Unsure => {
                 // 和普通聊天一样进入「思考中」，后台问 AI；不是备忘的话 AI 线程会转成普通聊天
-                self.waiting = true;
+                let req_id = self.begin_chat_wait();
                 self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(false)));
-                self.set_state(St::Think, None);
+                if !self.dragging && !matches!(self.state, St::Drag | St::Fall) {
+                    self.set_state(St::Think, None);
+                }
                 self.say_opts(&pick(lines::THINK), 30_000, false, SpeakKind::Line);
                 let d = &self.stats.data;
                 let ctx = crate::services::ai::ChatCtx {
@@ -350,7 +353,7 @@ impl Behavior {
                 };
                 self.call(format!("memo:ai:{text}"));
                 if self.io {
-                    mp::route_ai(&self.tx, text.to_string(), ctx);
+                    mp::route_ai(&self.tx, req_id, text.to_string(), ctx);
                 }
                 true
             }

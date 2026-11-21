@@ -178,6 +178,10 @@ impl Behavior {
         }
     }
 
+    fn cv_wait_ms(&self) -> u64 {
+        if self.io && crate::core::config::get().tts.mode == "sovits" { 65_000 } else { CV_WAIT_MS }
+    }
+
     /// 给第 shown 段发合成请求，并挂一个超时
     fn cv_request(&mut self) {
         let Some(cv) = &self.cv else { return };
@@ -191,7 +195,8 @@ impl Behavior {
         if self.io {
             crate::services::tts::speak(&self.tx, token, text, Some(mood), SpeakKind::Chat);
         }
-        self.later(CV_WAIT_MS, Later::ChatVoiceTimeout(token));
+        let wait = self.cv_wait_ms();
+        self.later(wait, Later::ChatVoiceTimeout(token));
     }
 
     /// 这个合成结果是不是语音回答在等的
@@ -238,10 +243,11 @@ impl Behavior {
             return self.cv_give_up();
         }
         // 下一段还在合成：字先留着，等它（超时会兜底）
+        let wait = self.cv_wait_ms();
         if let Some(b) = &mut self.bubble
             && b.token == token
         {
-            b.hide_at = Some(self.now + CV_WAIT_MS + 1000);
+            b.hide_at = Some(self.now + wait + 1000);
         }
     }
 

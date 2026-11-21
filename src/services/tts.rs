@@ -90,14 +90,24 @@ fn sha1_hex(s: &str) -> String { sha1_smol::Sha1::from(s.as_bytes()).digest().to
 
 fn mood_key(m: Option<VoiceMood>) -> &'static str { m.map(VoiceMood::key).unwrap_or("") }
 
-/// 原版 cacheKey：sha1([mode, voice, mode==clone ? '' : style, mood, text].join('|'))
+/// 原版 cacheKey：sha1([mode, voice, mode==clone ? '' : style, mood, text].join('|'))；
+/// sovits 模式把参考音频路径与参考文本编进键里，换参考音频不会串旧缓存
 pub fn cache_key(t: &TtsConfig, text: &str, mood: Option<VoiceMood>) -> String {
+    if t.mode == "sovits" {
+        return sha1_hex(&["sovits", t.sovits_ref.trim(), t.sovits_prompt.trim(), mood_key(mood), text].join("|"));
+    }
     let style = if t.mode == "clone" { "" } else { t.style.as_str() };
     sha1_hex(&[t.mode.as_str(), t.voice.as_str(), style, mood_key(mood), text].join("|"))
 }
 
 /// 原版 textKey：'T' + sha1([mode, voice, text].join('|'))
 pub fn text_key(t: &TtsConfig, text: &str) -> String {
+    if t.mode == "sovits" {
+        return format!("T{}", sha1_hex(&["sovits", t.sovits_ref.trim(), t.sovits_prompt.trim(), text].join("|")));
+    }
+    if t.mode == "design" {
+        return format!("T{}", sha1_hex(&["design", t.voice.as_str(), t.style.as_str(), text].join("|")));
+    }
     format!("T{}", sha1_hex(&[t.mode.as_str(), t.voice.as_str(), text].join("|")))
 }
 
@@ -118,9 +128,10 @@ pub fn bundled_playable() -> bool {
     })
 }
 
-/// 内置台词（哈基米默认声线，clone 和本机 GPT-SoVITS 模式用：都是她本人的声音）
+/// 内置台词（哈基米默认声线：clone 模式，或未自定义 sovitsRef 的默认 GPT-SoVITS 模式）
 pub fn bundled(t: &TtsConfig, text: &str) -> Option<&'static [u8]> {
-    if t.mode != "clone" && t.mode != "sovits" { return None; }
+    let default_hakimi = t.mode == "clone" || (t.mode == "sovits" && t.sovits_ref.trim().is_empty());
+    if !default_hakimi { return None; }
     crate::assets::get(&format!("voice/lines/{}.ogg", &sha1_hex(text)[..16]))
 }
 
@@ -444,13 +455,16 @@ fn worker() {
                     Some(at) if now >= at => {
                         // 在锁外读配置，避免持有 STATE 锁期间触发磁盘 I/O
                         drop(st);
-                        let t = crate::core::config::get().tts;
+                        let cfg = crate::core::config::get();
+                        let t = cfg.tts;
                         st = state();
                         if let Some(job) = st.fg.take() {
                             st.last_fg = Some(Instant::now());
                             break Work::Fg(job);
                         }
-                        if !t.enabled || !online_ok(&t) || t.speak == "off" || st.warm.is_empty() {
+                        // 本机 GPT-SoVITS 合成慢且占本地 GPU/CPU，不做百句后台预热；设了每日粮食上限时也别在后台悄悄扣额度
+                        let warm_ok = t.enabled && online_ok(&t) && t.speak != "off" && t.mode != "sovits" && cfg.daily_food_cap == 0;
+                        if !warm_ok || st.warm.is_empty() {
                             st.warm_at = None;
                             continue;
                         }
@@ -781,13 +795,18 @@ fn sovits_ref_path(t: &TtsConfig) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
+/// 内置参考音频（assets/voice/hakimi-voice.mp3）对应的准确台词：GPT-SoVITS v3/v4 要求非空 prompt_text
+const SOVITS_DEFAULT_PROMPT: &str = "主人，你回来啦！哈基米等你好久了喵，今天也要好好吃饭哦！";
+
 /// 请求体（不带心情标签：GPT-SoVITS 会把「(开心)」当字念出来）
 pub fn sovits_body(t: &TtsConfig, text: &str, ref_path: &str) -> Value {
+    let prompt = t.sovits_prompt.trim();
+    let prompt_text = if prompt.is_empty() && t.sovits_ref.trim().is_empty() { SOVITS_DEFAULT_PROMPT } else { prompt };
     json!({
         "text": text,
         "text_lang": "zh",
         "ref_audio_path": ref_path,
-        "prompt_text": t.sovits_prompt.trim(),
+        "prompt_text": prompt_text,
         "prompt_lang": "zh",
         "media_type": "wav",
         "streaming_mode": false,
@@ -797,8 +816,14 @@ pub fn sovits_body(t: &TtsConfig, text: &str, ref_path: &str) -> Value {
 
 fn sovits_url(t: &TtsConfig) -> String {
     let base = t.sovits_url.trim().trim_end_matches('/');
-    let base = if base.is_empty() { "http://127.0.0.1:9880" } else { base };
-    if base.ends_with("/tts") { base.to_string() } else { format!("{base}/tts") }
+    let base = if base.is_empty() {
+        "http://127.0.0.1:9880".to_string()
+    } else if base.contains("://") {
+        base.to_string()
+    } else {
+        format!("http://{base}")
+    };
+    if base.ends_with("/tts") { base } else { format!("{base}/tts") }
 }
 
 fn sovits_request(t: &TtsConfig, text: &str, timeout_secs: u64) -> Result<Vec<u8>, Fail> {
@@ -886,14 +911,22 @@ mod tests {
     fn sovits_request_shape() {
         let mut t = TtsConfig { mode: "sovits".into(), ..TtsConfig::default() };
         assert!(t.can_synth());
-        assert!(bundled(&t, SAMPLE).is_some(), "本机声线也用内置录音");
+        assert!(bundled(&t, SAMPLE).is_some(), "本机声线默认用内置录音");
         let b = sovits_body(&t, "你好呀", "C:/x/ref.mp3");
         assert_eq!(b["text"], "你好呀");
         assert_eq!(b["ref_audio_path"], "C:/x/ref.mp3");
+        assert!(!b["prompt_text"].as_str().unwrap().is_empty(), "默认参考音频自动附带台词文本以兼容 v3/v4");
         assert_eq!(b["media_type"], "wav");
+        assert_eq!(sovits_url(&t), "http://127.0.0.1:9880/tts");
+        t.sovits_url = "127.0.0.1:9880".into();
         assert_eq!(sovits_url(&t), "http://127.0.0.1:9880/tts");
         t.sovits_url = "http://192.168.1.5:9880/tts/".into();
         assert_eq!(sovits_url(&t), "http://192.168.1.5:9880/tts");
+        // 自定义 sovitsRef 不再强走内置哈基米录音，且缓存键与默认隔离
+        let k_default = cache_key(&t, "你好", None);
+        t.sovits_ref = "D:/custom/other.wav".into();
+        assert!(bundled(&t, SAMPLE).is_none());
+        assert_ne!(cache_key(&t, "你好", None), k_default);
         t.mode = "preset".into();
         assert!(!t.can_synth());
     }

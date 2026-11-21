@@ -88,6 +88,7 @@ fn build(proxy: &str, timeout_secs: u64) -> ureq::Agent {
     let t = if timeout_secs == 0 { None } else { Some(Duration::from_secs(timeout_secs)) };
     ureq::Agent::config_builder()
         .proxy(p)
+        .max_redirects(0)
         .timeout_global(t)
         .timeout_connect(Some(Duration::from_secs(CONNECT_TIMEOUT_SECS)))
         .http_status_as_error(false)

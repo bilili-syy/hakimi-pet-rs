@@ -63,20 +63,47 @@ static HISTORY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// 同一时间在途聊天计数（后台线程顺序化只针对网络发送，不阻塞 clear_history）
 static IN_FLIGHT: Mutex<()> = Mutex::new(());
 
-/// 后台线程发请求，完成后 tx.send(AppEvent::ChatReply(..))
-pub fn chat(tx: &EventSender, text: String, ctx: ChatCtx) {
+/// 每次发起可取消的聊天/吐槽/模糊备忘请求分配递增序号；按 Esc 时把当前已发出的最大序号标为已取消
+static NEXT_REQ_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CANCELLED_UP_TO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn next_req_id() -> u64 {
+    NEXT_REQ_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+pub fn is_cancelled(req_id: u64) -> bool {
+    req_id > 0 && req_id <= CANCELLED_UP_TO.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 取消在途的这一轮请求（Esc）：排队中的不再发网络请求，已在途的回来也不进历史
+pub fn cancel_current() {
+    let cur = NEXT_REQ_ID.load(std::sync::atomic::Ordering::SeqCst);
+    CANCELLED_UP_TO.fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 后台线程发请求，完成后 tx.send(AppEvent::ChatReplyId(..))
+pub fn chat(tx: &EventSender, req_id: u64, text: String, ctx: ChatCtx) {
     let worker_tx = tx.clone();
     let spawned = std::thread::Builder::new().name("hakimi-ai".into()).spawn(move || {
-        let r = chat_blocking(&text, &ctx);
-        worker_tx.send(AppEvent::ChatReply(r));
+        let r = chat_blocking_id(req_id, &text, &ctx);
+        if !is_cancelled(req_id) {
+            worker_tx.send(AppEvent::ChatReplyId(req_id, r));
+        }
     });
     if spawned.is_err() {
-        tx.send(AppEvent::ChatReply(ChatReply { ok: false, need_key: false, text: ERR_GENERIC.into() }));
+        tx.send(AppEvent::ChatReplyId(req_id, ChatReply { ok: false, need_key: false, text: ERR_GENERIC.into() }));
     }
 }
 
 /// 同步版本（在调用线程上阻塞），返回给用户看的结果
 pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
+    chat_blocking_id(0, user_text, ctx)
+}
+
+pub fn chat_blocking_id(req_id: u64, user_text: &str, ctx: &ChatCtx) -> ChatReply {
+    if is_cancelled(req_id) {
+        return ChatReply { ok: false, need_key: false, text: String::new() };
+    }
     let c = crate::core::config::get();
     if crate::core::config::ai_key_missing(&c) {
         return ChatReply { ok: false, need_key: true, text: NEED_KEY.into() };
@@ -87,7 +114,10 @@ pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
         return ChatReply { ok: true, need_key: false, text: FULL_LINES[fastrand::usize(..FULL_LINES.len())].into() };
     }
     let _net_guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-    let cancel_gen = CANCEL_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    // 排队等待期间已被按 Esc 取消：直接退出，不再白打一次 HTTP 请求
+    if is_cancelled(req_id) {
+        return ChatReply { ok: false, need_key: false, text: String::new() };
+    }
     let (hist_gen, mut history) = {
         let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let g = HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst);
@@ -112,9 +142,8 @@ pub fn chat_blocking(user_text: &str, ctx: &ChatCtx) -> ChatReply {
     match r {
         Ok(reply) => {
             let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // 主人按了 Esc 取消：这一轮不进历史，回复由行为层丢掉
-            let cancelled = CANCEL_GEN.load(std::sync::atomic::Ordering::SeqCst) != cancel_gen;
-            if HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst) == hist_gen && !cancelled {
+            // 主人按了 Esc 取消，或期间点了「忘记聊天记录」：这一轮不进历史
+            if HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst) == hist_gen && !is_cancelled(req_id) {
                 if let Some(u) = history.last().cloned() {
                     append_log(&[u, json!({ "role": "model", "text": reply, "t": now_ms() })]);
                 }
@@ -167,20 +196,29 @@ const ROAST_ASK: &str = "（主人把 TA 现在屏幕上的窗口截图给你看
 const ROAST_NOTE: &str = "\n\n【看屏吐槽】这一轮主人给你看了一张 TA 当前窗口的截图。用哈基米的口吻吐槽或点评一两句（60 字以内），可以调侃，别刻薄；看不清就说看不清。不要念出截图里的账号、密码、聊天对象名字、金额、地址等隐私。";
 const ROAST_NO_VISION: &str = "现在用的模型看不了图片喵…换个能看图的（比如 Gemini）再给我看～";
 
-/// 看屏吐槽：png 只在内存里，发完就丢。结果走 ChatReply
-pub fn roast(tx: &EventSender, png: Vec<u8>, ctx: ChatCtx) {
+/// 看屏吐槽：png 只在内存里，发完就丢。结果走 ChatReplyId
+pub fn roast(tx: &EventSender, req_id: u64, png: Vec<u8>, ctx: ChatCtx) {
     let worker_tx = tx.clone();
     let spawned = std::thread::Builder::new().name("hakimi-roast".into()).spawn(move || {
-        let r = roast_blocking(&png, &ctx);
-        worker_tx.send(AppEvent::ChatReply(r));
+        let r = roast_blocking_id(req_id, &png, &ctx);
+        if !is_cancelled(req_id) {
+            worker_tx.send(AppEvent::ChatReplyId(req_id, r));
+        }
     });
     if spawned.is_err() {
-        tx.send(AppEvent::ChatReply(ChatReply { ok: false, need_key: false, text: ERR_GENERIC.into() }));
+        tx.send(AppEvent::ChatReplyId(req_id, ChatReply { ok: false, need_key: false, text: ERR_GENERIC.into() }));
     }
 }
 
 pub fn roast_blocking(png: &[u8], ctx: &ChatCtx) -> ChatReply {
+    roast_blocking_id(0, png, ctx)
+}
+
+pub fn roast_blocking_id(req_id: u64, png: &[u8], ctx: &ChatCtx) -> ChatReply {
     use base64::Engine;
+    if is_cancelled(req_id) {
+        return ChatReply { ok: false, need_key: false, text: String::new() };
+    }
     let c = crate::core::config::get();
     if crate::core::config::ai_key_missing(&c) {
         return ChatReply { ok: false, need_key: true, text: NEED_KEY.into() };
@@ -192,7 +230,13 @@ pub fn roast_blocking(png: &[u8], ctx: &ChatCtx) -> ChatReply {
         return ChatReply { ok: true, need_key: false, text: FULL_LINES[fastrand::usize(..FULL_LINES.len())].into() };
     }
     let _net_guard = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-    let cancel_gen = CANCEL_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    if is_cancelled(req_id) {
+        return ChatReply { ok: false, need_key: false, text: String::new() };
+    }
+    let hist_gen = {
+        let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst)
+    };
     let img = base64::engine::general_purpose::STANDARD.encode(png);
     let ask = [json!({ "role": "user", "text": ROAST_ASK, "image": img })];
     let mut system = crate::core::skin::with_persona(persona(&c, ctx));
@@ -202,7 +246,7 @@ pub fn roast_blocking(png: &[u8], ctx: &ChatCtx) -> ChatReply {
     match r {
         Ok(reply) => {
             let _h = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            if CANCEL_GEN.load(std::sync::atomic::Ordering::SeqCst) == cancel_gen {
+            if HISTORY_GEN.load(std::sync::atomic::Ordering::SeqCst) == hist_gen && !is_cancelled(req_id) {
                 // 图不进历史，只记一句「给她看了屏幕」，下一句聊天她还接得上
                 let u = json!({ "role": "user", "text": "（给你看了一眼我的屏幕）", "t": now_ms() });
                 let a = json!({ "role": "model", "text": reply, "t": now_ms() });
@@ -221,16 +265,39 @@ pub fn roast_blocking(png: &[u8], ctx: &ChatCtx) -> ChatReply {
     }
 }
 
-/// 取消在途的这一轮聊天（Esc）：回复到了也不进历史
-static CANCEL_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub fn cancel_current() { CANCEL_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+/// 完整聊天记录最大保留体积（约几万轮对话；超限自动截留后半段，防 UI 线程读取大文件卡顿）
+const MAX_CHAT_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 完整聊天记录（导出用；chat.json 只留最近 20 条给模型当上下文）：一行一条 JSON
 pub fn log_file() -> std::path::PathBuf { crate::core::paths::data_dir().join("chat-log.jsonl") }
 
 fn append_log(items: &[Value]) {
     use std::io::Write;
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file()) else { return };
+    let path = log_file();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // 第一次建 chat-log.jsonl 时，先把升级前已在 chat.json 里的旧对话迁进来，免得导出丢失旧记录
+    let need_seed = std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
+    if need_seed {
+        let prior = load_history();
+        if !prior.is_empty()
+            && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+        {
+            for v in &prior {
+                let _ = writeln!(f, "{v}");
+            }
+        }
+    }
+    if let Ok(m) = std::fs::metadata(&path)
+        && m.len() > MAX_CHAT_LOG_BYTES
+        && let Ok(bytes) = std::fs::read(&path)
+    {
+        let half = bytes.len() / 2;
+        let start = bytes[half..].iter().position(|&b| b == b'\n').map_or(half, |i| half + i + 1);
+        let _ = crate::core::save::write_atomic(&path, &bytes[start..]);
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else { return };
     for v in items {
         let _ = writeln!(f, "{v}");
     }
@@ -238,7 +305,22 @@ fn append_log(items: &[Value]) {
 
 /// 读完整聊天记录；还没有（这版以前的）就用 chat.json 里最近的
 pub fn load_log() -> Vec<Value> {
-    let v: Vec<Value> = std::fs::read_to_string(log_file())
+    use std::io::{Read, Seek, SeekFrom};
+    let v: Vec<Value> = std::fs::File::open(log_file())
+        .and_then(|mut f| {
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut s = String::new();
+            if len > MAX_CHAT_LOG_BYTES {
+                let _ = f.seek(SeekFrom::End(-(MAX_CHAT_LOG_BYTES as i64)));
+                let _ = f.read_to_string(&mut s);
+                if let Some(nl) = s.find('\n') {
+                    s.drain(..=nl);
+                }
+            } else {
+                f.read_to_string(&mut s)?;
+            }
+            Ok(s)
+        })
         .map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
         .unwrap_or_default();
     if v.is_empty() { load_history() } else { v }
@@ -386,13 +468,49 @@ fn post_t(url: &str, headers: &[(&str, &str)], body: &Value, timeout: u64, key: 
         return Err(AiError { kind: ErrKind::Status(status), detail: format!("HTTP {status}: {short}") });
     }
     let json = json.ok_or_else(|| AiError::other("bad json"))?;
-    // 记今天吃了多少：本机模型不花钱不记；接口没给 usage 就按字数估
+    // 记今天吃了多少：本机模型不花钱不记；接口没给 usage 就只按文本字数 + 图片固定视觉开销估算（不把百万字符 base64 当字数算）
     if !crate::core::config::is_local_url(url) {
         let n = crate::core::usage::tokens_in(&json)
-            .unwrap_or_else(|| crate::core::usage::estimate_tokens(body.to_string().chars().count() / 2 + text.chars().count() / 2));
+            .unwrap_or_else(|| estimate_fallback_tokens(body, &text));
         crate::core::usage::add_tokens(n);
     }
     Ok(json)
+}
+
+/// 接口未返回 usage 时的回退估算：只统计提示词/消息文本，遇到 base64 图片按固定 800 token 计，避免看屏吐槽一次记几十万 token
+pub(crate) fn estimate_fallback_tokens(body: &Value, resp_text: &str) -> u64 {
+    fn walk(v: &Value, chars: &mut usize, images: &mut u64) {
+        match v {
+            Value::Object(map) => {
+                if map.contains_key("inline_data") || map.contains_key("image_url") {
+                    *images += 1;
+                    return;
+                }
+                for (k, val) in map {
+                    if matches!(k.as_str(), "text" | "content")
+                        && let Value::String(s) = val
+                    {
+                        *chars += s.chars().count();
+                    } else {
+                        walk(val, chars, images);
+                    }
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    walk(item, chars, images);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut chars, mut images) = (0usize, 0u64);
+    walk(body, &mut chars, &mut images);
+    let reply_chars = serde_json::from_str::<Value>(resp_text)
+        .ok()
+        .and_then(|j| parse_gemini(&j).or_else(|_| parse_openai(&j)).ok())
+        .map_or_else(|| resp_text.chars().count().min(1000), |s| s.chars().count());
+    crate::core::usage::estimate_tokens(chars + reply_chars).saturating_add(images * 800)
 }
 
 /// encodeURIComponent
@@ -493,8 +611,9 @@ fn provider_base<'a>(provider: &str, base_url: &'a str) -> &'a str {
 fn endpoint(provider: &str, base_url: &str, model: &str, key: &str) -> (String, &'static str, String) {
     let base = provider_base(provider, base_url);
     if provider == "openai" {
-        // 本机模型不要 Key：随便给一个，免得有的本地服务见到空 Bearer 报错
-        let key = if key.is_empty() { "local" } else { key };
+        // 本机/局域网明文 HTTP Ollama（默认 11434）不要发残留的云端 Key，避免明文外泄
+        let plain_ollama = base.starts_with("http://") && crate::core::config::is_local_url(base) && base.contains(":11434");
+        let key = if key.is_empty() || plain_ollama { "local" } else { key };
         (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}"))
     } else {
         (format!("{base}/models/{}:generateContent", encode_component(model)), "x-goog-api-key", key.to_string())
@@ -629,7 +748,7 @@ pub fn ask_once_reply(system: &str, user: &str, max_tokens: u32) -> Result<Strin
         return Err(ChatReply { ok: false, need_key: true, text: NEED_KEY.into() });
     }
     if !crate::core::config::ai_is_local(&c) && crate::core::usage::over_cap() {
-        return Err(ChatReply { ok: false, need_key: false, text: FULL_LINES[0].into() });
+        return Err(ChatReply { ok: true, need_key: false, text: FULL_LINES[fastrand::usize(..FULL_LINES.len())].into() });
     }
     ask_once_inner(&c, system, user, max_tokens).map_err(|e| {
         crate::core::log::log(&format!("memo ai error {}", redact(&e.detail, key)));
@@ -698,7 +817,8 @@ pub fn list_models(p: &TestParams) -> Result<Vec<String>, String> {
     let local = crate::core::config::is_local_url(&base);
     let agent = super::net::agent_with_proxy(&p.proxy, 10, &base);
     let key = p.api_key.trim();
-    let auth = format!("Bearer {}", if key.is_empty() { "local" } else { key });
+    let plain_ollama = base.starts_with("http://") && local && base.contains(":11434");
+    let auth = format!("Bearer {}", if key.is_empty() || plain_ollama { "local" } else { key });
     let mut res = agent
         .get(&format!("{base}/models"))
         .header("Authorization", &auth)
@@ -728,6 +848,7 @@ pub fn parse_models(text: &str) -> Option<Vec<String>> {
 
 /// 把服务器错误里可能带的 Key 片段遮掉，再截短
 fn redact(msg: &str, key: &str) -> String {
+    let key = key.trim();
     let mut m = msg.to_string();
     if key.len() >= 6 { m = m.replace(key, "***"); }
     let m = m.trim();
@@ -954,6 +1075,23 @@ mod tests {
     fn local_needs_no_key() {
         let (_, _, h) = endpoint("openai", "http://127.0.0.1:11434/v1", "qwen3:8b", "");
         assert_eq!(h, "Bearer local");
+        // 残留的云端 Key 不会通过明文 HTTP 发给默认 11434 端口的 Ollama
+        let (_, _, h2) = endpoint("openai", "http://192.168.1.5:11434/v1", "qwen3:8b", "sk-secret-cloud-key");
+        assert_eq!(h2, "Bearer local");
+        // 看屏吐槽无 usage 回退估算：百万字符 base64 图片按固定 800 token 算，不会打爆每日上限
+        let big_b64 = "A".repeat(200_000);
+        let g_roast = gemini_body("gemini-2.5-flash", "sys", &[json!({"role": "user", "text": "看看屏幕", "image": big_b64})]);
+        let est_g = estimate_fallback_tokens(&g_roast, r#"{"candidates":[{"content":{"parts":[{"text":"在摸鱼喵"}]}}]}"#);
+        assert!((800..1500).contains(&est_g), "gemini fallback tokens = {est_g}");
+        let o_roast = openai_body("gpt-4o", "sys", &[json!({"role": "user", "text": "看看屏幕", "image": big_b64})]);
+        let est_o = estimate_fallback_tokens(&o_roast, r#"{"choices":[{"message":{"content":"在摸鱼喵"}}]}"#);
+        assert!((800..1500).contains(&est_o), "openai fallback tokens = {est_o}");
+        // 请求序号取消语义：cancel_current 只取消已发出的序号，不影响后续新请求
+        let r1 = next_req_id();
+        let r2 = next_req_id();
+        cancel_current();
+        let r3 = next_req_id();
+        assert!(is_cancelled(r1) && is_cancelled(r2) && !is_cancelled(r3));
         // 本机没开服务：不报「没填 Key」，而是说连不上（端口 9 基本不会有人监听）
         let p = TestParams { provider: "openai".into(), base_url: "http://127.0.0.1:9/v1".into(), api_key: String::new(), model: "m".into(), proxy: String::new() };
         assert!(test_connection(&p).unwrap_err().contains("Ollama"));

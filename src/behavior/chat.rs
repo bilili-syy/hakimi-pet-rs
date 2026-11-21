@@ -42,6 +42,9 @@ impl Behavior {
         self.state_timer = None;
         if matches!(self.state, St::Walk | St::Sleep) { self.set_state(St::Idle, None); }
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Open));
+        if self.waiting {
+            self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(false)));
+        }
         // 新手：还没填聊天 Key，第一次打开聊天就先告诉她去哪儿填
         if !self.key_hint_shown && self.io && crate::core::config::ai_key_missing(&crate::core::config::get()) {
             self.key_hint_shown = true;
@@ -85,9 +88,11 @@ impl Behavior {
         // 「记住…」「忘掉…」「你记得我什么」
         if self.mind_chat(&text) { return; }
         if self.memo_chat(&text) { return; }
-        self.waiting = true;
+        let req_id = self.begin_chat_wait();
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(false)));
-        self.set_state(St::Think, None);
+        if !self.dragging && !matches!(self.state, St::Drag | St::Fall) {
+            self.set_state(St::Think, None);
+        }
         self.say_opts(&pick(lines::THINK), 30_000, false, SpeakKind::Line);
         let d = &self.stats.data;
         let ctx = crate::services::ai::ChatCtx {
@@ -98,17 +103,28 @@ impl Behavior {
             days: self.stats.days(),
         };
         self.call(format!("chat:{text}"));
-        if self.io { crate::services::ai::chat(&self.tx, text, ctx); }
+        if self.io { crate::services::ai::chat(&self.tx, req_id, text, ctx); }
     }
 
-    /// 看屏吐槽：主人确认过的截图。和聊天一样等回复（Esc 也能取消），回复走 on_chat_reply
+    pub(super) fn begin_chat_wait(&mut self) -> u64 {
+        self.waiting = true;
+        let req_id = crate::services::ai::next_req_id();
+        self.active_chat_req = req_id;
+        req_id
+    }
+
+    /// 看屏吐槽：主人确认过的截图。和聊天一样等回复（Esc 也能取消），回复走 on_chat_reply_id
     pub(super) fn on_roast(&mut self, png: Vec<u8>) {
         if self.waiting { return; }
-        self.waiting = true;
+        let req_id = self.begin_chat_wait();
         self.act(Act::Chat);
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(false)));
-        self.set_state(St::Think, None);
-        self.say_opts(&pick(lines::ROAST_LOOK), 30_000, false, SpeakKind::Line);
+        if !self.dragging && !matches!(self.state, St::Drag | St::Fall) && self.play.game.is_none() {
+            self.set_state(St::Think, None);
+        }
+        if !self.memo_ringing() {
+            self.say_opts(&pick(lines::ROAST_LOOK), 30_000, false, SpeakKind::Line);
+        }
         let d = &self.stats.data;
         let ctx = crate::services::ai::ChatCtx {
             hunger: d.hunger.round() as u32,
@@ -118,7 +134,7 @@ impl Behavior {
             days: self.stats.days(),
         };
         self.call(format!("roast:{}", png.len()));
-        if self.io { crate::services::ai::roast(&self.tx, png, ctx); }
+        if self.io { crate::services::ai::roast(&self.tx, req_id, png, ctx); }
     }
 
     /// 等回复时按 Esc：不等了。回复到了丢掉、不进历史；正在合成第一段语音的也停
@@ -127,23 +143,38 @@ impl Behavior {
             return self.close_chat();
         }
         self.waiting = false;
+        self.active_chat_req = 0;
         if self.cv.is_some() {
             self.cv = None;
             self.emotion_cv_clear();
+        } else if self.io {
+            crate::services::ai::cancel_current();
         } else {
-            self.drop_reply = true;
-            if self.io {
-                crate::services::ai::cancel_current();
-            }
+            self.drop_replies = self.drop_replies.saturating_add(1);
         }
         self.call("chat:stop".into());
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(true)));
-        self.set_state(St::Idle, None);
-        self.say_opts(&pick(lines::CHAT_STOP), 2200, false, SpeakKind::Line);
+        if !self.dragging && !matches!(self.state, St::Drag | St::Fall) && self.play.game.is_none() {
+            self.set_state(St::Idle, None);
+        }
+        if !self.memo_ringing() {
+            self.say_opts(&pick(lines::CHAT_STOP), 2200, false, SpeakKind::Line);
+        }
     }
 
     pub(super) fn on_chat_reply(&mut self, r: ChatReply) {
-        if std::mem::take(&mut self.drop_reply) {
+        self.on_chat_reply_id(0, r);
+    }
+
+    pub(super) fn on_chat_reply_id(&mut self, req_id: u64, r: ChatReply) {
+        if req_id != 0 {
+            if req_id != self.active_chat_req {
+                self.call("chat:dropped".into());
+                return;
+            }
+            self.active_chat_req = 0;
+        } else if self.drop_replies > 0 {
+            self.drop_replies -= 1;
             self.call("chat:dropped".into());
             return;
         }

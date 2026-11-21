@@ -69,7 +69,13 @@ fn today_local() -> String {
 
 impl Behavior {
     fn sense_busy(&self) -> bool {
-        self.chatting || self.waiting || self.dragging || self.routine.is_some() || self.memo_ringing()
+        self.chatting
+            || self.waiting
+            || self.dragging
+            || self.routine.is_some()
+            || self.memo_ringing()
+            || self.play.game.is_some()
+            || self.play.food.is_some()
             || matches!(self.state, St::Drag | St::Fall | St::Dance | St::Eat)
     }
 
@@ -134,6 +140,12 @@ impl Behavior {
         if on {
             self.sense.quiet_since = self.now;
             self.stop_voice();
+            // 进全屏安静（默认还会隐藏窗口）时停掉跳舞和歌曲，免得在后台出鼓点或 60~120fps 跟拍空转
+            if self.routine.is_some() {
+                self.finish_routine(false);
+            } else if self.state == St::Dance {
+                self.end_dance();
+            }
             if matches!(self.state, St::Idle | St::Walk) { self.set_state(St::Sit, None); }
         } else if !self.flush_off_work() && self.now.saturating_sub(self.sense.quiet_since) >= 5 * 60_000 && !self.sense_busy() {
             self.react(St::Smug, 2400, Some(pick(lines::FS_OFF)));

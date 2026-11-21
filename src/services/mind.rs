@@ -311,7 +311,8 @@ fn record_parse_fail(counter: &std::sync::atomic::AtomicU32) -> bool {
 }
 
 fn extract_blocking() {
-    if crate::core::config::ai_key_missing(&crate::core::config::get()) {
+    let c = crate::core::config::get();
+    if crate::core::config::ai_key_missing(&c) || (!crate::core::config::ai_is_local(&c) && crate::core::usage::over_cap()) {
         return;
     }
     let clear_gen = store::clear_gen();
@@ -370,7 +371,9 @@ pub fn care_in_background(tx: &EventSender) -> bool {
     let tx = tx.clone();
     let ok = std::thread::Builder::new().name("hakimi-care".into()).spawn(move || {
         let book = store::snapshot();
-        let line = if crate::core::config::ai_key_missing(&crate::core::config::get()) || !has_care_topic(&book) {
+        let c = crate::core::config::get();
+        let over_cap = !crate::core::config::ai_is_local(&c) && crate::core::usage::over_cap();
+        let line = if crate::core::config::ai_key_missing(&c) || over_cap || !has_care_topic(&book) {
             None
         } else {
             match crate::services::ai::ask_once(&care_prompt(Now::get().dt, &book), "说一句吧") {

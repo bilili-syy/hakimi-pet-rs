@@ -174,7 +174,7 @@ pub(super) fn paint_bg(hwnd: HWND, hdc: HDC) {
     fill(hdc, RECT { left: side + px(16.0), top: fy, right: cr.right - px(16.0), bottom: fy + px(1.0).max(1) }, LINE);
     let focus = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
     for (r, h, p) in frames {
-        if p != 0 && p != page {
+        if (p != 0 && p != page) || unsafe { !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h).as_bool() } {
             continue;
         }
         let rc = RECT { left: px(r[0]), top: px(r[1]), right: px(r[0] + r[2]), bottom: px(r[1] + r[3]) };

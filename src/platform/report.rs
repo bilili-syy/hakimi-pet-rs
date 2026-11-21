@@ -14,14 +14,20 @@ pub fn docs_dir() -> PathBuf {
 }
 
 fn known(id: &windows::core::GUID) -> Option<PathBuf> {
-    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree, CoUninitialize};
     use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-    // SAFETY: 返回的字符串用完交给 CoTaskMemFree
+    // SAFETY: 确保当前线程已初始化 COM；返回的字符串用完交给 CoTaskMemFree
     unsafe {
-        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
-        let s = p.to_string().ok();
-        CoTaskMemFree(Some(p.0 as *const _));
-        s.map(PathBuf::from)
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok();
+        let res = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok().and_then(|p| {
+            let s = p.to_string().ok();
+            CoTaskMemFree(Some(p.0 as *const _));
+            s.map(PathBuf::from)
+        });
+        if com {
+            CoUninitialize();
+        }
+        res
     }
 }
 
@@ -34,31 +40,24 @@ pub fn current(memories: Vec<String>) -> report::Report {
 
 /// 毫秒时间戳 → 当地日期（用系统时区换算）
 fn date_of_ms(ms: f64) -> String {
-    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
-    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
-    let ft100 = (ms as u64).saturating_mul(10_000) + 116_444_736_000_000_000;
-    let ft = FILETIME { dwLowDateTime: ft100 as u32, dwHighDateTime: (ft100 >> 32) as u32 };
-    let (mut utc, mut local) = (SYSTEMTIME::default(), SYSTEMTIME::default());
-    // SAFETY: 都是本地栈上的结构体
-    unsafe {
-        if FileTimeToSystemTime(&ft, &mut utc).is_err() || SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_err() {
-            return String::new();
-        }
-    }
-    format!("{:04}-{:02}-{:02}", local.wYear, local.wMonth, local.wDay)
+    let d = date_of_ms_full(ms);
+    if d.len() >= 10 { d[..10].to_string() } else { String::new() }
 }
 
 /// 毫秒时间戳 → 当地「11-21 14:05」
 fn clock_of_ms(ms: f64) -> String {
     let d = date_of_ms_full(ms);
-    if d.is_empty() { String::new() } else { d[5..].to_string() }
+    if d.len() >= 16 { d[5..].to_string() } else { String::new() }
 }
 
 /// 毫秒时间戳 → 当地「2026-11-21 14:05」
 fn date_of_ms_full(ms: f64) -> String {
     use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
     use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
-    let ft100 = (ms.max(0.0) as u64).saturating_mul(10_000) + 116_444_736_000_000_000;
+    if !ms.is_finite() {
+        return String::new();
+    }
+    let ft100 = (ms.max(0.0) as u64).saturating_mul(10_000).saturating_add(116_444_736_000_000_000);
     let ft = FILETIME { dwLowDateTime: ft100 as u32, dwHighDateTime: (ft100 >> 32) as u32 };
     let (mut utc, mut local) = (SYSTEMTIME::default(), SYSTEMTIME::default());
     // SAFETY: 都是本地栈上的结构体
@@ -70,22 +69,28 @@ fn date_of_ms_full(ms: f64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute)
 }
 
+/// 导出错误分类：Empty = 没有记录，Io = 写盘失败
+pub enum ExportErr {
+    Empty,
+    Io(String),
+}
+
 /// 把完整聊天记录导出成 Markdown（文档\哈基米\和哈基米的聊天-日期时间.md），返回路径
-pub fn export_chat() -> Result<PathBuf, String> {
+pub fn export_chat() -> Result<PathBuf, ExportErr> {
     let items = crate::services::ai::load_log();
     if items.is_empty() {
-        return Err("还没有聊天记录".into());
+        return Err(ExportErr::Empty);
     }
     let n = crate::core::memo::Now::get().dt;
     let stamp = format!("{:04}-{:02}-{:02} {:02}:{:02}", n.y, n.mo, n.d, n.h, n.mi);
     let md = crate::services::ai::log_markdown(&items, &stamp, clock_of_ms);
     let d = docs_dir();
-    std::fs::create_dir_all(&d).map_err(|e| format!("建文件夹失败：{e}"))?;
+    std::fs::create_dir_all(&d).map_err(|e| ExportErr::Io(format!("建文件夹失败：{e}")))?;
     let path = d.join(format!("和哈基米的聊天-{:04}{:02}{:02}-{:02}{:02}.md", n.y, n.mo, n.d, n.h, n.mi));
     // 带 BOM：记事本老版本也认得是 UTF-8
     let mut bytes = vec![0xEF, 0xBB, 0xBF];
     bytes.extend_from_slice(md.as_bytes());
-    std::fs::write(&path, bytes).map_err(|e| format!("存文件失败：{e}"))?;
+    std::fs::write(&path, bytes).map_err(|e| ExportErr::Io(format!("存文件失败：{e}")))?;
     Ok(path)
 }
 
@@ -96,8 +101,8 @@ pub fn reveal(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer.exe").raw_arg(arg).spawn();
 }
 
-/// 画好、存盘、复制。成功返回文件路径
-pub fn make(memories: Vec<String>) -> Result<PathBuf, String> {
+/// 画好、存盘、复制。成功返回 (文件路径, 是否已成功复制到剪贴板)
+pub fn make(memories: Vec<String>) -> Result<(PathBuf, bool), String> {
     let r = current(memories);
     let costume = crate::core::config::get().costume;
     let face = crate::services::emotion::Emotion::ALL
@@ -105,19 +110,22 @@ pub fn make(memories: Vec<String>) -> Result<PathBuf, String> {
         .find(|e| format!("{e:?}") == r.top_face_key)
         .map(|e| e.face())
         .unwrap_or(crate::types::Face::Happy);
-    let sprite = crate::assets::get(&crate::render::sprites::costume_src(&costume, face))
-        .or_else(|| crate::assets::get("sprites/happy.png"));
+    let sprite = report::resolve_sprite(&costume, face);
     let mut te = crate::render::text::TextEngine::new();
-    let pm = report::draw(&r, sprite, &mut te).ok_or("画图失败")?;
+    let pm = report::draw_pixmap(&r, sprite, &mut te).ok_or("画图失败")?;
     let png = pm.encode_png().map_err(|e| format!("编码 PNG 失败：{e}"))?;
     let d = dir();
     std::fs::create_dir_all(&d).map_err(|e| format!("建文件夹失败：{e}"))?;
     let path = d.join(format!("哈基米周报-{}.png", r.today));
     std::fs::write(&path, &png).map_err(|e| format!("存图失败：{e}"))?;
-    if let Err(e) = copy_to_clipboard(&pm) {
-        crate::core::log::log(&format!("report clipboard: {e}"));
-    }
-    Ok(path)
+    let copied = match copy_to_clipboard(&pm) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::core::log::log(&format!("report clipboard: {e}"));
+            false
+        }
+    };
+    Ok((path, copied))
 }
 
 /// 把图（预乘 RGBA）转成 CF_DIB 放进剪贴板，微信/QQ 里直接粘贴

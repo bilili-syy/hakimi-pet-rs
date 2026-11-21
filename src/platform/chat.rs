@@ -77,7 +77,7 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
 }
 
 pub struct Chat {
-    host: HWND,
+    pub(crate) host: HWND,
     edit: HWND,
     font: HFONT,
     bg: HBRUSH,
@@ -182,6 +182,7 @@ impl Chat {
 
     pub fn open(&mut self) {
         self.visible = true;
+        sync_edit(self.host, self.edit);
         unsafe {
             let _ = ShowWindow(self.host, SW_SHOW);
             let _ = SetForegroundWindow(self.host);
@@ -339,12 +340,32 @@ fn with_hist<R>(f: impl FnOnce(&mut InputHistory) -> R) -> R {
     f(h)
 }
 
+/// 清空输入框的 ↑/↓ 历史缓存（「忘掉聊天记录」时同步调用）
+pub fn clear_input_history() {
+    *HIST.lock().unwrap_or_else(|e| e.into_inner()) = Some(InputHistory::default());
+}
+
+/// 同步多行 Edit 的字数标志、框高度和灰色提示字（ES_MULTILINE 在 SetWindowTextW 时不会发 EN_CHANGE，必须显式同步）
+fn sync_edit(host: HWND, edit: HWND) {
+    if host.is_invalid() || edit.is_invalid() {
+        return;
+    }
+    let has = !edit_text(edit).trim().is_empty();
+    HAS_TEXT.store(has, Ordering::Relaxed);
+    fit_lines(host, edit);
+    unsafe {
+        let _ = InvalidateRect(Some(edit), None, true);
+    }
+}
+
 fn set_edit(edit: HWND, text: &str) {
     let w = wide(&text.replace('\n', "\r\n"));
+    let end = w.len().saturating_sub(1);
     unsafe {
+        // WM_SETTEXT 在 edit_proc 里会同步触发 sync_edit
         let _ = SetWindowTextW(edit, PCWSTR(w.as_ptr()));
-        // 光标放到最后
-        SendMessageW(edit, EM_SETSEL, Some(WPARAM(usize::MAX >> 1)), Some(LPARAM(-1)));
+        // 光标放到最后（避免 64 位下 usize::MAX>>1 低 32 位截成 -1 导致取消选区但不挪光标）
+        SendMessageW(edit, EM_SETSEL, Some(WPARAM(end)), Some(LPARAM(end as isize)));
     }
 }
 
@@ -446,12 +467,15 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     // Shift+回车：换行
                     let nl = wide("\r\n");
                     SendMessageW(hwnd, EM_REPLACESEL, Some(WPARAM(1)), Some(LPARAM(nl.as_ptr() as isize)));
+                    if let Ok(host) = GetParent(hwnd) {
+                        sync_edit(host, hwnd);
+                    }
                     return LRESULT(0);
                 }
                 let text = edit_text(hwnd).replace("\r\n", "\n").trim().to_string();
                 if !text.is_empty() {
                     with_hist(|h| h.push(&text));
-                    let _ = SetWindowTextW(hwnd, w!(""));
+                    set_edit(hwnd, "");
                     super::post_event(AppEvent::ChatSubmit(text));
                 }
                 return LRESULT(0);
@@ -491,6 +515,13 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             WM_IME_STARTCOMPOSITION | WM_IME_ENDCOMPOSITION => {
                 COMPOSING.store(msg == WM_IME_STARTCOMPOSITION, Ordering::Relaxed);
                 let _ = InvalidateRect(Some(hwnd), None, true);
+            }
+            WM_SETTEXT => {
+                let r = DefSubclassProc(hwnd, msg, wp, lp);
+                if let Ok(host) = GetParent(hwnd) {
+                    sync_edit(host, hwnd);
+                }
+                return r;
             }
             // 失焦/禁用/启用时 Edit 只重画一部分，整个重画一次免得提示字残影
             WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE => {
@@ -538,11 +569,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             WM_ERASEBKGND => LRESULT(1),
             WM_COMMAND if (wp.0 >> 16) as u32 & 0xffff == EN_CHANGE => {
                 let edit = HWND(lp.0 as *mut _);
-                let has = !edit_text(edit).trim().is_empty();
-                HAS_TEXT.store(has, Ordering::Relaxed);
-                fit_lines(hwnd, edit);
-                // 从有字变空 / 从空变有字：提示字要出现或消失，整个重画
-                let _ = InvalidateRect(Some(edit), None, true);
+                sync_edit(hwnd, edit);
                 LRESULT(0)
             }
             WM_SETCURSOR => {

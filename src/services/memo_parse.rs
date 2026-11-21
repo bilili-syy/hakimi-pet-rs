@@ -757,30 +757,47 @@ const NO_KEY_LINE: &str = "这个时间哈基米没听懂喵……换个说法�
 
 static MEMO_AI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 本地规则没看懂：后台线程问 AI。是备忘就加上并发 Memo(Reply)，不是就当普通聊天发 ChatReply
-pub fn route_ai(tx: &EventSender, text: String, ctx: ChatCtx) {
+/// 本地规则没看懂：后台线程问 AI。是备忘就加上并发 Memo(ReplyId)，不是就当普通聊天发 ChatReplyId
+pub fn route_ai(tx: &EventSender, req_id: u64, text: String, ctx: ChatCtx) {
     let worker_tx = tx.clone();
     let spawned = std::thread::Builder::new().name("hakimi-memo".into()).spawn(move || {
         let _g = MEMO_AI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::services::ai::is_cancelled(req_id) {
+            return;
+        }
         let now = Now::get().dt;
         if crate::core::config::ai_key_missing(&crate::core::config::get()) {
-            worker_tx.send(AppEvent::Memo(MemoEv::Reply { ok: false, text: NO_KEY_LINE.into() }));
+            worker_tx.send(AppEvent::Memo(MemoEv::ReplyId { req_id, ok: false, text: NO_KEY_LINE.into() }));
             return;
         }
         match crate::services::ai::ask_once_reply(&ai_prompt(now), &text, 512) {
-            Ok(r) => match parse_ai(&r, now) {
-                Some(d) => {
-                    crate::core::memo::add(&d.text, d.time, d.repeat);
-                    worker_tx.send(AppEvent::Memo(MemoEv::Reply { ok: true, text: confirm_line(&d, now) }));
+            Ok(r) => {
+                if crate::services::ai::is_cancelled(req_id) {
+                    return;
                 }
-                None => worker_tx.send(AppEvent::ChatReply(crate::services::ai::chat_blocking(&text, &ctx))),
-            },
-            // 网络/超时/429/401 等传输或鉴权错误直接反馈，不再重打一次 chat_blocking
-            Err(reply) => worker_tx.send(AppEvent::ChatReply(reply)),
+                match parse_ai(&r, now) {
+                    Some(d) => {
+                        crate::core::memo::add(&d.text, d.time, d.repeat);
+                        worker_tx.send(AppEvent::Memo(MemoEv::ReplyId { req_id, ok: true, text: confirm_line(&d, now) }));
+                    }
+                    None => {
+                        let r = crate::services::ai::chat_blocking_id(req_id, &text, &ctx);
+                        if !crate::services::ai::is_cancelled(req_id) {
+                            worker_tx.send(AppEvent::ChatReplyId(req_id, r));
+                        }
+                    }
+                }
+            }
+            // 网络/超时/429/401/超上限等直接反馈，不再重打一次 chat_blocking
+            Err(reply) => {
+                if !crate::services::ai::is_cancelled(req_id) {
+                    worker_tx.send(AppEvent::ChatReplyId(req_id, reply));
+                }
+            }
         }
     });
     if spawned.is_err() {
-        tx.send(AppEvent::Memo(MemoEv::Reply { ok: false, text: NO_KEY_LINE.into() }));
+        tx.send(AppEvent::Memo(MemoEv::ReplyId { req_id, ok: false, text: NO_KEY_LINE.into() }));
     }
 }
 

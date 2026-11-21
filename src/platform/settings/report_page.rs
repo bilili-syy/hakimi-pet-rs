@@ -61,7 +61,8 @@ impl Dlg {
 pub(super) fn report_make() {
     let Some(picked) = with(|d| d.report_picked()) else { return };
     let msg = match super::super::report::make(picked) {
-        Ok(p) => format!("做好啦！已经复制到剪贴板，可以直接粘贴到聊天里。\n存在：{}", p.display()),
+        Ok((p, true)) => format!("做好啦！已经复制到剪贴板，可以直接粘贴到聊天里。\n存在：{}", p.display()),
+        Ok((p, false)) => format!("图已存好（剪贴板正忙没复制上，可直接发文件）：\n{}", p.display()),
         Err(e) => format!("没做成：{e}"),
     };
     with(|d| set_text(d.c(ID_REPORT_MSG), &msg));

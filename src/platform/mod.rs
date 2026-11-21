@@ -90,6 +90,26 @@ pub(crate) fn main_hwnd() -> Option<HWND> {
     (h != 0).then_some(HWND(h as *mut _))
 }
 
+/// 自身当前可见的顶层窗口（看屏吐槽截图时临时设 WDA_EXCLUDEFROMCAPTURE，免得把桌宠/聊天框/道具拍进图里）
+pub(crate) fn own_visible_windows() -> Vec<HWND> {
+    let mut out = Vec::new();
+    with(|s| {
+        for h in [
+            Some(s.hwnd),
+            s.chat.as_ref().map(|c| c.host),
+            s.toy.as_ref().map(|t| t.hwnd),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !h.is_invalid() && unsafe { IsWindowVisible(h).as_bool() } {
+                out.push(h);
+            }
+        }
+    });
+    out
+}
+
 pub(crate) fn current_scale() -> f32 {
     f32::from_bits(SCALE_BITS.load(Ordering::Relaxed))
 }
@@ -152,6 +172,11 @@ pub(crate) fn post_event(ev: AppEvent) {
 pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // ShellExecuteW / SHGetKnownFolderPath 推荐 UI 线程开启 STA COM
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED | windows::Win32::System::Com::COINIT_DISABLE_OLE1DDE,
+        );
     }
     // 只允许开一只哈基米；第二个实例通知第一个后直接退出（不构造 Handler）
     let Some(_mutex) = sys::single_instance(WM_APP_SECOND) else {
@@ -240,7 +265,7 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
                     if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
                         break 'pump;
                     }
-                    if !settings::dialog_message(&msg) {
+                    if !settings::dialog_message(&msg) && !roast::dialog_message(&msg) {
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
                     }
@@ -253,8 +278,8 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
                     if msg.message == WM_QUIT {
                         break 'pump;
                     }
-                    // 设置窗口：Tab 切换、回车保存、Esc 取消
-                    if settings::dialog_message(&msg) {
+                    // 设置窗口 / 看屏吐槽确认框：Tab 切换、回车确认、Esc 取消
+                    if settings::dialog_message(&msg) || roast::dialog_message(&msg) {
                         continue;
                     }
                     let _ = TranslateMessage(&msg);
@@ -263,7 +288,7 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
             }
         } else {
             while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-                if settings::dialog_message(&msg) {
+                if settings::dialog_message(&msg) || roast::dialog_message(&msg) {
                     continue;
                 }
                 let _ = TranslateMessage(&msg);
@@ -678,6 +703,7 @@ fn on_menu(a: MenuAction) {
         }
         // 原版：win.show(); win.focus(); 再通知渲染进程开聊天
         MenuAction::Chat => {
+            FS_HIDDEN.with(|c| c.set(false));
             with(|s| s.set_visible(true));
         }
         _ => {}
@@ -703,6 +729,7 @@ fn after(a: MenuAction) {
             }
         }
         MenuAction::CallToCenter => {
+            FS_HIDDEN.with(|c| c.set(false));
             with(|s| s.call_to_center());
             emit(AppEvent::Peek);
         }
@@ -748,6 +775,10 @@ fn after(a: MenuAction) {
                 s.set_watch(cfg.moyu.enabled, now);
                 s.set_scale(dpi * cfg.scale);
             });
+            apply_fs_autohide(sense::is_fullscreen());
+        }
+        MenuAction::ForgetChat => {
+            chat::clear_input_history();
         }
         MenuAction::Moyu(on) => {
             with(|s| s.set_watch(on, now));
@@ -758,12 +789,18 @@ fn after(a: MenuAction) {
         MenuAction::Report => settings::open(4),
         MenuAction::Roast => roast::trigger(),
         MenuAction::ExportChat => {
-            let r = report::export_chat();
-            match &r {
-                Ok(p) => report::reveal(p),
-                Err(e) => crate::core::log::log(&format!("chat export: {e}")),
-            }
-            post_event(AppEvent::ChatExported(r.is_ok()));
+            let res = match report::export_chat() {
+                Ok(p) => {
+                    report::reveal(&p);
+                    Ok(())
+                }
+                Err(report::ExportErr::Empty) => Err(true),
+                Err(report::ExportErr::Io(e)) => {
+                    crate::core::log::log(&format!("chat export: {e}"));
+                    Err(false)
+                }
+            };
+            post_event(AppEvent::ChatExported(res));
         }
         MenuAction::Mind(crate::types::MindAct::OpenFile) => open_path(&crate::core::memory::ensure_file()),
         // 清空记忆：推迟到 pump() 外弹模态确认框，避免在 PUMPING=true 期间阻塞事件队列
@@ -784,6 +821,11 @@ fn do_quit() {
         return;
     }
     with(|s| s.quitting = true);
+    if let Some(h) = main_hwnd() {
+        roast::shutdown(h);
+    } else {
+        roast::close_existing();
+    }
     settings::close_now();
     hrtimer::close();
     with_handler(|h| h.quit());
@@ -1452,13 +1494,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let Some(ev) = ipc::decode(c.dwData, data) else { return LRESULT(0) };
                 if EXT_THROTTLE.with(|t| t.borrow_mut().allow(&ev, now_ms())) {
                     crate::core::log::log(&format!("external {:?} from {:?}", ev.kind, ev.source));
-                    emit(AppEvent::External(ev));
-                    pump();
+                    // WM_COPYDATA 是跨进程同步 SendMessage，可能重入 SetWindowPos/ShowWindow：走异步队列避免 RefCell 冲突丢事件
+                    post_event(AppEvent::External(ev));
                 }
                 LRESULT(1)
             }
             WM_APP_SECOND => {
                 // 再双击一次程序 = 把她叫到屏幕中间
+                FS_HIDDEN.with(|c| c.set(false));
                 with(|s| s.call_to_center());
                 emit(AppEvent::SecondInstance);
                 pump();

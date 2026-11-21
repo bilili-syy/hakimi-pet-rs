@@ -24,13 +24,24 @@ fn short(s: &str) -> String {
 
 impl Behavior {
     fn ext_busy(&self) -> bool {
-        self.chatting || self.waiting || self.dragging || self.routine.is_some() || self.memo_ringing()
+        let fs_hidden = self.sense.quiet && (!self.io || crate::core::config::get().fullscreen_hide);
+        self.chatting
+            || self.waiting
+            || self.dragging
+            || self.routine.is_some()
+            || self.memo_ringing()
+            || self.play.game.is_some()
+            || self.play.food.is_some()
+            || self.cv.is_some()
+            || self.voice_playing.is_some()
+            || fs_hidden
             || matches!(self.state, St::Drag | St::Fall | St::Dance | St::Eat)
     }
 
     pub(super) fn on_external(&mut self, e: ExtEvent) {
         self.call(format!("external:{:?}:{}", e.kind, e.source));
-        if self.ext_busy() {
+        let bubble_active = self.bubble.as_ref().is_some_and(|b| b.hide_at.is_some_and(|h| h > self.now));
+        if self.ext_busy() || bubble_active {
             let p = &mut self.ext.pending;
             p.retain(|(x, _)| x.source != e.source);
             p.push((e, self.now));

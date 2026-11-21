@@ -69,7 +69,7 @@ pub const PRESETS: &[Preset] = &[
         base: "http://127.0.0.1:11434/v1",
         models: &["qwen3:8b", "qwen3:4b", "gemma3:4b", "llama3.2:3b"],
         key_url: "https://ollama.com/download",
-        note: "模型跑在你自己电脑上：装好 Ollama，命令行运行 ollama pull qwen3:8b。不要 Key、不走代理，聊天不出本机。点「测试连接」会列出已装的模型。",
+        note: "跑在自己电脑上：装好 Ollama 执行 ollama pull qwen3:8b。免 Key 免代理，点「测试连接」自动列出模型。",
     },
     Preset {
         name: "自定义（OpenAI 兼容接口）",

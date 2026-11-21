@@ -97,6 +97,7 @@ impl Behavior {
         if self.rub.flips.len() >= 6 && now > self.rub.cool && !matches!(self.state, St::Drag | St::Fall) {
             self.rub.flips.clear();
             self.rub.cool = now + 5000;
+            self.sense_touch();
             self.act(Act::Pat);
             if self.state == St::Sleep {
                 self.say(lines::PAT_SLEEPING, 2600);

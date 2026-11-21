@@ -207,6 +207,8 @@ pub enum MemoEv {
     Due(Vec<MemoHit>),
     /// 本地规则没看懂、交给 AI 后的结果：ok = 已经加进备忘录，text 是她要说的确认/提示
     Reply { ok: bool, text: String },
+    /// 带请求序号的 AI 备忘结果（用于 Esc 取消后精准过滤旧回复）
+    ReplyId { req_id: u64, ok: bool, text: String },
 }
 
 /// 「备忘录」子菜单的动作
@@ -251,13 +253,15 @@ pub enum AppEvent {
     ChatCancel,
     /// 等回复时在输入框按 Esc：不等了（输入框不关）
     ChatStop,
-    /// 导出聊天记录的结果（true = 存好了）
-    ChatExported(bool),
+    /// 导出聊天记录的结果：Ok(()) = 存好了；Err(true) = 没有记录；Err(false) = 写文件失败
+    ChatExported(Result<(), bool>),
     /// 看屏吐槽：主人确认后的截图（PNG，只在内存里）
     ScreenRoast(Vec<u8>),
     /// 看屏吐槽没法看（录屏中 / 模型不支持 / 没截到）：她说这一句
     RoastNote(String),
     ChatReply(ChatReply),
+    /// 带请求序号的聊天/看屏吐槽回复（用于 Esc 取消后精准丢弃过期回复）
+    ChatReplyId(u64, ChatReply),
     /// tts::speak 的结果；None = 不念（关了/没 key/失败/限流）
     Speech { token: u64, audio: Option<Audio> },
     /// audio 播放结束（正常放完或被 stop）

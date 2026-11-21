@@ -136,6 +136,11 @@ thread_local! {
 }
 
 /// tick 里调用
+/// 当前是否处于全屏状态（设置重读时同步全屏自动隐藏用）
+pub fn is_fullscreen() -> bool {
+    S.with(|s| s.try_borrow().is_ok_and(|g| g.fs))
+}
+
 pub fn maybe_poll(now: u64, pet: HWND, evs: &mut Vec<AppEvent>) {
     let due = S.with(|s| {
         let mut s = s.borrow_mut();

@@ -23,10 +23,19 @@ pub fn start(feed: LiveFeed) {
 fn run(feed: LiveFeed) {
     use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
     use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender};
-    use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
+
+    struct ComGuard(bool);
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
     }
+
+    // 先声明 _com，保证局部变量析构时 meter 先释放、最后再 CoUninitialize
+    let _com = ComGuard(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok());
     let open = || -> Option<IAudioMeterInformation> {
         unsafe {
             (|| -> windows::core::Result<IAudioMeterInformation> {
@@ -75,6 +84,12 @@ fn run(feed: LiveFeed) {
         }
         if now.duration_since(last_report) >= REPORT_EVERY {
             last_report = now;
+            // 插拔耳机/切默认声卡时旧设备不会报错而是持续回 0.0：安静期间顺手重取默认输出端点
+            if peak <= LOUD
+                && let Some(m) = open()
+            {
+                meter = m;
+            }
             let start = samples.front().map_or(now, |s| s.0);
             let info = (now.duration_since(start) >= MIN_SPAN).then(|| {
                 let pts: Vec<(f64, f32)> = samples.iter().map(|(t, v)| (t.duration_since(start).as_secs_f64() * 1000.0, *v)).collect();

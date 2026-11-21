@@ -307,8 +307,9 @@ pub fn dialog_message(msg: &MSG) -> bool {
     unsafe { IsDialogMessageW(HWND(h as *mut _), msg).as_bool() }
 }
 
-/// 打开设置窗口（已经开着就恢复并切到对应页提到前台）。page：0 AI / 1 语音 / 2 常规 / 3 备忘录
+/// 打开设置窗口（已经开着就恢复并切到对应页提到前台）。page：0 AI / 1 语音 / 2 常规 / 3 备忘录 / 4 周报
 pub fn open(page: u8) {
+    let max_page = (PAGES.len() - 1) as u8;
     let h = HWND_ATOMIC.load(Ordering::Relaxed);
     if h != 0 {
         let hwnd = HWND(h as *mut _);
@@ -316,7 +317,7 @@ pub fn open(page: u8) {
             if IsWindow(Some(hwnd)).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
                 let _ = SetForegroundWindow(hwnd);
-                with(|d| d.show_page(page.min(3)));
+                with(|d| d.show_page(page.min(max_page)));
                 return;
             }
         }
@@ -463,7 +464,7 @@ fn create_inner(page: u8) -> windows::core::Result<()> {
         }
         d.build();
         d.fill(&cfg, d.orig_autostart);
-        d.show_page(page.min(3));
+        d.show_page(page.min((PAGES.len() - 1) as u8));
         DLG.with(|c| *c.borrow_mut() = Some(d));
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
@@ -767,7 +768,7 @@ impl Dlg {
         let p = 3;
         self.title(p, "常规");
         self.button(p, ID_AUTOSTART, "开机自动启动", BS_AUTOCHECKBOX, [X0, 50.0, 130.0, 24.0]);
-        self.button(p, ID_FS_HIDE, "全屏（游戏/视频）时自动隐藏", BS_AUTOCHECKBOX, [X0 + 140.0, 50.0, 260.0, 24.0]);
+        self.button(p, ID_FS_HIDE, "全屏（游戏/视频）时自动隐藏", BS_AUTOCHECKBOX, [X0 + 140.0, 50.0, W - (X0 + 140.0) - 18.0, 24.0]);
         self.label(p, "哈基米大小", [X0, 82.0, LW, 26.0]);
         let sc = self.combo(p, ID_SCALE, false, [FX, 82.0, 170.0, 0.0]);
         combo_fill(sc, &SCALES.map(|x| x.1));
@@ -1081,6 +1082,8 @@ impl Dlg {
 /// 只比较设置窗口管的字段（菜单开关等别处改的不算「有改动」）
 fn differs(a: &Config, b: &Config) -> bool {
     let pick = |c: &Config| {
+        let voice = if c.tts.voice.trim().is_empty() { "冰糖" } else { c.tts.voice.trim() };
+        let sovits_url = if c.tts.sovits_url.trim().is_empty() { "http://127.0.0.1:9880" } else { c.tts.sovits_url.trim() };
         (
             c.provider.clone(),
             c.api_key.clone(),
@@ -1088,7 +1091,16 @@ fn differs(a: &Config, b: &Config) -> bool {
             c.model.clone(),
             c.proxy.clone(),
             c.user_name.clone(),
-            format!("{:?}{:?}{:?}{:?}{:?}{:?}{}", c.tts.enabled, c.tts.chat_voice_reply, c.tts.speak, c.tts.api_key, c.tts.mode, c.tts.voice, c.tts.style) + &c.tts.sovits_url,
+            (
+                c.tts.enabled,
+                c.tts.chat_voice_reply,
+                c.tts.speak.clone(),
+                c.tts.api_key.clone(),
+                c.tts.mode.clone(),
+                voice.to_string(),
+                c.tts.style.clone(),
+                sovits_url.to_string(),
+            ),
             ((c.tts.volume * 100.0).round() as i32, (c.scale * 100.0).round() as i32, crate::core::config::clamp_fps(c.fps)),
             (c.weather_city.clone(), c.birthday.clone()),
             (c.moyu.enabled, c.moyu.minutes, c.moyu.pomodoro_minutes, c.reminders.water, c.reminders.stand_up),
@@ -1122,7 +1134,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
     match (id, code) {
         (ID_LIST, LBN_SELCHANGE) => {
             with(|d| {
-                let i = send(d.c(ID_LIST), LB_GETCURSEL, 0, 0).clamp(0, 3) as u8;
+                let i = send(d.c(ID_LIST), LB_GETCURSEL, 0, 0).clamp(0, (PAGES.len() - 1) as isize) as u8;
                 d.show_page(i);
             });
         }
@@ -1359,13 +1371,13 @@ fn start_test() {
     let spawned = std::thread::Builder::new().name("hakimi-settings-test".into()).spawn(move || {
         let mut params = params;
         let mut extra = String::new();
-        // 本机 / 局域网的服务（Ollama 等）：先列出装了哪些模型，模型没填或填的没装就换成第一个
+        // 本机 / 局域网的服务（Ollama 等）：先列出装了哪些模型；若非 Ollama 本地服务未实现 /models 但已填模型名，则直接测聊天接口
         if params.provider == "openai" && crate::core::config::is_local_url(&params.base_url) {
             match crate::services::ai::list_models(&params) {
-                Ok(list) if list.is_empty() => {
+                Ok(list) if list.is_empty() && params.model.trim().is_empty() => {
                     return post_result(hwnd, ID_TEST_RESULT, tag, false, "✘ 服务开着，但还没有模型：命令行运行 ollama pull qwen3:8b 再试".into());
                 }
-                Ok(list) => {
+                Ok(list) if !list.is_empty() => {
                     let cur = params.model.trim().to_string();
                     let chosen = if list.contains(&cur) { cur } else { list[0].clone() };
                     params.model = chosen.clone();
@@ -1373,7 +1385,9 @@ fn start_test() {
                     extra = format!("\n已装 {} 个：{}{}", list.len(), shown.join("、"), if list.len() > 6 { "…" } else { "" });
                     *FOUND_MODELS.lock().unwrap_or_else(|e| e.into_inner()) = Some((tag, list, chosen));
                 }
-                Err(e) => return post_result(hwnd, ID_TEST_RESULT, tag, false, format!("✘ {e}")),
+                Ok(_) => {}
+                Err(e) if params.model.trim().is_empty() => return post_result(hwnd, ID_TEST_RESULT, tag, false, format!("✘ {e}")),
+                Err(_) => {}
             }
         }
         let (ok, text) = match crate::services::ai::test_connection(&params) {
@@ -1394,13 +1408,9 @@ fn start_play() {
         t.api_key = get_text(d.c(ID_TTS_KEY)).trim().to_string();
         t.mode = mode_at(combo_sel(d.c(ID_MODE))).into();
         let surl = get_text(d.c(ID_SOVITS_URL)).trim().to_string();
-        if !surl.is_empty() {
-            t.sovits_url = surl;
-        }
+        t.sovits_url = if surl.is_empty() { "http://127.0.0.1:9880".into() } else { surl };
         let v = get_text(d.c(ID_VOICE)).trim().to_string();
-        if !v.is_empty() {
-            t.voice = v;
-        }
+        t.voice = if v.is_empty() { "冰糖".into() } else { v };
         let s = get_text(d.c(ID_STYLE)).trim().to_string();
         if !s.is_empty() {
             t.style = s;

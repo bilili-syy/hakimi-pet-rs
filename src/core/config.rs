@@ -263,9 +263,14 @@ pub fn is_local_url(url: &str) -> bool {
     if host.is_empty() { return false; }
     let lower = host.to_ascii_lowercase();
     if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") { return true; }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+    let ip_str = host.split('%').next().unwrap_or(host);
+    let check_v4 = |v4: std::net::Ipv4Addr| v4.is_loopback() || v4.is_private() || v4.is_link_local();
+    match ip_str.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => check_v4(v4),
         Ok(std::net::IpAddr::V6(v6)) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return check_v4(v4);
+            }
             let seg = v6.segments()[0];
             v6.is_loopback() || (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
         }

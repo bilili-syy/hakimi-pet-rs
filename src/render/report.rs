@@ -84,19 +84,23 @@ pub fn build(week: &[Day], first_met: &str, level: &str, memories: Vec<String>) 
     let mut faces: std::collections::BTreeMap<String, u32> = Default::default();
     for d in week {
         for (k, v) in &d.faces {
-            *faces.entry(k.clone()).or_insert(0) += v;
+            if *v > 0 {
+                let e = faces.entry(k.clone()).or_insert(0);
+                *e = e.saturating_add(*v);
+            }
         }
     }
     // 次数最多的；一样多按名字排，结果稳定
     let top = faces.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+    let total_sec = week.iter().fold(0u64, |acc, d| acc.saturating_add(d.seconds));
     Report {
         range,
         met_days,
         level: level.to_string(),
         days: week.iter().map(|d| (weekday(&d.date).to_string(), d.seconds / 60)).collect(),
-        total_min: week.iter().map(|d| d.seconds).sum::<u64>() / 60,
-        feeds: week.iter().map(|d| d.feeds).sum(),
-        chats: week.iter().map(|d| d.chats).sum(),
+        total_min: total_sec / 60,
+        feeds: week.iter().fold(0u32, |acc, d| acc.saturating_add(d.feeds)),
+        chats: week.iter().fold(0u32, |acc, d| acc.saturating_add(d.chats)),
         top_face: top.as_ref().map(|(k, n)| (face_name(k).to_string(), *n)),
         top_face_key: top.map(|(k, _)| k).unwrap_or_else(|| "Happy".into()),
         memories,
@@ -170,7 +174,33 @@ const MEMO_LINES: usize = 3;
 const MEMO_PX: f32 = 22.0;
 
 /// 画成图。sprite = 她的立绘 PNG 字节（None = 不画）
+/// 按当前服装（含默认水手服 ""/"sailor" 分层与原装卫衣 "hoodie"）和表情拼出周报立绘
+pub fn resolve_sprite(costume: &str, face: crate::types::Face) -> Option<Pixmap> {
+    let c = crate::core::costume::normalize(costume);
+    let layers = super::sprites::layers_for(face, c, &[]);
+    let bytes = crate::assets::get(&layers.base).or_else(|| crate::assets::get("sprites/happy.png"))?;
+    let mut pm = Pixmap::decode_png(bytes).ok()?;
+    if layers.tail
+        && let Some(tb) = crate::assets::get(super::sprites::TAIL)
+        && let Ok(tp) = Pixmap::decode_png(tb)
+    {
+        pm.draw_pixmap(0, 0, tp.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    }
+    if layers.star
+        && let Some(sb) = crate::assets::get(super::sprites::STAR)
+        && let Ok(sp) = Pixmap::decode_png(sb)
+    {
+        pm.draw_pixmap(0, 0, sp.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    }
+    Some(pm)
+}
+
+#[cfg(test)]
 pub fn draw(r: &Report, sprite: Option<&[u8]>, te: &mut TextEngine) -> Option<Pixmap> {
+    draw_pixmap(r, sprite.and_then(|b| Pixmap::decode_png(b).ok()), te)
+}
+
+pub fn draw_pixmap(r: &Report, sprite: Option<Pixmap>, te: &mut TextEngine) -> Option<Pixmap> {
     let inner = W as f32 - PAD * 2.0;
     // 先排好记忆的行，才知道图多高
     // (是不是一条的第一行, 字)：第一行前面画「·」，后面的行和第一行的字对齐
@@ -201,9 +231,7 @@ pub fn draw(r: &Report, sprite: Option<&[u8]>, te: &mut TextEngine) -> Option<Pi
     pen.rect(0.0, 0.0, W as f32, 200.0, 0.0, BAND);
 
     // 立绘：右上角，脚踩在卡片上沿
-    if let Some(bytes) = sprite
-        && let Ok(src) = Pixmap::decode_png(bytes)
-    {
+    if let Some(src) = sprite {
         let sh = 236.0;
         let sw = sh * src.width() as f32 / src.height().max(1) as f32;
         if let Some(sp) = super::sprites::scale_pixmap(src, sw.round() as u32, sh as u32) {
@@ -359,5 +387,11 @@ mod tests {
         if let Ok(dir) = std::env::var("HAKIMI_REPORT_SAMPLE") {
             let _ = std::fs::write(std::path::Path::new(&dir).join("report-sample.png"), &png);
         }
+        // 默认水手服（"" / "sailor"）、原装卫衣（"hoodie"）和其他服装都能拿到对应表情立绘，且水手服与卫衣结果不同
+        let sailor_love = resolve_sprite("", crate::types::Face::Love).expect("sailor love");
+        let hoodie_love = resolve_sprite("hoodie", crate::types::Face::Love).expect("hoodie love");
+        let maid_starry = resolve_sprite("maid", crate::types::Face::Starry).expect("maid starry");
+        assert_ne!(sailor_love.data(), hoodie_love.data());
+        assert_ne!(sailor_love.data(), maid_starry.data());
     }
 }

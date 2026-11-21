@@ -104,7 +104,7 @@ pub fn day_number(date: &str) -> Option<i64> {
     let y: i64 = it.next()?.parse().ok()?;
     let m: i64 = it.next()?.parse().ok()?;
     let d: i64 = it.next()?.parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) { return None; }
+    if !(1..=99_999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) { return None; }
     // Howard Hinnant 的 days_from_civil
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
