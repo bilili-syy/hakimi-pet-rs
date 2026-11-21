@@ -77,6 +77,12 @@ pub const LANTERN: &[&str] = &["元宵节快乐喵！汤圆要芝麻馅的～"];
 pub const DRAGON_BOAT: &[&str] = &["端午安康喵！粽子是甜的还是咸的？"];
 pub const QIXI: &[&str] = &["七夕快乐喵～今天也有哈基米陪你"];
 pub const MID_AUTUMN: &[&str] = &["中秋快乐喵！月亮好圆，像一块大月饼～"];
+/// 第一次见面（没有存档）依次说
+pub const INTRO: &[&str] = &[
+    "初次见面！我是哈基米，以后就住在你的桌面上啦喵～",
+    "戳戳我、摸摸头都可以，右键我还能喂食、换装、开番茄钟哦",
+    "想和我聊天的话，右键我点「设置」，填一下 AI 的 Key 喵",
+];
 pub const WELCOME: &[&str] = &["你回来啦！哈基米等你好久了喵！", "欢迎回来～刚才去哪儿了喵？", "终于回来了！哈基米一个人好无聊"];
 
 /// 固定台词按「最可能在什么心情下说」预合成（PREWARM_MOOD；没写的是 calm）
@@ -141,6 +147,7 @@ pub const PREWARM: &[(&[&str], VoiceMood)] = &[
     (STARRY, VoiceMood::Happy),
     (PUFF, VoiceMood::Mad),
     (WELCOME, VoiceMood::Happy),
+    (INTRO, VoiceMood::Happy),
     (ALONE, VoiceMood::Calm),
     (TYPING, VoiceMood::Happy),
     (POUNCE, VoiceMood::Happy),
