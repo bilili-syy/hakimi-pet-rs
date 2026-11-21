@@ -324,6 +324,8 @@ struct Job {
 
 struct State {
     next_seq: u64,
+    /// 最近一次「打断式」说话/停止的序号；正在流式接收的请求若 seq <= abort_seq 则立刻掐断
+    abort_seq: u64,
     /// 还没回复的前台请求 (seq, token, tx)；保证每个 token 恰好回一次
     pending: Vec<(u64, u64, EventSender)>,
     /// 等着发的前台请求（只留最新一条）
@@ -338,6 +340,7 @@ struct State {
 
 static STATE: Mutex<State> = Mutex::new(State {
     next_seq: 0,
+    abort_seq: 0,
     pending: Vec::new(),
     fg: None,
     cooldown_until: None,
@@ -365,16 +368,42 @@ fn is_pending(seq: u64) -> bool { state().pending.iter().any(|p| p.0 == seq) }
 
 fn in_cooldown(st: &State) -> bool { st.cooldown_until.is_some_and(|t| Instant::now() < t) }
 
+/// 主动取消当前正在排队或流式接收的前台语音请求（stop_voice / 关掉语音时调）
+pub fn cancel_active() {
+    let old = {
+        let mut st = state();
+        st.next_seq += 1;
+        st.abort_seq = st.next_seq;
+        st.fg = None;
+        std::mem::take(&mut st.pending)
+    };
+    for (_, tok, otx) in old {
+        otx.send(AppEvent::Speech { token: tok, audio: None });
+    }
+}
+
 /// 合成/取缓存，完成后 tx.send(AppEvent::Speech { token, audio })。
 /// 根据 config.tts 判断：enabled=false / speak=off / speak=chat 且 kind=Line → audio=None。
 /// 新请求来了要掐掉旧的在途请求（旧的回 None）。
 pub fn speak(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMood>, kind: SpeakKind) {
+    speak_inner(tx, token, text, mood, kind, false);
+}
+
+/// 语音回答（ChatVoice）在上一句正在播时预合成下一句：排进 fg 队列，但不掐断正在流式收尾的上一句
+pub fn speak_prefetch(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMood>, kind: SpeakKind) {
+    speak_inner(tx, token, text, mood, kind, true);
+}
+
+fn speak_inner(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMood>, kind: SpeakKind, prefetch: bool) {
     let t = crate::core::config::get().tts;
     lat::begin(token);
     let (seq, old) = {
         let mut st = state();
         st.next_seq += 1;
         let seq = st.next_seq;
+        if !prefetch {
+            st.abort_seq = seq;
+        }
         let old = std::mem::take(&mut st.pending);
         st.fg = None;
         st.pending.push((seq, token, tx.clone()));
@@ -654,7 +683,7 @@ fn request_stream(job: &Job, attempt: u32) -> Result<Option<Vec<u8>>, Fail> {
     }
     let out = drain_sse_stream(
         std::io::BufReader::new(reader),
-        || state().next_seq != job.seq,
+        || state().abort_seq >= job.seq,
         || is_pending(job.seq),
         |handle, len| {
             lat::mark(job.token, &format!("first audio chunk ({len} B)"));
@@ -956,8 +985,21 @@ mod tests {
     fn bundled_lines_present() {
         let t = TtsConfig::default();
         let lines: Value = serde_json::from_slice(crate::assets::get("voice/lines.json").unwrap()).unwrap();
-        let hits = lines.as_object().unwrap().keys().filter(|k| bundled(&t, &clean(k)).is_some()).count();
-        assert!(hits >= 87, "only {hits} bundled lines");
+        let obj = lines.as_object().unwrap();
+        let hits = obj.keys().filter(|k| bundled(&t, &clean(k)).is_some()).count();
+        assert_eq!(hits, obj.len(), "every lines.json entry must have a matching .ogg");
+        assert!(hits >= 370, "only {hits} bundled lines");
+        // 抽样校验新增台词也能正常解码
+        for sample in [
+            "诶嘿～被哈基米电到了没有喵？",
+            "吸溜……突然好想吃烤小鱼干喵",
+            "好耶——！给主人举爪爪打 call 喵！",
+            "小鱼干！哈基米来啦——",
+            "逗猫棒！哈基米要抓住它喵！",
+        ] {
+            let bytes = bundled(&t, &clean(sample)).expect(sample);
+            assert!(super::super::audio::can_decode(bytes), "cannot decode {sample}");
+        }
         let mut preset = t.clone();
         preset.mode = "preset".into();
         assert!(bundled(&preset, "喵？找哈基米有事吗～").is_none());

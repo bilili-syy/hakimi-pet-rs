@@ -101,8 +101,8 @@ pub fn reveal(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer.exe").raw_arg(arg).spawn();
 }
 
-/// 画好、存盘、复制。成功返回 (文件路径, 是否已成功复制到剪贴板)
-pub fn make(memories: Vec<String>) -> Result<(PathBuf, bool), String> {
+/// 画出周报的原始 Pixmap（供存盘和设置页实时缩略图共用）
+pub fn render_pixmap(memories: Vec<String>) -> Option<(report::Report, tiny_skia::Pixmap)> {
     let r = current(memories);
     let costume = crate::core::config::get().costume;
     let face = crate::services::emotion::Emotion::ALL
@@ -112,7 +112,13 @@ pub fn make(memories: Vec<String>) -> Result<(PathBuf, bool), String> {
         .unwrap_or(crate::types::Face::Happy);
     let sprite = report::resolve_sprite(&costume, face);
     let mut te = crate::render::text::TextEngine::new();
-    let pm = report::draw_pixmap(&r, sprite, &mut te).ok_or("画图失败")?;
+    let pm = report::draw_pixmap(&r, sprite, &mut te)?;
+    Some((r, pm))
+}
+
+/// 画好、存盘、复制。成功返回 (文件路径, 是否已成功复制到剪贴板)
+pub fn make(memories: Vec<String>) -> Result<(PathBuf, bool), String> {
+    let (r, pm) = render_pixmap(memories).ok_or("画图失败")?;
     let png = pm.encode_png().map_err(|e| format!("编码 PNG 失败：{e}"))?;
     let d = dir();
     std::fs::create_dir_all(&d).map_err(|e| format!("建文件夹失败：{e}"))?;
@@ -145,11 +151,15 @@ pub fn copy_to_clipboard(pm: &tiny_skia::Pixmap) -> Result<(), String> {
         }
         std::ptr::copy_nonoverlapping(dib.as_ptr(), p, dib.len());
         let _ = GlobalUnlock(h);
-        if OpenClipboard(None).is_err() {
+        if OpenClipboard(super::main_hwnd()).is_err() {
             let _ = GlobalFree(Some(h));
             return Err("OpenClipboard".into());
         }
-        let _ = EmptyClipboard();
+        if EmptyClipboard().is_err() {
+            let _ = CloseClipboard();
+            let _ = GlobalFree(Some(h));
+            return Err("EmptyClipboard".into());
+        }
         let r = SetClipboardData(CF_DIB, Some(HANDLE(h.0)));
         let _ = CloseClipboard();
         if r.is_err() {
@@ -158,6 +168,43 @@ pub fn copy_to_clipboard(pm: &tiny_skia::Pixmap) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// 复制纯文本到剪贴板（CF_UNICODETEXT）
+pub fn copy_text(s: &str) -> bool {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    let normalized = s.replace("\r\n", "\n").replace('\n', "\r\n");
+    let wide: Vec<u16> = normalized.encode_utf16().chain(std::iter::once(0)).collect();
+    let byte_len = wide.len() * 2;
+    unsafe {
+        let Ok(h): Result<HGLOBAL, _> = GlobalAlloc(GMEM_MOVEABLE, byte_len) else { return false };
+        let p = GlobalLock(h) as *mut u8;
+        if p.is_null() {
+            let _ = GlobalFree(Some(h));
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, p, byte_len);
+        let _ = GlobalUnlock(h);
+        if OpenClipboard(super::main_hwnd()).is_err() {
+            let _ = GlobalFree(Some(h));
+            return false;
+        }
+        if EmptyClipboard().is_err() {
+            let _ = CloseClipboard();
+            let _ = GlobalFree(Some(h));
+            return false;
+        }
+        let r = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0)));
+        let _ = CloseClipboard();
+        if r.is_err() {
+            let _ = GlobalFree(Some(h));
+            return false;
+        }
+    }
+    true
 }
 
 /// BITMAPINFOHEADER + 自下而上的 BGRA（图是不透明底，直接去预乘也安全）

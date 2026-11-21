@@ -36,6 +36,7 @@ pub enum St {
     Idle, Walk, Sit, Sleep, Eat, Happy, Hungry, Think, Drag, Fall,
     Shy, Dizzy, Surprised, Cry, Yawn, Love, Hiss, Stare, Dance, Honey,
     Pout, Smug, Confused, Scared, Starry, Puff,
+    Wink, Drool, Sweat, Cheer, Sleepy,
 }
 
 impl St {
@@ -66,17 +67,22 @@ impl St {
             St::Scared => Face::Scared,
             St::Starry => Face::Starry,
             St::Puff => Face::Puff,
+            St::Wink => Face::Wink,
+            St::Drool => Face::Drool,
+            St::Sweat => Face::Sweat,
+            St::Cheer => Face::Cheer,
+            St::Sleepy => Face::Sleepy,
         }
     }
     /// VOICE_MOOD
     fn voice_mood(self) -> Option<VoiceMood> {
         Some(match self {
-            St::Shy | St::Love | St::Dance | St::Honey | St::Happy | St::Eat | St::Smug | St::Starry => VoiceMood::Happy,
+            St::Shy | St::Love | St::Dance | St::Honey | St::Happy | St::Eat | St::Smug | St::Starry | St::Wink | St::Cheer => VoiceMood::Happy,
             St::Cry | St::Dizzy | St::Sit | St::Pout | St::Scared => VoiceMood::Sad,
-            St::Yawn | St::Sleep => VoiceMood::Sleepy,
+            St::Yawn | St::Sleep | St::Sleepy => VoiceMood::Sleepy,
             St::Hiss | St::Drag | St::Puff => VoiceMood::Mad,
-            St::Surprised | St::Stare => VoiceMood::Calm,
-            St::Hungry => VoiceMood::Hungry,
+            St::Surprised | St::Stare | St::Sweat => VoiceMood::Calm,
+            St::Hungry | St::Drool => VoiceMood::Hungry,
             St::Think | St::Confused => VoiceMood::Think,
             _ => return None,
         })
@@ -152,6 +158,22 @@ struct Bubble {
     dur: u64,
     /// 这条台词对应的语音请求
     token: u64,
+    /// 用户用滚轮手动翻到的位置（0..=1），None = 自动慢滚
+    manual_scroll: Option<f32>,
+}
+
+impl Bubble {
+    fn auto_scroll(&self, now: u64) -> f32 {
+        let span = self.dur.saturating_sub(3000).max(1000) as f32;
+        ((now.saturating_sub(self.shown) as f32 - 1500.0) / span).clamp(0.0, 1.0)
+    }
+
+    fn scroll_at(&self, now: u64, overflow: bool) -> f32 {
+        if !overflow {
+            return 0.0;
+        }
+        self.manual_scroll.unwrap_or_else(|| self.auto_scroll(now))
+    }
 }
 
 struct Down { sx: i32, sy: i32, lx: Option<i32>, dir: i32, flips: Vec<u64> }
@@ -245,6 +267,9 @@ pub struct Behavior {
 
     bubble: Option<Bubble>,
     bubble_fade: Fade,
+    bubble_hover: bool,
+    bubble_top: f32,
+    last_bubble_text: String,
     status: Option<StatusView>,
     status_hide_at: Option<u64>,
     status_fade: Fade,
@@ -255,6 +280,7 @@ pub struct Behavior {
     land_shaken: bool,
     rub: Rub,
     pokes: Vec<u64>,
+    angry_until: u64,
     last_beg: u64,
 
     chatting: bool,
@@ -354,6 +380,9 @@ impl Behavior {
             food_seen: None,
             bubble: None,
             bubble_fade: Fade::OFF,
+            bubble_hover: false,
+            bubble_top: 0.0,
+            last_bubble_text: String::new(),
             status: None,
             status_hide_at: None,
             status_fade: Fade::OFF,
@@ -363,6 +392,7 @@ impl Behavior {
             land_shaken: false,
             rub: Rub::default(),
             pokes: Vec::new(),
+            angry_until: 0,
             last_beg: 0,
             chatting: false,
             fake_chat_text: false,
@@ -400,6 +430,11 @@ impl Behavior {
 
     pub fn set_scale(&mut self, s: f32) { if s.is_finite() && s > 0.1 { self.scale = s; } }
     pub fn set_ui(&mut self, ui: UiInfo) { self.ui = ui; }
+    pub fn set_bubble_top(&mut self, top: f32) {
+        let top = if top.is_finite() && top > 0.0 { top } else { 0.0 };
+        self.bubble_top = top;
+        self.scene.bubble_top = top;
+    }
 
     // ============================================================ Handler 入口
     pub fn event(&mut self, ev: AppEvent, out: &mut Vec<WinCmd>) {
@@ -447,7 +482,10 @@ impl Behavior {
             AppEvent::RoastNote(t) => {
                 if !self.memo_ringing() {
                     self.play(Shot::Shake);
+                    self.fx(FxKind::Sweat, 1);
+                    self.set_state(St::Sweat, None);
                     self.say_opts(&t, 3200, false, SpeakKind::Line);
+                    self.hold_timer(2400, StateAct::Set(St::Idle, Some((5000.0, 9000.0))));
                 }
             }
             AppEvent::ChatExported(res) => {
@@ -508,15 +546,28 @@ impl Behavior {
             AppEvent::Moyu(m) => self.on_moyu(m),
             AppEvent::Landed { big } => self.on_landed(big),
             AppEvent::WalkDone { hit_edge } => {
+                let pouncing = std::mem::take(&mut self.sense.pouncing);
                 if self.state == St::Walk {
-                    if hit_edge { self.say(&pick(lines::EDGE), 2000); }
-                    self.set_state(St::Idle, Some((4000.0, 9000.0)));
+                    if pouncing {
+                        self.play(Shot::Bounce);
+                        self.fx(FxKind::Spark, 5);
+                        self.react(St::Starry, 1600, None);
+                    } else {
+                        if hit_edge { self.say(&pick(lines::EDGE), 2000); }
+                        self.set_state(St::Idle, Some((4000.0, 9000.0)));
+                    }
                 }
             }
-            AppEvent::Peek => self.react(St::Happy, 1500, Some(pick(lines::PEEK))),
+            AppEvent::Peek => {
+                self.reset_aerial_flags();
+                let line = (!self.memo_ringing()).then(|| pick(lines::PEEK));
+                self.react(St::Happy, 1500, line);
+            }
             AppEvent::SecondInstance => {
+                self.reset_aerial_flags();
                 self.cmds.push(WinCmd::Show);
-                self.react(St::Happy, 1500, Some(pick(lines::PEEK)));
+                let line = (!self.memo_ringing()).then(|| pick(lines::PEEK));
+                self.react(St::Happy, 1500, line);
             }
             AppEvent::Cursor { x, y } => self.on_cursor(x, y),
             AppEvent::Weather(w) => self.on_weather(w),
@@ -595,8 +646,18 @@ impl Behavior {
                 4 => self.walk_tick(now),
                 5 => self.on_dance_beat(),
                 6 => {
-                    if let Some(b) = &mut self.bubble { b.hide_at = None; }
-                    self.bubble_fade.set(false, due);
+                    // 光标正指着气泡读字时暂停消失（用最新光标坐标兜底校验，防透明区未发 Move 导致卡住），移开后再留一会儿
+                    let over = self.bubble_hover
+                        && self.ui.bubble.is_some_and(|r| {
+                            self.play.cursor.is_none_or(|(cx, cy, _)| r.contains(cx, cy))
+                        });
+                    if over && !self.memo_ringing() {
+                        if let Some(b) = &mut self.bubble { b.hide_at = Some(now + 1800); }
+                    } else {
+                        self.bubble_hover = false;
+                        if let Some(b) = &mut self.bubble { b.hide_at = None; }
+                        self.bubble_fade.set(false, due);
+                    }
                 }
                 7 => {
                     self.status_hide_at = None;
@@ -634,7 +695,7 @@ impl Behavior {
             || self.bubble_fade.moving(now)
             || self.status_fade.moving(now)
             || now < self.flip_t + 200
-            || (self.ui.bubble_overflow && self.bubble_fade.on)
+            || (self.ui.bubble_overflow && self.bubble_fade.on && self.bubble.as_ref().is_some_and(|b| b.manual_scroll.is_none()))
     }
 
     fn next_interval(&self) -> u32 {
@@ -658,7 +719,11 @@ impl Behavior {
             StateAct::Set(s, hold) => self.set_state(s, hold),
             StateAct::DanceEnd => self.end_dance(),
             StateAct::ChatIdle => {
-                if self.chatting { self.set_state(St::Idle, None) } else { self.set_state(St::Idle, Some((5000.0, 9000.0))) }
+                if self.chatting {
+                    self.set_state(St::Idle, self.io.then_some((25_000.0, 35_000.0)));
+                } else {
+                    self.set_state(St::Idle, Some((5000.0, 9000.0)));
+                }
             }
         }
     }
@@ -796,6 +861,7 @@ impl Behavior {
     fn set_state(&mut self, next: St, hold: Option<(f64, f64)>) {
         if self.io && next != self.state { crate::core::log::trace(&format!("state {:?} -> {next:?}", self.state)); }
         if next != St::Dance { self.cancel_routine(); }
+        if next != St::Walk { self.sense.pouncing = false; }
         if self.state == St::Walk && next != St::Walk { self.cmds.push(WinCmd::WalkStop); }
         let prev = self.state;
         self.state = next;
@@ -852,6 +918,28 @@ impl Behavior {
     fn is_night() -> bool { local_hour() < 6 }
 
     // ============================================================ 气泡 & 语音
+    pub(super) fn show_bubble(&mut self, text: String, hide_at: Option<u64>, dur: u64, token: u64, remember: bool) {
+        if remember && !text.trim().is_empty() {
+            self.last_bubble_text = text.clone();
+            if self.io {
+                crate::platform::set_has_copyable_bubble(true);
+            }
+        }
+        self.bubble = Some(Bubble { text, shown: self.now, hide_at, dur, token, manual_scroll: None });
+        self.bubble_fade.set(true, self.now);
+    }
+
+    pub(super) fn dismiss_bubble(&mut self) {
+        self.bubble_hover = false;
+        if let Some(b) = &mut self.bubble {
+            b.hide_at = None;
+        }
+        self.bubble_fade.set(false, self.now);
+        if !self.memo_voice_busy(0) {
+            self.stop_voice();
+        }
+    }
+
     fn say(&mut self, text: &str, ms: u64) { self.say_opts(text, ms, true, SpeakKind::Line); }
 
     fn say_opts(&mut self, text: &str, ms: u64, voice: bool, kind: SpeakKind) {
@@ -860,8 +948,7 @@ impl Behavior {
         let over = if kind == SpeakKind::Line && self.io { skin::line_override(text) } else { None };
         let text = over.as_deref().unwrap_or(text);
         let token = if voice { self.next_token() } else { 0 };
-        self.bubble = Some(Bubble { text: text.to_string(), shown: self.now, hide_at: Some(self.now + ms), dur: ms, token });
-        self.bubble_fade.set(true, self.now);
+        self.show_bubble(text.to_string(), Some(self.now + ms), ms, token, true);
         if voice {
             self.voice(text, kind, token);
         } else if !self.memo_voice_busy(0) {
@@ -871,8 +958,7 @@ impl Behavior {
 
     /// 只换气泡、不出声，也不掐正在念的台词（小游戏里抓到/扑空的短句，别把开场白打断）
     fn say_bubble(&mut self, text: &str, ms: u64) {
-        self.bubble = Some(Bubble { text: text.to_string(), shown: self.now, hide_at: Some(self.now + ms), dur: ms, token: 0 });
-        self.bubble_fade.set(true, self.now);
+        self.show_bubble(text.to_string(), Some(self.now + ms), ms, 0, true);
     }
 
     /// 气泡先出，声音随后到；新台词会打断旧的
@@ -887,11 +973,49 @@ impl Behavior {
     }
 
     fn stop_voice(&mut self) {
+        if self.voice_req != 0 && self.io {
+            crate::services::tts::cancel_active();
+        }
         self.voice_req = 0;
         if let Some(tok) = self.voice_playing.take() {
             self.call("stop".into());
             if self.io { crate::services::audio::stop_token(tok); }
+            self.emotion_audio_done(tok);
+            let ringing = self.memo_ringing();
+            if let Some(b) = &mut self.bubble
+                && b.token == tok
+                && self.bubble_fade.on
+                && !ringing
+            {
+                b.hide_at = Some(self.now + 1500);
+            }
         }
+    }
+
+    pub(super) fn reset_aerial_flags(&mut self) {
+        self.play.perch = None;
+        self.play.climbing = None;
+        self.play.jumping_down = false;
+        self.sense.pounce_after_land = false;
+        self.dragging = false;
+        self.dragging_cls = false;
+        self.land_shaken = false;
+        self.shaken = false;
+    }
+
+    pub(super) fn cleanup_for_hide(&mut self) {
+        self.cancel_routine();
+        if self.state == St::Dance {
+            self.end_dance();
+        }
+        if !self.memo_voice_busy(0) {
+            self.stop_voice();
+        }
+        self.cv_disable_tts();
+        if self.play.game.take().is_some() || self.play.food.take().is_some() {
+            self.cmds.push(WinCmd::Toy(crate::types::ToyCmd::Remove));
+        }
+        self.sense.pounce_after_land = false;
     }
 
     fn voice_mood(&self) -> VoiceMood {
@@ -924,6 +1048,10 @@ impl Behavior {
     /// 空闲时自己决定下一步做什么，受数值影响
     fn think(&mut self) {
         if matches!(self.state, St::Drag | St::Fall) || self.chat_busy() { return; }
+        if self.chatting && self.io && crate::platform::chat_is_focused() {
+            self.hold_timer(25_000, StateAct::Think);
+            return;
+        }
         // 备忘提醒还响着：原地等你点她，不换动作不说闲话（不然 60 秒的提醒气泡十几秒就被盖掉）
         if self.memo_ringing() { return self.set_state(St::Idle, Some((5000.0, 9000.0))); }
         self.yield_chat();
@@ -943,12 +1071,44 @@ impl Behavior {
         }
         // 彩蛋：心情好时偶尔追头顶的小星星，原地转圈
         if m == MoodLevel::Great && self.state == St::Idle && r < 0.08 { return self.go_chase(); }
-        // 小动作：伸懒腰、哼哈基米之歌、盯着你看
-        if self.state == St::Idle && r < 0.2 {
+        // 丰富的待机微表情与小动作：犯困点头、伸懒腰、馋嘴流口水、俏皮眨眼、举爪打气、得意叉腰、歪头好奇、哼歌、盯——
+        if self.state == St::Idle && r < 0.34 {
             let f = fastrand::f64();
-            if f < 0.3 && energy < 70.0 { self.say(&pick(lines::YAWN), 1800); return self.react(St::Yawn, 1800, None); }
-            if f < 0.55 && m == MoodLevel::Great { return self.go_dance(4200, Some(pick(lines::DANCE))); }
-            if f < 0.75 { self.say(&pick(lines::STARE), 2200); return self.react(St::Stare, 2400, None); }
+            let hunger = self.stats.data.hunger;
+            if f < 0.16 && (energy < 55.0 || Self::is_night()) {
+                self.say(&pick(lines::SLEEPY_NOD), 2200);
+                return self.react(St::Sleepy, 2400, None);
+            }
+            if f < 0.28 && energy < 75.0 {
+                self.say(&pick(lines::YAWN), 1800);
+                return self.react(St::Yawn, 1800, None);
+            }
+            if f < 0.42 && hunger < 68.0 {
+                self.fx(FxKind::Spark, 3);
+                self.say(&pick(lines::DROOL), 2400);
+                return self.react(St::Drool, 2400, None);
+            }
+            if f < 0.56 {
+                self.fx(FxKind::Heart, 2);
+                self.say(&pick(lines::WINK), 2200);
+                return self.react(St::Wink, 2000, None);
+            }
+            if f < 0.68 && m == MoodLevel::Great {
+                self.play(Shot::Jump);
+                self.fx(FxKind::Spark, 6);
+                self.say(&pick(lines::CHEER), 2200);
+                return self.react(St::Cheer, 2200, None);
+            }
+            if f < 0.78 && m == MoodLevel::Great {
+                return self.go_dance(4200, Some(pick(lines::DANCE)));
+            }
+            if f < 0.89 {
+                self.fx(FxKind::Question, 1);
+                self.say(&pick(lines::IDLE_CURIOUS), 2200);
+                return self.react(St::Confused, 2200, None);
+            }
+            self.say(&pick(lines::STARE), 2200);
+            return self.react(St::Stare, 2400, None);
         }
         let walk_chance = match m { MoodLevel::Great => 0.55, MoodLevel::Sad => 0.2, _ => 0.45 };
         if r < walk_chance { return self.go_walk(); }

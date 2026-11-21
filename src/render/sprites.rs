@@ -31,12 +31,12 @@ const COSTUME_FACES: [&str; 8] = ["idle", "happy", "drag", "sit", "sleep", "eat"
 
 fn costume_alias(stem: &str) -> &str {
     match stem {
-        "shy" | "love" | "dance" | "smug" | "starry" => "happy",
+        "shy" | "love" | "dance" | "smug" | "starry" | "wink" | "cheer" => "happy",
         "honey" => "eat",
         "dizzy" | "surprised" | "hiss" | "scared" => "drag",
-        "cry" | "pout" => "hungry",
-        "stare" | "confused" | "puff" => "think",
-        "yawn" => "idle",
+        "cry" | "pout" | "drool" => "hungry",
+        "stare" | "confused" | "puff" | "sweat" => "think",
+        "yawn" | "sleepy" => "idle",
         s => s,
     }
 }
@@ -53,19 +53,35 @@ pub fn costume_src(costume: &str, face: Face) -> String {
 pub fn outfit_offset(face: Face) -> Option<(f32, f32)> {
     match face {
         Face::Sit => Some((0.0, 17.0)),
-        Face::Sleep | Face::Yawn | Face::Dizzy | Face::Hiss | Face::Dance => None,
+        Face::Sleep | Face::Sleepy | Face::Cry | Face::Yawn | Face::Dizzy | Face::Hiss | Face::Dance => None,
         _ => Some((0.0, 0.0)),
     }
 }
 
-/// 默认水手服：和原装卫衣一样走分层（尾巴/星星单独动），其余表情按 costume_alias 退到 8 张基本姿势
+/// 默认水手服：和原装卫衣一样走分层（尾巴/星星单独动），有独立表情图时直接用，其余按 costume_alias 退回基本姿势
 const SAILOR_FACES: [&str; 4] = ["drag", "sit", "sleep", "think"];
+
+pub fn sailor_has_direct(stem: &str) -> bool {
+    let mut buf = [0u8; 48];
+    let pfx = b"outfits/sailor/";
+    let sfx = b".png";
+    let n = pfx.len() + stem.len() + sfx.len();
+    if n > buf.len() { return false; }
+    buf[..pfx.len()].copy_from_slice(pfx);
+    buf[pfx.len()..pfx.len() + stem.len()].copy_from_slice(stem.as_bytes());
+    buf[pfx.len() + stem.len()..n].copy_from_slice(sfx);
+    std::str::from_utf8(&buf[..n]).is_ok_and(|p| crate::assets::get(p).is_some())
+}
 
 fn sailor_layers(face: Face) -> (String, Option<(bool, bool)>) {
     if let Some(l) = layered(face) {
         return (format!("outfits/sailor/layered/{}.png", face.stem()), Some(l));
     }
-    let n = costume_alias(face.stem());
+    let stem = face.stem();
+    if sailor_has_direct(stem) {
+        return (format!("outfits/sailor/{stem}.png"), None);
+    }
+    let n = costume_alias(stem);
     if SAILOR_FACES.contains(&n) {
         return (format!("outfits/sailor/{n}.png"), None);
     }
@@ -249,6 +265,8 @@ mod tests {
         assert_eq!(layers_for(Face::Walk1, "jk", &[]).base, "outfits/jk/idle.png");
         assert_eq!(layers_for(Face::Sit, "", &["glasses".into()]).outfit_offset, Some((0.0, 17.0)));
         assert_eq!(layers_for(Face::Sleep, "", &["glasses".into()]).outfit_offset, None);
+        assert_eq!(layers_for(Face::Sleepy, "", &["glasses".into()]).outfit_offset, None);
+        assert_eq!(layers_for(Face::Cry, "", &["glasses".into()]).outfit_offset, None);
         // 戴圣诞帽时藏星星
         assert!(!layers_for(Face::Idle, "", &["santa".into()]).star);
     }
@@ -277,18 +295,19 @@ mod tests {
         assert_eq!(layers_for(Face::Walk2, "sailor", &[]).base, "outfits/sailor/layered/walk2.png");
         let l = layers_for(Face::Happy, "sailor", &[]);
         assert!(l.star && !l.tail);
-        // 别名：love → happy（分层），stare → think，yawn → idle（分层）
-        let l = layers_for(Face::Love, "sailor", &[]);
+        // 已有独立表情立绘则直接用；没有的（如 dance / honey）走分层别名
+        let l = layers_for(Face::Dance, "sailor", &[]);
         assert_eq!(l.base, "outfits/sailor/layered/happy.png");
         assert!(l.star && !l.tail);
-        assert_eq!(layers_for(Face::Stare, "sailor", &[]).base, "outfits/sailor/think.png");
+        assert_eq!(layers_for(Face::Honey, "sailor", &[]).base, "outfits/sailor/layered/eat.png");
         assert_eq!(layers_for(Face::Sleep, "sailor", &[]).base, "outfits/sailor/sleep.png");
-        assert!(layers_for(Face::Yawn, "sailor", &[]).tail);
         assert!(!layers_for(Face::Idle, "sailor", &["santa".into()]).star);
         // 原装卫衣："" 和 "hoodie" 一样
         assert_eq!(layers_for(Face::Idle, "hoodie", &[]), layers_for(Face::Idle, "", &[]));
         assert_eq!(layers_for(Face::Shy, "hoodie", &[]).base, "sprites/shy.png");
+        assert_eq!(layers_for(Face::Wink, "hoodie", &[]).base, "sprites/wink.png");
         assert_eq!(layers_for(Face::Cry, "swim", &[]).base, "outfits/swim/hungry.png");
+        assert_eq!(layers_for(Face::Cheer, "maid", &[]).base, "outfits/maid/happy.png");
     }
 
     #[test]

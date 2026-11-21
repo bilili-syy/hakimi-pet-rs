@@ -169,27 +169,16 @@ pub fn clear_history() {
 
 // ------------------------------------------------------------------ 看屏吐槽
 
-/// 当前模型能不能看图（猜的：Gemini 全系能看；OpenAI 兼容接口看模型名）
+/// 当前模型能不能尝试看图：OpenAI 兼容中转/新模型（如 deepseek-v4、qwen3、kimi、自定义别名）命名五花八门，
+/// 不再用白名单硬拦，只排除空模型和明确的语音/向量/生图专用模型；真不支持看图时由接口报错兜底提示
 pub fn vision_ok(provider: &str, model: &str) -> bool {
     let m = model.trim().to_ascii_lowercase();
     if m.is_empty() {
         return provider == "gemini";
     }
-    if ["embedding", "tts", "whisper", "audio", "image-gen", "dall-e"].iter().any(|k| m.contains(k)) {
-        return false;
-    }
-    if provider == "gemini" || m.contains("gemini") || m.contains("gemma-3") || m.contains("gemma3") {
-        return true;
-    }
-    const VISION: [&str; 16] = [
-        "gpt-4o", "gpt-4.1", "gpt-5", "vision", "-vl", "vl-", "qvq", "llava", "minicpm-v", "glm-4v", "glm-4.5v",
-        "claude", "pixtral", "llama3.2-vision", "omni", "4v",
-    ];
-    if VISION.iter().any(|k| m.contains(k)) {
-        return true;
-    }
-    let tail = m.rsplit('/').next().unwrap_or(&m);
-    ["o3", "o4-mini"].iter().any(|p| tail == *p || tail.starts_with(&format!("{p}-")))
+    !["embedding", "tts", "whisper", "rerank", "image-gen", "dall-e"]
+        .iter()
+        .any(|k| m.contains(k))
 }
 
 const ROAST_ASK: &str = "（主人把 TA 现在屏幕上的窗口截图给你看）你瞧瞧我在干嘛？";
@@ -260,7 +249,14 @@ pub fn roast_blocking_id(req_id: u64, png: &[u8], ctx: &ChatCtx) -> ChatReply {
         }
         Err(e) => {
             crate::core::log::log(&format!("ai roast error {}", redact(&e.detail, &c.api_key)));
-            ChatReply { ok: false, need_key: false, text: e.user_text().into() }
+            let d = e.detail.to_ascii_lowercase();
+            let auth_err = d.contains("api key") || d.contains("api_key") || d.contains("unauthorized") || d.contains("invalid key");
+            let text = if matches!(e.kind, ErrKind::Status(400 | 415 | 422)) && !auth_err {
+                ROAST_NO_VISION
+            } else {
+                e.user_text()
+            };
+            ChatReply { ok: false, need_key: false, text: text.into() }
         }
     }
 }
@@ -616,7 +612,8 @@ fn endpoint(provider: &str, base_url: &str, model: &str, key: &str) -> (String, 
         let key = if key.is_empty() || plain_ollama { "local" } else { key };
         (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}"))
     } else {
-        (format!("{base}/models/{}:generateContent", encode_component(model)), "x-goog-api-key", key.to_string())
+        let m = if model.trim().is_empty() { "gemini-2.5-flash" } else { model.trim() };
+        (format!("{base}/models/{}:generateContent", encode_component(m)), "x-goog-api-key", key.to_string())
     }
 }
 
@@ -897,14 +894,11 @@ mod tests {
         assert!(vision_ok("gemini", "gemini-2.5-flash"));
         assert!(vision_ok("gemini", ""));
         assert!(vision_ok("openai", "gpt-4o-mini"));
-        assert!(vision_ok("openai", "qwen2.5-vl:7b"));
-        assert!(vision_ok("openai", "llava:13b"));
-        assert!(vision_ok("openai", "gemma3:12b"));
-        assert!(vision_ok("openai", "openai/o4-mini"));
-        assert!(!vision_ok("openai", "deepseek-chat"));
-        assert!(!vision_ok("openai", "qwen2.5:7b"));
-        assert!(!vision_ok("openai", "gpt-3.5-turbo"));
+        assert!(vision_ok("openai", "deepseek-v4"));
+        assert!(vision_ok("openai", "qwen3-32b"));
+        assert!(vision_ok("openai", "my-custom-model"));
         assert!(!vision_ok("openai", ""));
+        assert!(!vision_ok("openai", "text-embedding-3-small"));
         assert!(!vision_ok("gemini", "gemini-2.5-flash-preview-tts"));
     }
 
@@ -1101,5 +1095,11 @@ mod tests {
     fn encode() {
         assert_eq!(encode_component("gemini-2.5-flash"), "gemini-2.5-flash");
         assert_eq!(encode_component("a b/c"), "a%20b%2Fc");
+        let (u, _, _) = endpoint("gemini", "", "", "key123");
+        assert!(u.contains("/models/gemini-2.5-flash:generateContent"), "{u}");
+        assert!(vision_ok("openai", "deepseek-v4"));
+        assert!(vision_ok("gemini", ""));
+        assert!(!vision_ok("openai", ""));
+        assert!(!vision_ok("openai", "text-embedding-3-small"));
     }
 }

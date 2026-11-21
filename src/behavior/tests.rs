@@ -662,3 +662,260 @@ fn req_id_cancel_never_swallows_newer_reply_and_dance_stops_on_song_or_fullscree
     assert!(b.play.game.is_some());
     assert!(!b.scene.bubble.as_ref().is_some_and(|x| x.text.contains("构建完成")));
 }
+
+#[test]
+fn calling_her_name_or_mentioning_honey_does_not_hijack_chat() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    // 正常喊名字聊天：应该走 AI 聊天，绝不能被当成梗直接跳舞
+    ev(&mut b, AppEvent::ChatSubmit("哈基米，今天上班好累啊".into()), 3_200);
+    assert_eq!(b.state, St::Think);
+    assert!(b.calls.iter().any(|c| c == "chat:哈基米，今天上班好累啊"));
+    ev(&mut b, AppEvent::ChatStop, 3_400);
+
+    // 提到蜂蜜的正常对话：走 AI 聊天
+    ev(&mut b, AppEvent::ChatSubmit("早上喝了蜂蜜柚子茶".into()), 3_600);
+    assert_eq!(b.state, St::Think);
+    assert!(b.calls.iter().any(|c| c == "chat:早上喝了蜂蜜柚子茶"));
+    ev(&mut b, AppEvent::ChatStop, 3_800);
+
+    // 纯玩梗短句和直接喂蜂蜜短句依然生效
+    ev(&mut b, AppEvent::ChatSubmit("曼波！".into()), 4_000);
+    assert_eq!(b.state, St::Dance);
+    ev(&mut b, AppEvent::ChatSubmit("喝蜂蜜水".into()), 12_000);
+    assert_eq!(b.state, St::Honey);
+}
+
+#[test]
+fn need_key_reply_opens_ai_settings_page() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    ev(&mut b, AppEvent::ChatSubmit("你好".into()), 3_200);
+    let req = b.active_chat_req;
+    let out = ev(&mut b, AppEvent::ChatReplyId(req, ChatReply { ok: false, need_key: true, text: "要先填 Key".into() }), 3_500);
+    assert!(out.contains(&WinCmd::OpenSettingsPage(0)));
+}
+
+#[test]
+fn bubble_hover_wheel_click_copy_and_headroom() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    b.set_ui(UiInfo {
+        bubble: Some(Rect { x: 8.0, y: 0.0, w: 224.0, h: 140.0 }),
+        status: None,
+        bubble_overflow: true,
+    });
+    b.say_opts("第一行\n第二行\n第三行\n第四行\n第五行", 2_000, false, SpeakKind::Chat);
+    b.build_scene();
+    assert!(b.scene.bubble.is_some());
+
+    // 鼠标悬停在气泡上：超过原本 2000ms 消失时间也不会消失
+    ev(&mut b, AppEvent::Mouse(MouseEv::Move { x: 100.0, y: 40.0, sx: 200, sy: 200 }), 3_500);
+    tick(&mut b, 6_000);
+    assert!(b.scene.bubble.is_some());
+
+    // 在气泡上滚轮向下滚：变成手动滚动进度
+    ev(&mut b, AppEvent::Mouse(MouseEv::Wheel { delta: -240, x: 100.0, y: 40.0 }), 6_100);
+    assert!(b.scene.bubble.as_ref().unwrap().scroll > 0.3);
+
+    // 窗口贴屏幕顶边时：bubble_top 下移气泡
+    b.set_bubble_top(42.0);
+    tick(&mut b, 6_200);
+    assert_eq!(b.scene.bubble_top, 42.0);
+
+    // 左键点气泡（已满 250ms）：立刻收起
+    ev(&mut b, AppEvent::Mouse(MouseEv::Down { button: Button::Left, x: 100.0, y: 40.0, sx: 200, sy: 200 }), 6_300);
+    tick(&mut b, 6_700);
+    assert!(b.scene.bubble.is_none());
+
+    // 就算气泡刚收起，点菜单「复制刚才那句话」也能复制出刚才那句正文
+    ev(&mut b, AppEvent::Menu(MenuAction::CopyBubble), 6_800);
+    assert!(b.calls.iter().any(|c| c == "copy:第一行\n第二行\n第三行\n第四行\n第五行"));
+}
+
+#[test]
+fn new_expressions_and_question_fx_work_in_chat_and_sense() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    for (tag, expected_st, expected_face) in [
+        ("[wink]略略略～", St::Wink, Face::Wink),
+        ("[drool]吸溜，小鱼干好香喵", St::Drool, Face::Drool),
+        ("[sweat]啊哈哈，什么都没看到喵", St::Sweat, Face::Sweat),
+        ("[cheer]冲呀！给主人打 call 喵！", St::Cheer, Face::Cheer),
+        ("[sleepy]眼皮好重，迷迷糊糊喵", St::Sleepy, Face::Sleepy),
+        ("[confused]歪头？这是什么意思喵", St::Confused, Face::Confused),
+    ] {
+        let next_t = b.now + 5_000;
+        ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, need_key: false, text: tag.into() }), next_t);
+        assert_eq!(b.state, expected_st);
+        assert_eq!(b.scene.face, expected_face);
+    }
+    // [confused] 会冒出蓝色问号粒子 Question
+    assert!(b.scene.fx.iter().any(|f| f.shape == crate::render::FxShape::Question));
+
+    // 快速打字触发举爪欢呼 St::Cheer
+    b.set_state(St::Idle, None);
+    b.chatting = false;
+    b.waiting = false;
+    let t = b.now + 5_000;
+    ev(&mut b, AppEvent::Sense(crate::types::SenseEv::Typing), t);
+    assert_eq!(b.state, St::Cheer);
+    assert_eq!(b.scene.face, Face::Cheer);
+}
+
+#[test]
+fn stop_voice_and_disable_tts_prevent_60s_stuck_bubble_and_emotion() {
+    // 1. 普通语音播报中途关掉语音：60 秒兜底气泡与 60 秒情绪保持立刻缩短到 ~2 秒内收尾
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, need_key: false, text: "[cheer]太棒啦喵！".into() }), 4_000);
+    let tok = b.voice_req;
+    assert_ne!(tok, 0);
+    ev(&mut b, AppEvent::Speech { token: tok, audio: audio() }, 4_200);
+    assert_eq!(b.bubble.as_ref().and_then(|x| x.hide_at), Some(64_200));
+    assert_eq!(b.state, St::Cheer);
+
+    ev(&mut b, AppEvent::Menu(MenuAction::Tts(false)), 5_000);
+    // 气泡在 1.5s 后淡出（不再挂死 60s），表情在 2s 后回到 Idle
+    tick(&mut b, 7_200);
+    assert!(b.scene.bubble.is_none());
+    assert_eq!(b.state, St::Idle);
+
+    // 2. ChatVoice 分段播报中途关掉语音：剩余文字出全且表情不再卡死 60 秒
+    let mut b2 = mk();
+    b2.fake_chat_voice = true;
+    tick(&mut b2, 3_000);
+    ev(&mut b2, AppEvent::ChatSubmit("讲长一点".into()), 3_100);
+    let long = "[wink]第一句先眨个眼喵！第二句有很多很多字，足够被切分成多段来顺序播报哦～第三句也紧随其后喵！";
+    ev(&mut b2, AppEvent::ChatReply(ChatReply { ok: true, need_key: false, text: long.into() }), 4_000);
+    let t1 = b2.token_seq;
+    ev(&mut b2, AppEvent::Speech { token: t1, audio: audio() }, 4_500);
+    assert_eq!(b2.state, St::Wink);
+    ev(&mut b2, AppEvent::Menu(MenuAction::Tts(false)), 5_000);
+    assert!(b2.cv.is_none());
+    assert!(b2.scene.bubble.as_ref().unwrap().text.contains("第三句"));
+    tick(&mut b2, 7_500);
+    assert_eq!(b2.state, St::Idle, "CV_TOKEN emotion should clear within 2s after disabling TTS");
+}
+
+#[test]
+fn hide_roast_memo_and_chat_edge_cases() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+
+    // 1. 逗猫棒期间隐藏桌宠：清理置顶玩具；跳舞期间隐藏桌宠：静默停舞（不冒收尾台词）
+    ev(&mut b, AppEvent::Menu(MenuAction::Game), 3_200);
+    assert!(b.play.game.is_some());
+    let out = ev(&mut b, AppEvent::Menu(MenuAction::ToggleVisible), 3_400);
+    assert!(b.play.game.is_none());
+    assert!(out.contains(&WinCmd::Toy(crate::types::ToyCmd::Remove)));
+
+    ev(&mut b, AppEvent::Menu(MenuAction::Dance("wiggle".into())), 3_600);
+    assert!(b.routine.is_some());
+    let calls_before = b.calls.len();
+    ev(&mut b, AppEvent::Menu(MenuAction::ToggleVisible), 4_000);
+    assert!(b.routine.is_none());
+    assert_eq!(b.state, St::Idle);
+    assert!(!b.calls[calls_before..].iter().any(|c| c.starts_with("speak:")), "hiding should not speak dance outro");
+
+    // 2. 聊天触发「曼波！」唱歌跳舞后，按 Esc 关掉空输入框：不会打断正在跳的舞
+    ev(&mut b, AppEvent::Menu(MenuAction::Chat), 5_000);
+    ev(&mut b, AppEvent::ChatSubmit("曼波！".into()), 5_100);
+    assert_eq!(b.state, St::Dance);
+    ev(&mut b, AppEvent::ChatCancel, 5_200);
+    assert_eq!(b.state, St::Dance, "closing empty chat should not abort active dance");
+    ev(&mut b, AppEvent::Menu(MenuAction::ToggleVisible), 5_300);
+
+    // 3. 看屏吐槽未打开聊天框时（chatting == false, waiting == true）：think() 不会打断等待状态
+    ev(&mut b, AppEvent::ScreenRoast(vec![1, 2, 3, 4]), 6_000);
+    assert!(!b.chatting && b.waiting && b.chat_busy());
+    assert_eq!(b.state, St::Think);
+    b.think();
+    assert_eq!(b.state, St::Think);
+    ev(&mut b, AppEvent::ChatStop, 6_500);
+    assert!(!b.waiting);
+    ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, need_key: false, text: "已取消的吐槽".into() }), 6_600);
+    assert_ne!(b.last_bubble_text, "已取消的吐槽");
+
+    // 4. 备忘响铃期间收到 SecondInstance / Peek / ChatReply：90 秒提醒气泡不被覆盖，且高空标志复位
+    b.play.perch = Some(crate::types::PerchKind::WindowTop);
+    ev(
+        &mut b,
+        AppEvent::Memo(crate::types::MemoEv::Due(vec![crate::types::MemoHit { id: 42, text: "交周报".into(), late: false }])),
+        7_000,
+    );
+    assert!(b.scene.bubble.as_ref().unwrap().text.contains("交周报"));
+    ev(&mut b, AppEvent::SecondInstance, 7_500);
+    assert!(b.play.perch.is_none(), "SecondInstance should reset perch state");
+    assert!(b.scene.bubble.as_ref().unwrap().text.contains("交周报"), "SecondInstance must not overwrite memo alert");
+    ev(&mut b, AppEvent::ChatReply(ChatReply { ok: true, need_key: false, text: "顺便回你一句喵".into() }), 8_000);
+    assert!(b.scene.bubble.as_ref().unwrap().text.contains("交周报"), "ChatReply must not overwrite active memo alert");
+    assert_eq!(b.last_bubble_text, "顺便回你一句喵");
+}
+
+#[test]
+fn click_zone_double_click_spam_poke_wheel_and_perch_feed() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+
+    // 1. 气泡被点击收起进入 250ms 淡出期间，同位置再次点击不应再被旧 bubble_rect 吞掉，而应直接戳到哈基米
+    b.set_ui(UiInfo {
+        bubble: Some(Rect { x: 8.0, y: 0.0, w: 224.0, h: 130.0 }),
+        status: Some(Rect { x: 12.0, y: 8.0, w: 216.0, h: 120.0 }),
+        bubble_overflow: false,
+    });
+    ev(&mut b, AppEvent::Menu(MenuAction::Status), 3_100);
+    // 第一下点状态卡：收起状态卡
+    ev(&mut b, AppEvent::Mouse(MouseEv::Down { button: Button::Left, x: 120.0, y: 100.0, sx: 200, sy: 200 }), 3_200);
+    ev(&mut b, AppEvent::Mouse(MouseEv::Up { button: Button::Left, x: 120.0, y: 100.0, sx: 200, sy: 200 }), 3_210);
+    assert!(!b.status_fade.on);
+    // 状态卡淡出中且无开启气泡：在 y=100（头部）紧接着点一下，直接触发戳她
+    let pokes0 = b.pokes.len();
+    ev(&mut b, AppEvent::Mouse(MouseEv::Down { button: Button::Left, x: 120.0, y: 100.0, sx: 200, sy: 200 }), 3_250);
+    ev(&mut b, AppEvent::Mouse(MouseEv::Up { button: Button::Left, x: 120.0, y: 100.0, sx: 200, sy: 200 }), 3_260);
+    assert_eq!(b.pokes.len(), pokes0 + 1);
+
+    // 2. 非溢出的短气泡盖在头顶时，在头部（y >= PET_TOP）滚轮依然能顺畅撸猫
+    b.say_opts("呼噜～", 2_000, false, SpeakKind::Line);
+    let mood0 = b.stats.data.mood;
+    for i in 0..3 {
+        ev(&mut b, AppEvent::Mouse(MouseEv::Wheel { delta: 120, x: 120.0, y: 100.0 }), 4_000 + i * 50);
+    }
+    assert!(b.stats.data.mood > mood0, "wheel on non-overflowing bubble over head should pet her");
+
+    // 3. 头顶上方空白处（y < PET_TOP - 10）双击（如双击刚消散的气泡）：绝不误开聊天框
+    b.dismiss_bubble();
+    ev(&mut b, AppEvent::Mouse(MouseEv::DoubleClick { x: 120.0, y: 20.0 }), 4_500);
+    assert!(!b.chatting, "double-clicking empty sky above PET_TOP must not open chat");
+
+    // 4. 在身体上正常双击：立即打开聊天框，且清除残留的 down 状态
+    b.pokes.clear();
+    ev(&mut b, AppEvent::Mouse(MouseEv::Down { button: Button::Left, x: 120.0, y: 220.0, sx: 200, sy: 320 }), 6_000);
+    ev(&mut b, AppEvent::Mouse(MouseEv::Up { button: Button::Left, x: 120.0, y: 220.0, sx: 200, sy: 320 }), 6_020);
+    ev(&mut b, AppEvent::Mouse(MouseEv::Down { button: Button::Left, x: 120.0, y: 220.0, sx: 200, sy: 320 }), 6_150);
+    ev(&mut b, AppEvent::Mouse(MouseEv::DoubleClick { x: 120.0, y: 220.0 }), 6_170);
+    assert!(b.chatting && b.down.is_none());
+
+    // 5. 模拟 Windows 连续快速狂戳（奇偶交替 Down+Up 与 Down+DoubleClick）：不会反复闪开聊天框，第 5 次顺利炸毛/鼓脸
+    let mut t = 6_300;
+    for step in 3..=6 {
+        ev(&mut b, AppEvent::Mouse(MouseEv::Down { button: Button::Left, x: 120.0, y: 220.0, sx: 200, sy: 320 }), t);
+        if step % 2 == 0 {
+            ev(&mut b, AppEvent::Mouse(MouseEv::DoubleClick { x: 120.0, y: 220.0 }), t + 20);
+        } else {
+            ev(&mut b, AppEvent::Mouse(MouseEv::Up { button: Button::Left, x: 120.0, y: 220.0, sx: 200, sy: 320 }), t + 20);
+        }
+        t += 150;
+    }
+    assert!(!b.chatting, "rapid spam-clicking should keep chat closed after yielding");
+    assert!(matches!(b.state, St::Hiss | St::Puff), "expected angry Hiss/Puff after rapid spam clicks, got {:?}", b.state);
+
+    // 6. 栖息在窗口顶部（WindowTop）时把小鱼干直接拖到她嘴边松手：直接吃掉，不会穿模掉地上
+    b.stats.data.hunger = 30.0;
+    ev(&mut b, AppEvent::Perched(crate::types::PerchKind::WindowTop), 10_000);
+    ev(&mut b, AppEvent::Menu(MenuAction::Feed), 10_200);
+    ev(&mut b, AppEvent::Toy(crate::types::ToyEv::Grabbed), 10_300);
+    let out = ev(&mut b, AppEvent::Toy(crate::types::ToyEv::Dropped { dx: 5.0, dy: 5.0 }), 10_500);
+    assert!(out.contains(&WinCmd::Toy(crate::types::ToyCmd::Remove)));
+    assert_eq!(b.state, St::Eat);
+}

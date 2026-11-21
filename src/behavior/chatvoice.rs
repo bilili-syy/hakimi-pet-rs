@@ -191,9 +191,14 @@ impl Behavior {
             cv.req = token;
         }
         let mood = self.cv_mood();
+        let prefetch = self.cv.as_ref().is_some_and(|c| c.playing.is_some());
         self.call(format!("cvspeak:{text}"));
         if self.io {
-            crate::services::tts::speak(&self.tx, token, text, Some(mood), SpeakKind::Chat);
+            if prefetch {
+                crate::services::tts::speak_prefetch(&self.tx, token, text, Some(mood), SpeakKind::Chat);
+            } else {
+                crate::services::tts::speak(&self.tx, token, text, Some(mood), SpeakKind::Chat);
+            }
         }
         let wait = self.cv_wait_ms();
         self.later(wait, Later::ChatVoiceTimeout(token));
@@ -276,9 +281,37 @@ impl Behavior {
         }
     }
 
+    /// 用户点了气泡：若还有未展示的段则立刻推进/出全文字；若已全出则停止语音并收起气泡
+    pub(super) fn cv_click_bubble(&mut self) -> bool {
+        let Some(cv) = &self.cv else { return false };
+        if cv.shown == 0 {
+            return false;
+        }
+        if cv.shown < cv.chunks.len() {
+            let ready = self.cv.as_mut().and_then(|c| c.ready.take());
+            self.stop_voice();
+            if let Some(c) = &mut self.cv {
+                c.playing = None;
+            }
+            if let Some(a) = ready {
+                self.cv_reveal(Some(a));
+            } else {
+                self.cv_give_up();
+            }
+        } else {
+            self.stop_voice();
+            self.cv = None;
+            self.emotion_cv_done();
+            self.dismiss_bubble();
+        }
+        true
+    }
+
     /// 用户关掉了语音开关：把还没念完的文字直接出全，清空队列不再续播已预合成的段
     pub(super) fn cv_disable_tts(&mut self) {
-        if self.cv.is_some() {
+        if let Some(c) = &mut self.cv {
+            c.playing = None;
+            c.ready = None;
             self.cv_give_up();
         }
     }
@@ -326,8 +359,7 @@ impl Behavior {
         }
         let token = self.next_token();
         let dur = read_ms(&text);
-        self.bubble = Some(Bubble { text, shown: self.now, hide_at: Some(self.now + 60_000), dur, token });
-        self.bubble_fade.set(true, self.now);
+        self.show_bubble(text, Some(self.now + 60_000), dur, token, true);
         if let Some((a, req)) = audio {
             self.call(format!("cvplay:{token}"));
             if first {
@@ -361,8 +393,10 @@ impl Behavior {
         let token = self.next_token();
         let ms = read_ms(&text);
         let hide = if cv.playing.is_some() { self.now + 60_000 } else { self.now + ms };
-        self.bubble = Some(Bubble { text, shown: self.now, hide_at: Some(hide), dur: ms, token: cv.playing.unwrap_or(token) });
-        self.bubble_fade.set(true, self.now);
+        self.show_bubble(text, Some(hide), ms, cv.playing.unwrap_or(token), true);
+        if !first && cv.playing.is_none() {
+            self.emotion_cv_done();
+        }
     }
 }
 

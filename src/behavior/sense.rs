@@ -19,6 +19,10 @@ pub struct SenseUi {
     next_bob: u64,
     bob_n: u32,
     music_said: u64,
+    /// 正在朝晃动的鼠标猛扑过去（跑到位后星星眼收尾）
+    pub pouncing: bool,
+    /// 从窗口顶上跳下来落地后接着扑鼠标
+    pub pounce_after_land: bool,
     /// 今天已经说过的节日（日期）
     festive_day: String,
     /// 测试用「今天」 YYYY-MM-DD
@@ -119,19 +123,49 @@ impl Behavior {
             }
             SenseEv::Typing => {
                 if matches!(self.state, St::Idle | St::Walk | St::Sit) {
-                    self.play(Shot::Bounce);
-                    self.fx(FxKind::Spark, 6);
-                    self.react(St::Happy, 2400, Some(pick(lines::TYPING)));
+                    self.play(Shot::Jump);
+                    self.fx(FxKind::Spark, 7);
+                    self.react(St::Cheer, 2400, Some(pick(lines::TYPING)));
                 }
             }
             SenseEv::CursorShake => {
                 if matches!(self.state, St::Idle | St::Walk | St::Sit | St::Think | St::Stare) {
-                    self.play(Shot::Jump);
-                    self.fx(FxKind::Exclaim, 1);
-                    self.react(St::Starry, 1800, Some(pick(lines::POUNCE)));
+                    self.pounce_cursor();
                 }
             }
         }
+    }
+
+    /// 晃鼠标：朝光标所在的水平方向小跑扑过去（如果正坐在窗口顶上，先跳下来再扑）
+    pub(super) fn pounce_cursor(&mut self) {
+        if self.play.perch == Some(crate::types::PerchKind::WindowTop) {
+            self.sense.pounce_after_land = true;
+            self.fx(FxKind::Exclaim, 1);
+            self.say(&pick(lines::POUNCE), 2600);
+            return self.jump_down();
+        }
+        let dx = self
+            .play
+            .cursor
+            .map(|(x, _, _)| x - 120.0)
+            .unwrap_or_else(|| if fastrand::bool() { 260.0 } else { -260.0 });
+        if dx.abs() < 35.0 {
+            self.play(Shot::Jump);
+            self.fx(FxKind::Exclaim, 1);
+            self.react(St::Starry, 1800, Some(pick(lines::POUNCE)));
+            return;
+        }
+        self.walk_dir = if dx >= 0.0 { 1 } else { -1 };
+        self.set_state(St::Walk, None);
+        self.sense.pouncing = true;
+        self.fx(FxKind::Exclaim, 1);
+        self.say(&pick(lines::POUNCE), 2600);
+        let dist = dx.abs().clamp(90.0, 1400.0) * self.scale;
+        self.cmds.push( crate::types::WinCmd::Walk {
+            dir: self.walk_dir,
+            distance: dist,
+            speed: 5.5 * self.scale,
+        });
     }
 
     fn sense_fullscreen(&mut self, on: bool) {
@@ -139,13 +173,8 @@ impl Behavior {
         self.sense.quiet = on;
         if on {
             self.sense.quiet_since = self.now;
-            self.stop_voice();
-            // 进全屏安静（默认还会隐藏窗口）时停掉跳舞和歌曲，免得在后台出鼓点或 60~120fps 跟拍空转
-            if self.routine.is_some() {
-                self.finish_routine(false);
-            } else if self.state == St::Dance {
-                self.end_dance();
-            }
+            // 进全屏安静（默认还会隐藏窗口）时停掉跳舞、外放、语音队列和置顶玩具，免得在后台出声或 60~120fps 跟拍空转
+            self.cleanup_for_hide();
             if matches!(self.state, St::Idle | St::Walk) { self.set_state(St::Sit, None); }
         } else if !self.flush_off_work() && self.now.saturating_sub(self.sense.quiet_since) >= 5 * 60_000 && !self.sense_busy() {
             self.react(St::Smug, 2400, Some(pick(lines::FS_OFF)));
@@ -267,5 +296,28 @@ mod tests {
         assert!(b.festive_line().is_none());
         b.sense.test_today = Some("2027-02-06".into());
         assert!(b.festive_line().is_some_and(|l| lines::SPRING.contains(&l.as_str())));
+    }
+
+    #[test]
+    fn cursor_shake_sprints_toward_cursor() {
+        let mut b = mk();
+        tick(&mut b, 3000);
+        b.set_state(St::Idle, None);
+        ev(&mut b, AppEvent::Cursor { x: 520.0, y: 200.0 }, 4000);
+        let out = ev(&mut b, AppEvent::Sense(SenseEv::CursorShake), 4010);
+        assert_eq!(b.state, St::Walk);
+        assert!(b.sense.pouncing);
+        let walk = out.iter().find_map(|c| match c {
+            WinCmd::Walk { dir, distance, speed } => Some((*dir, *distance, *speed)),
+            _ => None,
+        });
+        let (dir, dist, speed) = walk.expect("should emit Walk toward cursor");
+        assert_eq!(dir, 1);
+        assert!((dist - 400.0).abs() < 1.0);
+        assert!(speed > 5.0);
+        // 扑到鼠标位置后，蹦一下切星星眼
+        ev(&mut b, AppEvent::WalkDone { hit_edge: false }, 4800);
+        assert_eq!(b.state, St::Starry);
+        assert!(!b.sense.pouncing);
     }
 }

@@ -119,6 +119,20 @@ fn glyph_path(shape: FxShape) -> Option<Path> {
             pb.close();
             pb.push_circle(0.0, 0.29, 0.065);
         }
+        FxShape::Question => {
+            pb.move_to(-0.22, -0.18);
+            pb.cubic_to(-0.22, -0.35, -0.11, -0.42, 0.02, -0.42);
+            pb.cubic_to(0.16, -0.42, 0.25, -0.33, 0.25, -0.20);
+            pb.cubic_to(0.25, -0.09, 0.16, -0.03, 0.06, 0.03);
+            pb.line_to(0.05, 0.14);
+            pb.line_to(-0.06, 0.14);
+            pb.line_to(-0.06, -0.02);
+            pb.cubic_to(0.05, -0.08, 0.12, -0.13, 0.12, -0.20);
+            pb.cubic_to(0.12, -0.27, 0.07, -0.31, 0.01, -0.31);
+            pb.cubic_to(-0.06, -0.31, -0.10, -0.26, -0.11, -0.18);
+            pb.close();
+            pb.push_circle(-0.005, 0.29, 0.065);
+        }
     }
     pb.finish()
 }
@@ -131,6 +145,7 @@ struct GlyphCache {
     drop_hi: Option<Path>,
     anger: Option<Path>,
     exclaim: Option<Path>,
+    question: Option<Path>,
 }
 
 static GLYPHS: std::sync::LazyLock<GlyphCache> = std::sync::LazyLock::new(|| {
@@ -144,6 +159,7 @@ static GLYPHS: std::sync::LazyLock<GlyphCache> = std::sync::LazyLock::new(|| {
         drop_hi: pb.finish(),
         anger: glyph_path(FxShape::Anger),
         exclaim: glyph_path(FxShape::Exclaim),
+        question: glyph_path(FxShape::Question),
     }
 });
 
@@ -156,6 +172,7 @@ pub fn draw_glyph(pm: &mut Pixmap, shape: FxShape, color: u32, opacity: f32, t: 
         FxShape::Drop => GLYPHS.drop.as_ref(),
         FxShape::Anger => GLYPHS.anger.as_ref(),
         FxShape::Exclaim => GLYPHS.exclaim.as_ref(),
+        FxShape::Question => GLYPHS.question.as_ref(),
     };
     let Some(path) = path else { return };
     let stroke = Stroke { width: 2.0 / size.max(1.0), ..Default::default() };

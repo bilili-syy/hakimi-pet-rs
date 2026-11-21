@@ -130,9 +130,13 @@ impl Pomodoro {
     }
 }
 
-/// 剩余分钟（原版 Math.max(0, Math.round((end - now) / 60000))）
+/// 剩余分钟（未到点时至少显示 1 分钟，避免最后 30 秒提前显示「剩 0 分钟」）
 pub fn minutes_left(end: u64, now: u64) -> u32 {
-    (end.saturating_sub(now) as f64 / MIN as f64).round() as u32
+    if end <= now {
+        0
+    } else {
+        ((end - now) as f64 / MIN as f64).round().max(1.0) as u32
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +202,8 @@ mod tests {
         let p = Pomodoro::start(25, 0);
         assert_eq!(minutes_left(p.end, 0), 25);
         assert_eq!(minutes_left(p.end, 24 * MIN + 29_000), 1);
+        assert_eq!(minutes_left(p.end, 24 * MIN + 50_000), 1);
+        assert_eq!(minutes_left(p.end, 25 * MIN), 0);
         assert_eq!(minutes_left(p.end, 30 * MIN), 0);
     }
 }

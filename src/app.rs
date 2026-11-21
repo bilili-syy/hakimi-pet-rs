@@ -22,6 +22,7 @@ impl Handler for App {
 
     fn render(&mut self, scale: f32) -> Option<&Frame> {
         self.behavior.set_scale(scale);
+        self.behavior.set_bubble_top(crate::platform::bubble_top_offset());
         let changed = self.renderer.update(&self.behavior.scene, scale);
         // 气泡/状态卡的位置回填给行为层做点击判定（点状态卡=关掉，点气泡不算戳她）
         self.behavior.set_ui(UiInfo {

@@ -18,8 +18,8 @@ use windows::Win32::Graphics::Gdi::{
     SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_RETURN,
-    VK_SHIFT, VK_UP,
+    GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE,
+    VK_RETURN, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -30,6 +30,7 @@ const HOST_CLASS: PCWSTR = w!("HakimiPetRsChat");
 const H: f32 = 32.0;
 const MARGIN: f32 = 6.0;
 const MAX_LEN: usize = 1000;
+const EM_GETSEL: u32 = 0x00B0;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
 const EM_SETSEL: u32 = 0x00B1;
 const EM_GETLINECOUNT: u32 = 0x00BA;
@@ -56,12 +57,18 @@ static HAS_TEXT: AtomicBool = AtomicBool::new(false);
 static COMPOSING: AtomicBool = AtomicBool::new(false);
 /// 鼠标是否悬停在「×」上
 static CLOSE_HOT: AtomicBool = AtomicBool::new(false);
+/// 宠物脚边锚定底边（物理像素），防多行缩回单行时在顶边夹取后向下漂移
+static ANCHOR_BOTTOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// 当前输入框 HWND（用于判断焦点是否仍在输入框内）
+static EDIT_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 标记刚刚由 WM_KEYDOWN(Ctrl+Backspace) 处理过一次删词，避免紧随其后的 WM_CHAR(0x7F) 重复删
+static ATE_CTRL_BACK: AtomicBool = AtomicBool::new(false);
 /// 「×」按钮的逻辑宽度（贴右侧内边距里）
 const CLOSE_W: f32 = 18.0;
 /// 灰色提示字（原版 placeholder 是「和哈基米说点什么…（回车发送，Esc 关闭）」，228px 宽放不下，缩短）
 const CUE: &str = "回车发送 · Shift+回车换行 · ↑翻旧话";
 /// 等回复时的提示字
-const CUE_BUSY: &str = "她在想…按 Esc 不等了";
+const CUE_BUSY: &str = "她在想…按 Esc 或点 × 不等了";
 const CUE_COLOR: COLORREF = rgb(0xb0, 0x9c, 0x8c);
 const CLOSE_COLOR: COLORREF = rgb(0xa8, 0x8e, 0x7c);
 const CLOSE_HOT_COLOR: COLORREF = rgb(0xea, 0x43, 0x35);
@@ -132,6 +139,7 @@ impl Chat {
             };
             let _ = SetWindowSubclass(edit, Some(edit_proc), 1, 0);
             SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(MAX_LEN)), None);
+            EDIT_HWND.store(edit.0 as isize, Ordering::Relaxed);
             let bg = CreateSolidBrush(BG);
             BG_BRUSH.store(bg.0 as isize, Ordering::Relaxed);
             let mut c = Self { host, edit, font: HFONT::default(), bg, scale, visible: false };
@@ -177,6 +185,7 @@ impl Chat {
         let w = ((WIN_W as f32 - 2.0 * MARGIN) * s).round() as i32;
         let x = pet_x + (MARGIN * s).round() as i32;
         let bottom = pet_y + pet_h - (MARGIN * s).round() as i32;
+        ANCHOR_BOTTOM.store(bottom, Ordering::Relaxed);
         place(self.host, self.edit, s, x, bottom, w, false);
     }
 
@@ -222,6 +231,7 @@ impl Chat {
 impl Drop for Chat {
     fn drop(&mut self) {
         BG_BRUSH.store(0, Ordering::Relaxed);
+        EDIT_HWND.store(0, Ordering::Relaxed);
         unsafe {
             let _ = DestroyWindow(self.host);
             if !self.font.is_invalid() {
@@ -234,12 +244,18 @@ impl Drop for Chat {
     }
 }
 
-/// 摆框：底边固定在 bottom，高度跟着行数长。force = 行数变了，就算大小没变也重摆输入框
+/// 摆框：底边固定在 bottom，高度跟着行数长，并夹在当前屏幕工作区内免得靠边时被截断。force = 行数变了，就算大小没变也重摆输入框
 fn place(host: HWND, edit: HWND, s: f32, x: i32, bottom: i32, w: i32, force: bool) {
     let n = LINES.load(Ordering::Relaxed).clamp(1, MAX_LINES);
     let line = (LINE * s).round() as i32;
     let h = (H * s).round() as i32 + (n - 1) * line;
-    let y = bottom - h;
+    let wa = super::work_area_at(
+        windows::Win32::Foundation::POINT { x: x + w / 2, y: bottom - h / 2 },
+        windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+    );
+    let edge = (4.0 * s).round().max(2.0) as i32;
+    let x = x.clamp(wa.left + edge, (wa.right - w - edge).max(wa.left + edge));
+    let y = (bottom - h).clamp(wa.top + edge, (wa.bottom - h - edge).max(wa.top + edge));
     let pad_x = (10.0 * s).round() as i32;
     let close_w = (CLOSE_W * s).round() as i32;
     unsafe {
@@ -271,7 +287,9 @@ fn fit_lines(host: HWND, edit: HWND) {
     unsafe {
         let _ = GetWindowRect(host, &mut r);
     }
-    place(host, edit, super::current_scale(), r.left, r.bottom, r.right - r.left, true);
+    let anchor = ANCHOR_BOTTOM.load(Ordering::Relaxed);
+    let bottom = if anchor != 0 { anchor } else { r.bottom };
+    place(host, edit, super::current_scale(), r.left, bottom, r.right - r.left, true);
 }
 
 /// ↑/↓ 翻发过的话（纯逻辑，可测）
@@ -382,6 +400,80 @@ fn key_down(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> boo
 
 /// 输入框里有没有打了字（不算空白）。行为层判断「别的动作要不要顺手关掉空输入框」用
 pub fn has_text() -> bool { HAS_TEXT.load(Ordering::Relaxed) }
+
+/// 当前是否正处于等待 AI 回复状态
+pub fn is_busy() -> bool { BUSY.load(Ordering::Relaxed) }
+
+/// 聊天输入框是否正拥有键盘焦点
+pub fn is_focused() -> bool {
+    let e = EDIT_HWND.load(Ordering::Relaxed);
+    e != 0 && unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus().0 as isize == e }
+}
+
+unsafe fn delete_prev_word(hwnd: HWND) {
+    if BUSY.load(Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        let (mut s, mut e) = (0u32, 0u32);
+        SendMessageW(hwnd, EM_GETSEL, Some(WPARAM(&mut s as *mut u32 as usize)), Some(LPARAM(&mut e as *mut u32 as isize)));
+        if s == e && s > 0 {
+            let to = prev_word_utf16(&edit_text(hwnd), s as usize);
+            SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(to)), Some(LPARAM(e as isize)));
+        }
+        if s != e || s > 0 {
+            let empty = wide("");
+            SendMessageW(hwnd, EM_REPLACESEL, Some(WPARAM(1)), Some(LPARAM(empty.as_ptr() as isize)));
+            if let Ok(host) = GetParent(hwnd) {
+                sync_edit(host, hwnd);
+            }
+        }
+    }
+}
+
+/// Ctrl+Backspace 向前删词的落点（UTF-16 偏移）：跳过紧挨光标的空白，再删掉一整段同类型字符
+pub(crate) fn prev_word_utf16(text: &str, caret_utf16: usize) -> usize {
+    let mut chars: Vec<(usize, char)> = Vec::new();
+    let mut u16_pos = 0usize;
+    for ch in text.chars() {
+        if u16_pos >= caret_utf16 {
+            break;
+        }
+        chars.push((u16_pos, ch));
+        u16_pos += ch.len_utf16();
+    }
+    let Some(&(_, last)) = chars.last() else { return 0 };
+    if last == '\n' {
+        chars.pop();
+        if chars.last().is_some_and(|&(_, c)| c == '\r') {
+            chars.pop();
+        }
+        return chars.last().map_or(0, |&(p, c)| p + c.len_utf16());
+    }
+    while chars.last().is_some_and(|&(_, c)| c.is_whitespace() && c != '\r' && c != '\n') {
+        chars.pop();
+    }
+    let kind = |c: char| -> u8 {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            1
+        } else if ('\u{4e00}'..='\u{9fff}').contains(&c) || c.is_alphanumeric() {
+            2
+        } else if c.is_whitespace() {
+            0
+        } else {
+            3
+        }
+    };
+    let Some(&(_, target_ch)) = chars.last() else { return 0 };
+    let k = kind(target_ch);
+    if k == 0 {
+        return chars.last().map_or(0, |&(p, c)| p + c.len_utf16());
+    }
+    while chars.last().is_some_and(|&(_, c)| kind(c) == k) {
+        chars.pop();
+    }
+    chars.last().map_or(0, |&(p, c)| p + c.len_utf16())
+}
 
 /// 「×」按钮在 host 客户区里的矩形
 fn close_rect(host: HWND) -> RECT {
@@ -505,6 +597,21 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
                 return LRESULT(0);
             }
+            // Ctrl+Backspace 向前删词（原生 Edit 默认会插一个 0x7F 方框字符）
+            WM_KEYDOWN if wp.0 == VK_BACK.0 as usize && key_down(VK_CONTROL) => {
+                ATE_CTRL_BACK.store(true, Ordering::Relaxed);
+                delete_prev_word(hwnd);
+                return LRESULT(0);
+            }
+            WM_KEYDOWN => {
+                ATE_CTRL_BACK.store(false, Ordering::Relaxed);
+            }
+            WM_CHAR if wp.0 == 0x7f => {
+                if !ATE_CTRL_BACK.swap(false, Ordering::Relaxed) {
+                    delete_prev_word(hwnd);
+                }
+                return LRESULT(0);
+            }
             // 吞掉回车/Esc/Ctrl+A/Ctrl+回车 的 WM_CHAR，否则会“叮”一声或插进怪字符
             WM_CHAR if [0x0d, 0x1b, 0x01, 0x0a].contains(&wp.0) => return LRESULT(0),
             WM_PAINT => {
@@ -611,8 +718,15 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             WM_LBUTTONDOWN => LRESULT(0),
             WM_LBUTTONUP => {
                 if in_close(hwnd, lp) {
-                    CLOSE_HOT.store(false, Ordering::Relaxed);
-                    super::chat_escape();
+                    if CLOSE_HOT.swap(false, Ordering::Relaxed) {
+                        let r = close_rect(hwnd);
+                        let _ = InvalidateRect(Some(hwnd), Some(&r), false);
+                    }
+                    if BUSY.load(Ordering::Relaxed) {
+                        super::post_event(AppEvent::ChatStop);
+                    } else {
+                        super::chat_escape();
+                    }
                 } else if let Ok(edit) = GetWindow(hwnd, GW_CHILD) {
                     // 点到内边距：把焦点交给输入框
                     let _ = SetFocus(Some(edit));
@@ -736,5 +850,18 @@ mod tests {
             drop(c);
             let _ = DestroyWindow(owner);
         }
+    }
+
+    #[test]
+    fn ctrl_backspace_word_boundaries() {
+        let u16_len = |s: &str| s.encode_utf16().count();
+        let t = "hello world  ";
+        assert_eq!(prev_word_utf16(t, u16_len(t)), u16_len("hello "));
+        let t2 = "哈基米 今天好累";
+        assert_eq!(prev_word_utf16(t2, u16_len(t2)), u16_len("哈基米 "));
+        let t3 = "测试！！！";
+        assert_eq!(prev_word_utf16(t3, u16_len(t3)), u16_len("测试"));
+        let t4 = "第一行\r\n";
+        assert_eq!(prev_word_utf16(t4, u16_len(t4)), u16_len("第一行"));
     }
 }

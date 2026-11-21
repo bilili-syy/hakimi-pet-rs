@@ -16,7 +16,7 @@ pub(super) fn ctl_color(hdc: HDC, ctl: HWND) -> LRESULT {
     let color = match id {
         ID_KEY_LINK | ID_TTS_LINK => LINK,
         ID_NOTE => GREY,
-        ID_MEMO_MSG => OK_GREEN,
+        ID_MEMO_MSG => if MEMO_MSG_ERR.with(|c| c.get()) { ERR_RED } else { OK_GREEN },
         ID_TEST_RESULT | ID_PLAY_RESULT => {
             let v = colors[if id == ID_TEST_RESULT { 0 } else { 1 }];
             if v > 0 { OK_GREEN } else if v < 0 { ERR_RED } else { GREY }
@@ -34,7 +34,7 @@ pub(super) fn ctl_color(hdc: HDC, ctl: HWND) -> LRESULT {
 // ---------------------------------------------------------------- 自绘外观
 
 /// 界面字体：有思源黑体就用（和气泡同一套），没有退回微软雅黑 UI
-pub(super) fn ui_faces() -> (&'static str, &'static str) {
+pub(crate) fn ui_faces() -> (&'static str, &'static str) {
     static F: std::sync::LazyLock<(&'static str, &'static str)> = std::sync::LazyLock::new(|| {
         if font_installed("Noto Sans SC") { ("Noto Sans SC", "Noto Sans SC") } else { ("Microsoft YaHei UI", "Microsoft YaHei UI") }
     });
@@ -68,7 +68,7 @@ pub(super) fn is_edit(h: HWND) -> bool {
 }
 
 /// Win11 标题栏染成导航栏的奶油色（老系统不支持就算了）
-pub(super) fn style_caption(hwnd: HWND) {
+pub(crate) fn style_caption(hwnd: HWND) {
     use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
     for (attr, c) in [(35, SIDE), (36, TEXT), (34, LINE)] {
         unsafe {
@@ -83,7 +83,7 @@ pub(super) fn cref(c: COLORREF) -> tiny_skia::Color {
 
 /// 抗锯齿圆角矩形：在 tiny-skia 里画好再贴到 DC 上（GDI 的 RoundRect 边缘有锯齿）。
 /// rc 是设备像素；bg 是四个角外面的底色
-pub(super) fn aa_round(hdc: HDC, rc: RECT, radius: f32, bg: COLORREF, fill: COLORREF, stroke: Option<(COLORREF, f32)>) {
+pub(crate) fn aa_round(hdc: HDC, rc: RECT, radius: f32, bg: COLORREF, fill: COLORREF, stroke: Option<(COLORREF, f32)>) {
     use windows::Win32::Graphics::Gdi::{BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SetDIBitsToDevice};
     let (w, h) = ((rc.right - rc.left).max(1) as u32, (rc.bottom - rc.top).max(1) as u32);
     let Some(mut pm) = tiny_skia::Pixmap::new(w, h) else { return };
@@ -182,6 +182,51 @@ pub(super) fn paint_bg(hwnd: HWND, hdc: HDC) {
         let (stroke, wd) = if focus == h { (ACCENT, 1.6 * scale) } else { (LINE, 1.0 * scale) };
         aa_round(hdc, rc, 7.0 * scale, BG, if on { FIELD } else { BG }, Some((stroke, wd)));
     }
+    if page == 5 {
+        let pr = super::report_page::REPORT_PREVIEW_RECT;
+        let box_rc = RECT { left: px(pr[0]), top: px(pr[1]), right: px(pr[0] + pr[2]), bottom: px(pr[1] + pr[3]) };
+        aa_round(hdc, box_rc, 8.0 * scale, BG, FIELD, Some((LINE, 1.0 * scale)));
+        DLG.with(|c| {
+            if let Ok(g) = c.try_borrow()
+                && let Some(d) = g.as_ref()
+                && let Some((bgra, w, h)) = &d.report_preview
+            {
+                let dx = box_rc.left + (box_rc.right - box_rc.left - *w) / 2;
+                let dy = box_rc.top + (box_rc.bottom - box_rc.top - *h) / 2;
+                let bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
+                    bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
+                        biWidth: *w,
+                        biHeight: -(*h),
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: windows::Win32::Graphics::Gdi::BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::SetStretchBltMode(hdc, windows::Win32::Graphics::Gdi::HALFTONE);
+                    let _ = windows::Win32::Graphics::Gdi::SetBrushOrgEx(hdc, 0, 0, None);
+                    let _ = windows::Win32::Graphics::Gdi::StretchDIBits(
+                        hdc,
+                        dx,
+                        dy,
+                        *w,
+                        *h,
+                        0,
+                        0,
+                        *w,
+                        *h,
+                        Some(bgra.as_ptr() as *const _),
+                        &bmi,
+                        windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
+                        windows::Win32::Graphics::Gdi::SRCCOPY,
+                    );
+                }
+            }
+        });
+    }
 }
 
 /// 自绘：左侧导航（选中项橙色圆角块）和按钮（主按钮橙色，其他奶油色描边）
@@ -224,11 +269,12 @@ pub(super) fn draw_item(di: &windows::Win32::UI::Controls::DRAWITEMSTRUCT) {
             let primary = di.CtlID as i32 == IDOK;
             let down = state & ODS_SELECTED != 0;
             let disabled = state & ODS_DISABLED != 0;
+            let focused = state & 0x0010 != 0; // ODS_FOCUS
             let (bg, border, fg) = match (primary, down) {
-                (true, false) => (ACCENT, None, rgb(0xff, 0xff, 0xff)),
-                (true, true) => (ACCENT_DOWN, None, rgb(0xff, 0xff, 0xff)),
-                (false, false) => (BTN, Some((LINE, 1.0 * scale)), TEXT),
-                (false, true) => (BTN_DOWN, Some((LINE, 1.0 * scale)), TEXT),
+                (true, false) => (ACCENT, focused.then_some((TEXT, 1.5 * scale)), rgb(0xff, 0xff, 0xff)),
+                (true, true) => (ACCENT_DOWN, focused.then_some((TEXT, 1.5 * scale)), rgb(0xff, 0xff, 0xff)),
+                (false, false) => (BTN, Some(if focused { (ACCENT, 1.6 * scale) } else { (LINE, 1.0 * scale) }), TEXT),
+                (false, true) => (BTN_DOWN, Some(if focused { (ACCENT, 1.6 * scale) } else { (LINE, 1.0 * scale) }), TEXT),
             };
             aa_round(hdc, rc, 8.0 * scale, BG, bg, border);
             let old = SelectObject(hdc, (if primary { nav_bold } else { font }).into());

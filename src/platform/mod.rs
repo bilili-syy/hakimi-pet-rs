@@ -84,13 +84,33 @@ pub(crate) static MENU_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new
 /// 番茄钟结束时间（GetTickCount64 单调毫秒，计入睡眠/休眠时间），0 = 没开
 static POMO_END: AtomicU64 = AtomicU64::new(0);
 static MOYU_TODAY_SEC: AtomicU32 = AtomicU32::new(0);
+/// 桌宠窗口顶部伸出屏幕顶边的逻辑像素数（爬在贴顶窗口上时把气泡往下挪进可见区）
+static HEADROOM_BITS: AtomicU32 = AtomicU32::new(0);
+/// 是否已有可复制的气泡文字
+static HAS_COPYABLE_BUBBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn bubble_top_offset() -> f32 {
+    f32::from_bits(HEADROOM_BITS.load(Ordering::Relaxed))
+}
+
+pub fn set_has_copyable_bubble(on: bool) {
+    HAS_COPYABLE_BUBBLE.store(on, Ordering::Relaxed);
+}
+
+pub fn has_copyable_bubble() -> bool {
+    HAS_COPYABLE_BUBBLE.load(Ordering::Relaxed)
+}
+
+pub fn copy_text(s: &str) -> bool {
+    report::copy_text(s)
+}
 
 pub(crate) fn main_hwnd() -> Option<HWND> {
     let h = MAIN_HWND.load(Ordering::Relaxed);
     (h != 0).then_some(HWND(h as *mut _))
 }
 
-/// 自身当前可见的顶层窗口（看屏吐槽截图时临时设 WDA_EXCLUDEFROMCAPTURE，免得把桌宠/聊天框/道具拍进图里）
+/// 自身当前可见的顶层窗口（看屏吐槽截图时临时设 WDA_EXCLUDEFROMCAPTURE，免得把桌宠/聊天框/道具/设置窗拍进图里）
 pub(crate) fn own_visible_windows() -> Vec<HWND> {
     let mut out = Vec::new();
     with(|s| {
@@ -98,6 +118,7 @@ pub(crate) fn own_visible_windows() -> Vec<HWND> {
             Some(s.hwnd),
             s.chat.as_ref().map(|c| c.host),
             s.toy.as_ref().map(|t| t.hwnd),
+            settings::hwnd(),
         ]
         .into_iter()
         .flatten()
@@ -108,6 +129,18 @@ pub(crate) fn own_visible_windows() -> Vec<HWND> {
         }
     });
     out
+}
+
+pub(crate) fn is_pet_visible() -> bool {
+    with(|s| s.is_visible()).unwrap_or(true)
+}
+
+pub(crate) fn is_chat_open() -> bool {
+    with(|s| s.chat.as_ref().is_some_and(|c| c.visible)).unwrap_or(false)
+}
+
+pub fn chat_is_focused() -> bool {
+    chat::is_focused()
 }
 
 pub(crate) fn current_scale() -> f32 {
@@ -234,6 +267,7 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
             last_frame: 0,
             reminders: Reminders::schedule(&cfg.reminders, now),
             pomodoro: None,
+            last_pomo_left: None,
             sup: Supervisor::new(LocalTime::now().day_key()),
             watch_next: cfg.moyu.enabled.then_some(now + watch::STEP as u64 * 1000),
             dbl_pending: false,
@@ -403,6 +437,7 @@ struct Plat {
     last_frame: u64,
     reminders: Reminders,
     pomodoro: Option<Pomodoro>,
+    last_pomo_left: Option<u32>,
     sup: Supervisor,
     watch_next: Option<u64>,
     dbl_pending: bool,
@@ -504,7 +539,8 @@ fn rearm() {
             due = due.min(t);
         }
         if let Some(p) = &s.pomodoro {
-            due = due.min(now + p.end.saturating_sub(pomo_now_ms()));
+            // 番茄钟期间至少每 15 秒醒一次，保证隐藏态下托盘 Tooltip 剩余分钟数也能准时刷新
+            due = due.min(now + p.end.saturating_sub(pomo_now_ms()).min(15_000));
         }
         // 备忘录：排到下一条提醒的时间
         if let Some(ms) = crate::core::memo::ms_until_next(crate::core::memo::Now::get()) {
@@ -653,6 +689,7 @@ fn apply(out: Vec<WinCmd>) {
             }
             WinCmd::DragMove { sx, sy } => {
                 with(|s| {
+                    s.dbl_pending = false;
                     s.fall = None;
                     s.walk = None;
                     s.hop = None;
@@ -685,6 +722,12 @@ fn apply(out: Vec<WinCmd>) {
                         }
                     }
                 });
+                if matches!(c, ChatInputCmd::Enable(_)) {
+                    menu::refresh();
+                }
+            }
+            WinCmd::OpenSettingsPage(p) => {
+                settings::open_focus_key(p);
             }
         }
     }
@@ -872,7 +915,7 @@ fn work_area_of(hwnd: HWND) -> RECT {
     }
 }
 
-fn work_area_at(pt: POINT, flag: windows::Win32::Graphics::Gdi::MONITOR_FROM_FLAGS) -> RECT {
+pub(super) fn work_area_at(pt: POINT, flag: windows::Win32::Graphics::Gdi::MONITOR_FROM_FLAGS) -> RECT {
     unsafe {
         let mon = MonitorFromPoint(pt, flag);
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -889,6 +932,13 @@ impl Plat {
         work_area_at(POINT { x: self.x + self.w / 2, y: self.y + self.h / 2 }, MONITOR_DEFAULTTONEAREST)
     }
 
+    fn update_headroom(&self) {
+        let wa = self.work_area();
+        let clip_px = (wa.top - self.y).max(0) as f32;
+        let logical = if self.scale > 0.1 { clip_px / self.scale } else { 0.0 };
+        HEADROOM_BITS.store(logical.to_bits(), Ordering::Relaxed);
+    }
+
     fn is_visible(&self) -> bool {
         unsafe { IsWindowVisible(self.hwnd).as_bool() }
     }
@@ -900,6 +950,8 @@ impl Plat {
         if on {
             self.shown_once = true;
             self.layout_chat();
+        } else {
+            self.toy = None;
         }
         if let Some(c) = &self.chat {
             c.show_with_pet(on);
@@ -920,6 +972,7 @@ impl Plat {
         }
         self.x = x;
         self.y = y;
+        self.update_headroom();
         unsafe {
             let _ = SetWindowPos(self.hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
@@ -931,7 +984,13 @@ impl Plat {
         self.fall = None;
         self.hop = None;
         self.perch = None;
-        let wa = self.work_area();
+        // 多屏时优先来到鼠标当前所在的屏幕，真正做到「叫她过来找我」
+        let mut pt = POINT::default();
+        let wa = if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+            work_area_at(pt, MONITOR_DEFAULTTONEAREST)
+        } else {
+            self.work_area()
+        };
         let x = (wa.left as f32 + (wa.right - wa.left) as f32 * 0.62 - self.w as f32 / 2.0).round() as i32;
         self.move_to(x, wa.bottom - self.h);
         self.set_visible(true);
@@ -1025,16 +1084,23 @@ impl Plat {
         self.toy_step(evs);
     }
 
-    /// 提醒 / 番茄钟 / 摸鱼采样。返回番茄钟是否刚结束（要刷新菜单）
+    /// 提醒 / 番茄钟 / 摸鱼采样。返回番茄钟状态或剩余分钟是否变化（要刷新菜单与托盘提示）
     fn timers(&mut self, now: u64, evs: &mut Vec<AppEvent>) -> bool {
-        let mut pomo_done = false;
+        let mut pomo_changed = false;
         if let Some(p) = self.pomodoro
             && pomo_now_ms() >= p.end
         {
             self.pomodoro = None;
+            self.last_pomo_left = None;
             POMO_END.store(0, Ordering::Relaxed);
             evs.push(AppEvent::Pomodoro(PomodoroEv::Done { minutes: p.minutes }));
-            pomo_done = true;
+            pomo_changed = true;
+        } else {
+            let cur_left = pomodoro_left();
+            if cur_left != self.last_pomo_left {
+                self.last_pomo_left = cur_left;
+                pomo_changed = true;
+            }
         }
         let rem_due = self.reminders.next_deadline().is_some_and(|t| now >= t);
         let watch_due = self.watch_next.is_some_and(|t| now >= t);
@@ -1064,7 +1130,7 @@ impl Plat {
                 }
             }
         }
-        pomo_done
+        pomo_changed
     }
 
     fn set_watch(&mut self, on: bool, now: u64) {
@@ -1077,6 +1143,7 @@ impl Plat {
         }
         self.scale = scale;
         SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
+        self.update_headroom();
         if let Some(c) = self.chat.as_mut() {
             c.set_scale(scale);
         }
@@ -1115,6 +1182,7 @@ impl Plat {
             self.y += self.h - fh;
             self.w = fw;
             self.h = fh;
+            self.update_headroom();
         }
         let dst = POINT { x: self.x, y: self.y };
         let size = SIZE { cx: fw, cy: fh };
@@ -1551,15 +1619,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_LBUTTONUP => {
                 LEFT_DOWN.with(|d| d.set(false));
                 let _ = ReleaseCapture();
-                let mut dbl = None;
-                mouse(lp, |s, (x, y, sx, sy)| {
+                if let Some(ev) = with(|s| {
+                    let (x, y, sx, sy) = s.mouse_pos(lp);
                     if std::mem::take(&mut s.dbl_pending) {
-                        dbl = Some((x, y));
+                        MouseEv::DoubleClick { x, y }
+                    } else {
+                        MouseEv::Up { button: Button::Left, x, y, sx, sy }
                     }
-                    MouseEv::Up { button: Button::Left, x, y, sx, sy }
-                });
-                if let Some((x, y)) = dbl {
-                    emit(AppEvent::Mouse(MouseEv::DoubleClick { x, y }));
+                }) {
+                    emit(AppEvent::Mouse(ev));
                     pump();
                 }
                 LRESULT(0)

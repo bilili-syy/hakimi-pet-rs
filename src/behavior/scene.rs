@@ -9,7 +9,7 @@ impl Behavior {
         if self.chase.is_some_and(|t| now < t + 1800) { return PetAnim::Chase; }
         if self.dragging_cls { return PetAnim::Wiggle; }
         match self.state {
-            St::Walk => PetAnim::Walk(now < self.fast_until && self.glow),
+            St::Walk => PetAnim::Walk((now < self.fast_until && self.glow) || self.sense.pouncing),
             St::Sleep => PetAnim::BreatheSlow,
             St::Dance => PetAnim::Still,
             St::Hiss => PetAnim::Hiss,
@@ -53,7 +53,7 @@ impl Behavior {
         let sad = m == MoodLevel::Sad;
         let tired = m == MoodLevel::Exhausted;
         let p = |dur: f32| ((now % dur as f64) / dur as f64) as f32;
-        let tail = if self.state == St::Happy {
+        let tail = if matches!(self.state, St::Happy | St::Cheer | St::Starry | St::Wink | St::Love) {
             anim::tail_wag(p(450.0))
         } else if sad || tired {
             anim::tail_droop(p(4000.0))
@@ -63,7 +63,7 @@ impl Behavior {
         };
         let star = if sad {
             anim::star_droop(p(4000.0))
-        } else if matches!(self.state, St::Happy | St::Eat) {
+        } else if matches!(self.state, St::Happy | St::Eat | St::Cheer | St::Starry) {
             anim::star_spin(p(1200.0))
         } else {
             anim::star_bob(p(3200.0))
@@ -83,11 +83,8 @@ impl Behavior {
         let bubble = self.bubble.as_ref().and_then(|b| {
             let op = self.bubble_fade.value(now);
             if op <= 0.0 { return None; }
-            // 超出 max-height 时慢慢往下滚（原版可以用滚轮，这里自动滚）
-            let scroll = if self.ui.bubble_overflow {
-                let span = b.dur.saturating_sub(3000).max(1000) as f32;
-                ((now.saturating_sub(b.shown) as f32 - 1500.0) / span).clamp(0.0, 1.0)
-            } else { 0.0 };
+            // 超出 max-height 时：默认慢慢往下滚，用户滚过滚轮后按手动位置停住
+            let scroll = b.scroll_at(now, self.ui.bubble_overflow);
             let scroll = (scroll * 100.0).round() / 100.0;
             Some(BubbleView { text: b.text.clone(), opacity: op, scroll })
         });
@@ -120,6 +117,7 @@ impl Behavior {
         self.scene.glow = self.glow;
         self.scene.lean = lean;
         self.scene.bubble = bubble;
+        self.scene.bubble_top = self.bubble_top;
         self.scene.status = status;
         self.scene.fx = self.fx.sprites(now);
         self.scene.live = live;

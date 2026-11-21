@@ -27,6 +27,7 @@ pub enum FxShape {
     Drop,
     Anger,
     Exclaim,
+    Question,
 }
 
 /// 一个特效字形。x/y 是元素左上角（#pet 盒子 200×293 内的坐标），size 是字号
@@ -94,6 +95,8 @@ pub struct Scene {
     /// 身子朝光标那边歪：头顶水平错切的像素（逻辑像素，向右为正；脚底不动）
     pub lean: f32,
     pub bubble: Option<BubbleView>,
+    /// 窗口顶部超出屏幕上沿时，气泡往下挪多少逻辑像素以免被屏幕顶边截掉
+    pub bubble_top: f32,
     pub status: Option<StatusView>,
     pub zzz: Vec<ZGlyph>,
     pub fx: Vec<FxSprite>,
@@ -114,6 +117,7 @@ impl Default for Scene {
             glow: false,
             lean: 0.0,
             bubble: None,
+            bubble_top: 0.0,
             status: None,
             zzz: Vec::new(),
             fx: Vec::new(),
@@ -402,6 +406,7 @@ impl Renderer {
         let layers = match &skin { Some((k, _)) => skin_loader::strip_layers(layers, k), None => layers };
         let skinned = skin.is_some();
         let base = skin.map(|s| s.1).or_else(|| self.sprites.asset(&layers.base, sw, sh));
+        let mut prev_layers = None;
         if let Some(base) = &base {
             if scene.glow {
                 let key = format!("glow:{}", layers.base);
@@ -434,7 +439,15 @@ impl Renderer {
             let prev = match scene.live.prev_face {
                 Some(pf) if scene.live.prev_alpha > 0.003 && !skinned => {
                     let pl = sprites::layers_for(pf, &scene.costume, &scene.outfits);
-                    if pl.base == layers.base { None } else { self.sprites.asset(&pl.base, sw, sh) }
+                    if pl.base == layers.base {
+                        None
+                    } else {
+                        let img = self.sprites.asset(&pl.base, sw, sh);
+                        if img.is_some() {
+                            prev_layers = Some(pl);
+                        }
+                        img
+                    }
                 }
                 _ => None,
             };
@@ -476,22 +489,35 @@ impl Renderer {
             }
         }
         let full_box = Transform::from_scale(PET_W / sw as f32, PET_H / sh as f32);
-        if layers.tail
+        // 从非分层表情淡回分层表情时，旧图自带尾巴/星星以 prev_alpha 淡出，分层尾巴/星星按 (1 - prev_alpha) 淡入，杜绝双尾巴/双星星叠影
+        let tail_op = match &prev_layers {
+            Some(pl) if layers.tail && !pl.tail => (1.0 - scene.live.prev_alpha).clamp(0.0, 1.0),
+            _ if layers.tail => 1.0,
+            _ => 0.0,
+        };
+        if tail_op > 0.003
             && let Some((t, ox, oy)) = self.cropped(sprites::TAIL, sw, sh)
         {
             let (dx, dy) = live::offset_at(&scene.live, 0.6, 0.797);
             let m = body.pre_translate(dx, dy).pre_concat(xf_matrix(&scene.tail, 0.6 * PET_W, 0.797 * PET_H)).pre_concat(full_box).pre_translate(ox, oy);
-            pm.draw_pixmap(0, 0, t.as_ref().as_ref(), &paint, m, None);
+            let tp = PixmapPaint { opacity: tail_op, ..paint };
+            pm.draw_pixmap(0, 0, t.as_ref().as_ref(), &tp, m, None);
         }
-        if layers.star
+        let star_op = match &prev_layers {
+            Some(pl) if layers.star && !pl.star => (1.0 - scene.live.prev_alpha).clamp(0.0, 1.0),
+            _ if layers.star => 1.0,
+            _ => 0.0,
+        };
+        if star_op > 0.003
             && let Some((s, ox, oy)) = self.cropped(sprites::STAR, sw, sh)
         {
             let lift = live::row_lift(&scene.live, 0.123);
             let m = body.pre_translate(0.0, -lift).pre_concat(xf_matrix(&scene.star, 0.395 * PET_W, 0.123 * PET_H)).pre_concat(full_box).pre_translate(ox, oy);
-            pm.draw_pixmap(0, 0, s.as_ref().as_ref(), &paint, m, None);
+            let sp = PixmapPaint { opacity: star_op, ..paint };
+            pm.draw_pixmap(0, 0, s.as_ref().as_ref(), &sp, m, None);
             if scene.star.bright > 1.001 {
                 // brightness(b) ≈ 再叠一层 (b-1) 的加色
-                let p = PixmapPaint { opacity: (scene.star.bright - 1.0).min(1.0), blend_mode: BlendMode::Plus, quality: FilterQuality::Bilinear };
+                let p = PixmapPaint { opacity: ((scene.star.bright - 1.0) * star_op).min(1.0), blend_mode: BlendMode::Plus, quality: FilterQuality::Bilinear };
                 pm.draw_pixmap(0, 0, s.as_ref().as_ref(), &p, m, None);
             }
         }
@@ -616,9 +642,12 @@ impl Renderer {
                 .map(|(pm, rect)| Layer { key, pm, x: (8.0 * s).round() as i32, y: 0, rect });
         }
         if let Some(l) = &self.bubble {
+            let max_y = (WIN_H as f32 - l.rect.h - 6.0).max(0.0);
+            let by = scene.bubble_top.clamp(0.0, max_y);
+            let y_px = (by * s).round() as i32;
             let p = PixmapPaint { opacity: b.opacity, ..Default::default() };
-            pm.draw_pixmap(l.x, l.y, l.pm.as_ref(), &p, Transform::identity(), None);
-            self.bubble_rect = Some(l.rect);
+            pm.draw_pixmap(l.x, y_px, l.pm.as_ref(), &p, Transform::identity(), None);
+            self.bubble_rect = Some(Rect { y: by, ..l.rect });
         }
     }
 

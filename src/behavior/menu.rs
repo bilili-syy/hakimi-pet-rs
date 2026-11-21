@@ -53,6 +53,18 @@ impl Behavior {
             MenuAction::Walk => self.go_walk(),
             MenuAction::Status => self.show_status(),
             MenuAction::Chat => self.open_chat(),
+            MenuAction::ChatStop => self.chat_stop(),
+            MenuAction::CopyBubble => {
+                if self.last_bubble_text.trim().is_empty() {
+                    self.show_bubble("还没有可以复制的话喵～".into(), Some(self.now + 2000), 2000, 0, false);
+                } else {
+                    let t = self.last_bubble_text.clone();
+                    self.call(format!("copy:{t}"));
+                    let ok = if self.io { crate::platform::copy_text(&t) } else { true };
+                    let msg = if ok { "刚才那句话复制到剪贴板啦喵～" } else { "剪贴板正忙，没复制上喵…" };
+                    self.show_bubble(msg.into(), Some(self.now + 2200), 2200, 0, false);
+                }
+            }
             MenuAction::Costume(id) => {
                 // 「🎭 角色」子菜单（skin:…）
                 if self.on_skin_menu(&id) { return; }
@@ -73,8 +85,8 @@ impl Behavior {
                     let cfg = crate::core::config::reload();
                     // 设置窗口里关了声音：正在念的停掉，并中止未念完的语音回答队列
                     if !cfg.tts.enabled {
-                        self.cv_disable_tts();
                         self.stop_voice();
+                        self.cv_disable_tts();
                     }
                     (cfg.costume, cfg.outfit)
                 } else {
@@ -87,8 +99,8 @@ impl Behavior {
             MenuAction::Tts(on) => {
                 if self.io { crate::core::config::update(|c| c.tts.enabled = on); }
                 if !on {
-                    self.cv_disable_tts();
                     self.stop_voice();
+                    self.cv_disable_tts();
                 }
             }
             MenuAction::TtsChatOnly(on) => {
@@ -108,18 +120,17 @@ impl Behavior {
                 self.say(&pick(lines::FORGOT), 2600);
             }
             MenuAction::ToggleVisible => {
-                // 藏起来时顺手停掉正在跳的舞和外放，免得窗口隐藏还在背后出鼓点/跑高帧率跟拍
-                if self.routine.is_some() {
-                    self.finish_routine(false);
-                } else if self.state == St::Dance {
-                    self.end_dance();
-                }
+                // 藏起来时顺手停掉正在跳的舞、外放、语音队列和置顶玩具，免得窗口隐藏还在背后出鼓点/悬浮玩具
+                self.cleanup_for_hide();
             }
-            // 平台层自己处理：番茄钟（会发 AppEvent::Pomodoro）、叫到中间（会发 Peek）、
+            MenuAction::CallToCenter => {
+                self.reset_aerial_flags();
+            }
+            // 平台层自己处理：番茄钟（会发 AppEvent::Pomodoro）、叫到中间（还会发 Peek）、
             // 打开文件/文件夹、自启、退出（会调 Handler::quit）
             MenuAction::PomodoroStart(_) | MenuAction::PomodoroStop | MenuAction::OpenSongDir | MenuAction::OpenSettings
             | MenuAction::OpenConfigFile
-            | MenuAction::OpenDataDir | MenuAction::AutoStart(_) | MenuAction::CallToCenter
+            | MenuAction::OpenDataDir | MenuAction::AutoStart(_)
             | MenuAction::Quit => {}
         }
     }

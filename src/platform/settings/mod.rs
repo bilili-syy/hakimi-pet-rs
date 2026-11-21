@@ -40,6 +40,7 @@ mod report_page;
 mod paint;
 pub use logic::*;
 use memo_page::*;
+pub(crate) use paint::{aa_round, style_caption, ui_faces};
 use paint::*;
 
 const CLASS: PCWSTR = w!("HakimiPetRsSettings");
@@ -95,6 +96,8 @@ const LB_SETCURSEL: u32 = 0x186;
 const LB_GETCURSEL: u32 = 0x188;
 const LB_SETITEMHEIGHT: u32 = 0x1A0;
 const LBN_SELCHANGE: u32 = 1;
+const LBN_DBLCLK: u32 = 2;
+const EN_CHANGE: u32 = 0x300;
 const BM_GETCHECK: u32 = 0xF0;
 const BM_SETCHECK: u32 = 0xF1;
 const EM_SETPASSWORDCHAR: u32 = 0xCC;
@@ -267,8 +270,9 @@ struct Dlg {
     memo_ids: Vec<u64>,
     memo_sel: Option<u64>,
     memo_ver: u64,
-    /// 周报页：勾选框第 i 个对应的记忆
+    /// 周报页：勾选框第 i 个对应的记忆 + 右侧实时缩略图 (BGRA, w, h)
     report_mems: Vec<String>,
+    report_preview: Option<(Vec<u8>, i32, i32)>,
 }
 
 thread_local! {
@@ -280,6 +284,8 @@ thread_local! {
     static FIELD_BRUSH: Cell<isize> = const { Cell::new(0) };
     /// 「测试连接」「试听」结果颜色：0 灰 / 1 绿 / -1 红
     static RESULT_COLOR: Cell<[i8; 2]> = const { Cell::new([0, 0]) };
+    /// 备忘录页提示文字是否为报错（⚠️ 开头标红，其余标绿）
+    pub(super) static MEMO_MSG_ERR: Cell<bool> = const { Cell::new(false) };
 }
 static HWND_ATOMIC: AtomicIsize = AtomicIsize::new(0);
 static GEN: AtomicU64 = AtomicU64::new(1);
@@ -298,13 +304,83 @@ pub fn is_open() -> bool {
     HWND_ATOMIC.load(Ordering::Relaxed) != 0
 }
 
-/// 主消息循环里先给设置窗口一次机会（Tab 切换焦点、回车=保存、Esc=取消）
+pub(crate) fn hwnd() -> Option<HWND> {
+    let h = HWND_ATOMIC.load(Ordering::Relaxed);
+    (h != 0).then_some(HWND(h as *mut _))
+}
+
+/// 主消息循环里先给设置窗口一次机会（Tab 切换焦点、回车=保存/激活聚焦按钮、Esc=取消、备忘列表按 Del 删除）
 pub fn dialog_message(msg: &MSG) -> bool {
     let h = HWND_ATOMIC.load(Ordering::Relaxed);
     if h == 0 {
         return false;
     }
-    unsafe { IsDialogMessageW(HWND(h as *mut _), msg).as_bool() }
+    let hwnd = HWND(h as *mut _);
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool()
+            || (msg.hwnd != hwnd && !windows::Win32::UI::WindowsAndMessaging::IsChild(hwnd, msg.hwnd).as_bool())
+        {
+            return false;
+        }
+    }
+    if msg.message == 0x0100 /* WM_KEYDOWN */ {
+        // 备忘录列表聚焦时按 Delete 键直接触发删除
+        if msg.wParam.0 == 0x2E /* VK_DELETE */ {
+            let on_memo_list = with(|d| {
+                let f = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+                d.page == 4 && d.c(ID_MEMO_LIST) == f && d.memo_sel.is_some()
+            })
+            .unwrap_or(false);
+            if on_memo_list {
+                memo_del_selected(hwnd);
+                return true;
+            }
+        }
+        // 回车键：备忘录输入框里直接添加/保存；聚焦在自绘按钮（BS_OWNERDRAW）上时激活该按钮
+        if msg.wParam.0 == 0x0D /* VK_RETURN */ {
+            let focus = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+            let in_memo_edit = with(|d| {
+                d.page == 4 && [ID_MEMO_TEXT, ID_MEMO_DATE, ID_MEMO_TIME].iter().any(|i| d.c(*i) == focus)
+            })
+            .unwrap_or(false);
+            if in_memo_edit {
+                memo_save_ui(hwnd);
+                return true;
+            }
+            unsafe {
+                if !focus.is_invalid() && windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(focus).as_bool() {
+                    let mut cls = [0u16; 16];
+                    let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(focus, &mut cls).max(0) as usize;
+                    let style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(
+                        focus,
+                        windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+                    ) as u32;
+                    if String::from_utf16_lossy(&cls[..n]).eq_ignore_ascii_case("Button") && (style & 0x0F) == BS_OWNERDRAW {
+                        let id = windows::Win32::UI::WindowsAndMessaging::GetDlgCtrlID(focus);
+                        if id > 0 {
+                            SendMessageW(hwnd, WM_COMMAND, Some(WPARAM(id as usize)), Some(LPARAM(focus.0 as isize)));
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    unsafe { IsDialogMessageW(hwnd, msg).as_bool() }
+}
+
+/// 打开设置窗口并（若在 AI 页且未填 Key）直接把光标放进 API Key 框
+pub fn open_focus_key(page: u8) {
+    open(page);
+    if page == 0 {
+        with(|d| {
+            if !preset_is_local(d.preset) && get_text(d.c(ID_KEY)).trim().is_empty() {
+                unsafe {
+                    let _ = SetFocus(Some(d.c(ID_KEY)));
+                }
+            }
+        });
+    }
 }
 
 /// 打开设置窗口（已经开着就恢复并切到对应页提到前台）。page：0 AI / 1 语音 / 2 常规 / 3 备忘录 / 4 周报
@@ -456,6 +532,7 @@ fn create_inner(page: u8) -> windows::core::Result<()> {
             memo_sel: None,
             memo_ver: 0,
             report_mems: Vec::new(),
+            report_preview: None,
         };
         let _ = d.make_fonts();
         if let Some(i) = d.icon {
@@ -473,7 +550,7 @@ fn create_inner(page: u8) -> windows::core::Result<()> {
 }
 
 /// tray.png → 窗口图标（解码完就丢，只留 HICON）
-fn make_icon() -> Option<HICON> {
+pub(crate) fn make_icon() -> Option<HICON> {
     let png = crate::assets::get("tray.png")?;
     let pm = tiny_skia::Pixmap::decode_png(png).ok()?;
     let (w, h) = (pm.width() as i32, pm.height() as i32);
@@ -809,7 +886,7 @@ impl Dlg {
         // ---------------- 备忘录（改动马上写进 memo.json，不用点「保存」）
         let p = 4;
         self.title(p, "备忘录");
-        self.hint(p, "这一页改动马上生效。聊天里说「提醒我…」也能加。", [X0, 44.0, W - X0 - 16.0, 20.0]);
+        self.hint(p, "改动马上生效（双击条目=完成，按 Del=删除）。聊天里说「提醒我…」也能加。", [X0, 44.0, W - X0 - 16.0, 20.0]);
         let mw = W - X0 - 16.0;
         let list = self.add(p, w!("LISTBOX"), "", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, 0, ID_MEMO_LIST, [X0 + 6.0, 72.0, mw - 10.0, 164.0]);
         self.frames.push(([X0, 68.0, mw, 172.0], list, p));
@@ -833,7 +910,7 @@ impl Dlg {
             self.button(p, id, s, 0, [X0 + i as f32 * (bw + 10.0), 366.0, bw, 30.0]);
         }
         self.button(p, ID_MEMO_CLEAR, "清空已完成", 0, [X0, 406.0, 110.0, 30.0]);
-        self.add(p, w!("STATIC"), "", SS_CENTERIMAGE, 0, ID_MEMO_MSG, [X0 + 122.0, 406.0, mw - 122.0, 30.0]);
+        self.add(p, w!("STATIC"), "", 0, 0, ID_MEMO_MSG, [X0 + 118.0, 408.0, mw - 118.0, 42.0]);
 
         // ---------------- 周报
         self.report_build();
@@ -918,12 +995,20 @@ impl Dlg {
         cue(base, if p.provider == "gemini" { "留空 = 用官方地址（一般不用改）" } else { "https://…/v1" });
     }
 
-    /// 看屏吐槽勾选框：按 AI 页现在选的模型判断能不能看图，不能就灰掉
+    /// 看屏吐槽勾选框：不再按模型名白名单硬禁（新模型如 deepseek-v4 或中转别名都能看图）；只排除明确的语音/向量专用模型
     fn update_roast(&self) {
-        let ok = crate::services::ai::vision_ok(PRESETS[self.preset].provider, get_text(self.c(ID_MODEL)).trim());
+        let model = get_text(self.c(ID_MODEL));
+        let ok = model.trim().is_empty() || crate::services::ai::vision_ok(PRESETS[self.preset].provider, model.trim());
         let h = self.c(ID_ROAST);
         enable(h, ok);
-        set_text(h, if ok { ROAST_ON } else { ROAST_NO });
+        let text = if !ok {
+            ROAST_NO
+        } else if checked(h) && super::roast::hotkey_conflict() {
+            ROAST_CONFLICT
+        } else {
+            ROAST_ON
+        };
+        set_text(h, text);
     }
 
     fn update_volume_label(&self) {
@@ -970,9 +1055,15 @@ impl Dlg {
                 let _ = ShowWindow(c.h, if show { SW_SHOW } else { SW_HIDE });
             }
         }
-        // 备忘录页不走「保存」，「恢复默认」藏起来免得误会；只在备忘录页开 1 秒刷新定时器
+        // 备忘录与周报页不走「保存」：「恢复默认」藏起来；若前 3 页没有未保存改动，底部只留一个「关闭」按钮免得困惑
+        let instant_page = self.page >= 4;
+        let show_save = !instant_page || self.dirty();
+        set_text(self.c(IDCANCEL), if show_save { "取消" } else { "关闭" });
+        enable(self.c(ID_DEFAULTS), !instant_page);
+        enable(self.c(IDOK), show_save);
         unsafe {
-            let _ = ShowWindow(self.c(ID_DEFAULTS), if self.page >= 4 { SW_HIDE } else { SW_SHOW });
+            let _ = ShowWindow(self.c(ID_DEFAULTS), if instant_page { SW_HIDE } else { SW_SHOW });
+            let _ = ShowWindow(self.c(IDOK), if show_save { SW_SHOW } else { SW_HIDE });
             if self.page == 4 {
                 windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(self.hwnd), 1, 1000, None);
             } else {
@@ -1075,6 +1166,9 @@ impl Dlg {
         }
         send(self.c(ID_LIST), LB_SETITEMHEIGHT, 0, self.px(40.0) as isize);
         Self::delete_fonts(old_fonts);
+        if self.page == 5 {
+            self.report_update_preview();
+        }
         repaint(self.hwnd);
     }
 }
@@ -1112,6 +1206,7 @@ fn differs(a: &Config, b: &Config) -> bool {
 }
 
 const ROAST_ON: &str = "看屏吐槽（Ctrl+Alt+K，先看缩略图确认才发，不存盘）";
+const ROAST_CONFLICT: &str = "看屏吐槽（⚠️ Ctrl+Alt+K 热键被占用，可用右键菜单触发）";
 const ROAST_NO: &str = "看屏吐槽（当前模型不能看图，换 Gemini 等）";
 const X0: f32 = 140.0;
 const LW: f32 = 84.0;
@@ -1128,6 +1223,35 @@ fn with<R>(f: impl FnOnce(&mut Dlg) -> R) -> Option<R> {
 /// 菜单动作（走主窗口的菜单队列，和点菜单一样）
 fn menu(id: &str) {
     super::menu::push_id(id.to_string());
+}
+
+fn memo_done_selected(hwnd: HWND) {
+    if let Some(Some(id)) = with(|d| d.memo_sel) {
+        // 走菜单同一条路：她会说一句「划掉啦」；50ms 后立刻刷新列表免得等 1 秒
+        menu(&format!("memo:done:{id}"));
+        with(|d| {
+            d.memo_clear_form();
+            d.memo_msg("✔ 划掉啦");
+        });
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, 50, None);
+        }
+    }
+}
+
+fn memo_del_selected(hwnd: HWND) {
+    if let Some(Some(id)) = with(|d| d.memo_sel)
+        && msgbox(hwnd, "删掉这条备忘吗？", MB_YESNO | MB_ICONQUESTION) == IDYES.0
+    {
+        menu(&format!("memo:del:{id}"));
+        with(|d| {
+            d.memo_clear_form();
+            d.memo_msg("已删除");
+        });
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, 50, None);
+        }
+    }
 }
 
 fn on_command(hwnd: HWND, id: i32, code: u32) {
@@ -1182,6 +1306,9 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
         (ID_MOYU, 0) => {
             with(|d| d.update_moyu_enable());
         }
+        (ID_ROAST, 0) => {
+            with(|d| d.update_roast());
+        }
         (ID_DATADIR, 0) => menu("datadir"),
         (ID_RAWFILE, 0) => menu("settings:file"),
         (ID_FORGET, 0) => {
@@ -1191,6 +1318,9 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
         }
         (ID_RELOAD, 0) => {
             let c = config::reload();
+            if let Some(pet) = super::main_hwnd() {
+                super::roast::sync_hotkey(pet);
+            }
             let a = super::sys::is_autostart();
             with(|d| {
                 d.orig = c.clone();
@@ -1215,6 +1345,33 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
         (ID_MEMO_LIST, LBN_SELCHANGE) => {
             with(|d| d.memo_pick());
         }
+        (ID_MEMO_LIST, LBN_DBLCLK) => {
+            let hit_item = with(|d| {
+                if d.memo_ids.is_empty() {
+                    return false;
+                }
+                let list = d.c(ID_MEMO_LIST);
+                let pos = unsafe { windows::Win32::UI::WindowsAndMessaging::GetMessagePos() };
+                let mut pt = windows::Win32::Foundation::POINT {
+                    x: (pos & 0xffff) as i16 as i32,
+                    y: ((pos >> 16) & 0xffff) as i16 as i32,
+                };
+                let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(list, &mut pt) };
+                let lp = ((pt.y as u16 as usize) << 16) | (pt.x as u16 as usize);
+                let res = send(list, 0x01A9 /* LB_ITEMFROMPOINT */, 0, lp as isize) as usize;
+                let outside = ((res >> 16) & 0xffff) != 0;
+                let idx = res & 0xffff;
+                !outside && idx < d.memo_ids.len()
+            })
+            .unwrap_or(false);
+            if hit_item {
+                with(|d| d.memo_pick());
+                memo_done_selected(hwnd);
+            }
+        }
+        (ID_MEMO_DATE, EN_CHANGE) | (ID_MEMO_TIME, EN_CHANGE) | (ID_MEMO_REPEAT, CBN_SELCHANGE) => {
+            with(|d| d.memo_preview_when());
+        }
         (ID_MEMO_NEW, 0) => {
             with(|d| {
                 d.memo_clear_form();
@@ -1225,28 +1382,10 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
             });
         }
         (ID_MEMO_SAVE, 0) => memo_save_ui(hwnd),
-        (ID_MEMO_DONE, 0) => {
-            if let Some(Some(id)) = with(|d| d.memo_sel) {
-                // 走菜单同一条路：她会说一句「划掉啦」；50ms 后立刻刷新列表免得等 1 秒
-                menu(&format!("memo:done:{id}"));
-                with(|d| {
-                    d.memo_clear_form();
-                    d.memo_msg("✔ 划掉啦");
-                });
-                unsafe { windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, 50, None); }
-            }
-        }
-        (ID_MEMO_DEL, 0) => {
-            if let Some(Some(id)) = with(|d| d.memo_sel)
-                && msgbox(hwnd, "删掉这条备忘吗？", MB_YESNO | MB_ICONQUESTION) == IDYES.0
-            {
-                menu(&format!("memo:del:{id}"));
-                with(|d| {
-                    d.memo_clear_form();
-                    d.memo_msg("已删除");
-                });
-                unsafe { windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, 50, None); }
-            }
+        (ID_MEMO_DONE, 0) => memo_done_selected(hwnd),
+        (ID_MEMO_DEL, 0) => memo_del_selected(hwnd),
+        (id, 0) if (ID_REPORT_MEM0..ID_REPORT_MEM0 + report_page::REPORT_MEMS as i32).contains(&id) => {
+            with(|d| d.report_update_preview());
         }
         (ID_REPORT_MAKE, 0) => report_page::report_make(),
         (ID_REPORT_OPEN, 0) => {
@@ -1564,6 +1703,71 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                     return LRESULT(1);
                 }
+                if over != hwnd && windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(over).as_bool() {
+                    let mut cls = [0u16; 16];
+                    let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(over, &mut cls).max(0) as usize;
+                    let st = windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(
+                        over,
+                        windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+                    ) as u32;
+                    if String::from_utf16_lossy(&cls[..n]).eq_ignore_ascii_case("Button") && (st & 0x0F) == BS_OWNERDRAW {
+                        if let Ok(c) = LoadCursorW(None, IDC_HAND) {
+                            SetCursor(Some(c));
+                        }
+                        return LRESULT(1);
+                    }
+                }
+                if over == hwnd {
+                    let mut pt = windows::Win32::Foundation::POINT::default();
+                    if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt).is_ok()
+                        && windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt).as_bool()
+                    {
+                        let in_edit_frame = with(|d| {
+                            d.frames.iter().any(|(r, h, p)| {
+                                (*p == 0 || *p == d.page)
+                                    && is_edit(*h)
+                                    && windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(*h).as_bool()
+                                    && windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(*h).as_bool()
+                                    && pt.x >= d.px(r[0])
+                                    && pt.x < d.px(r[0] + r[2])
+                                    && pt.y >= d.px(r[1])
+                                    && pt.y < d.px(r[1] + r[3])
+                            })
+                        })
+                        .unwrap_or(false);
+                        if in_edit_frame {
+                            if let Ok(c) = LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_IBEAM) {
+                                SetCursor(Some(c));
+                            }
+                            return LRESULT(1);
+                        }
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            0x0201 /* WM_LBUTTONDOWN */ => {
+                let x = (lp.0 & 0xffff) as i16 as i32;
+                let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+                let hit_edit = with(|d| {
+                    d.frames
+                        .iter()
+                        .find(|(r, h, p)| {
+                            (*p == 0 || *p == d.page)
+                                && is_edit(*h)
+                                && windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(*h).as_bool()
+                                && windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(*h).as_bool()
+                                && x >= d.px(r[0])
+                                && x < d.px(r[0] + r[2])
+                                && y >= d.px(r[1])
+                                && y < d.px(r[1] + r[3])
+                        })
+                        .map(|(_, h, _)| *h)
+                })
+                .flatten();
+                if let Some(e) = hit_edit {
+                    let _ = SetFocus(Some(e));
+                    return LRESULT(0);
+                }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_RESULT => {
@@ -1600,7 +1804,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 1);
                 let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2);
                 RESULTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                if let Some(h) = super::main_hwnd() {
+                if let Some(h) = super::main_hwnd()
+                    && windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h).as_bool()
+                    && !super::is_chat_open()
+                {
                     let _ = SetFocus(Some(h));
                 }
                 LRESULT(0)

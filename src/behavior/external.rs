@@ -68,7 +68,7 @@ impl Behavior {
         let (st, pool, fx, n) = match e.kind {
             ExtKind::Done => (St::Starry, Some(lines::EXT_DONE), FxKind::Spark, 6),
             ExtKind::Error => (St::Scared, Some(lines::EXT_ERROR), FxKind::Sweat, 3),
-            ExtKind::Wait => (St::Confused, Some(lines::EXT_WAIT), FxKind::Exclaim, 1),
+            ExtKind::Wait => (St::Confused, Some(lines::EXT_WAIT), FxKind::Question, 1),
             ExtKind::Info => (St::Happy, None, FxKind::Note, 1),
         };
         let line = pool.map(|p| pick(p).replace("{}", &src));

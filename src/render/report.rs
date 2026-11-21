@@ -52,6 +52,11 @@ pub fn face_name(key: &str) -> &'static str {
         "Scared" => "害怕",
         "Starry" => "星星眼",
         "Puff" => "鼓脸",
+        "Wink" => "眨眼",
+        "Drool" => "流口水",
+        "Sweat" => "流汗",
+        "Cheer" => "欢呼",
+        "Sleepy" => "犯困",
         _ => "开心",
     }
 }

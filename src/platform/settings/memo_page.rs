@@ -42,11 +42,52 @@ impl Dlg {
     }
 
     pub(super) fn memo_msg(&self, s: &str) {
+        MEMO_MSG_ERR.with(|c| c.set(s.starts_with("⚠️")));
         set_text(self.c(ID_MEMO_MSG), s);
+        repaint(self.c(ID_MEMO_MSG));
     }
 
-    /// 点列表里一条：填进下面的表单
+    /// 改日期/时间/重复下拉框时：底下即时预告什么时候会叫你
+    pub(super) fn memo_preview_when(&self) {
+        use crate::core::memo as store;
+        let d = get_text(self.c(ID_MEMO_DATE));
+        let t = get_text(self.c(ID_MEMO_TIME));
+        let repeat = REPEATS[combo_sel(self.c(ID_MEMO_REPEAT)).min(REPEATS.len() - 1)].0;
+        if d.trim().is_empty() && t.trim().is_empty() && repeat == Repeat::None {
+            if !get_text(self.c(ID_MEMO_TEXT)).trim().is_empty() {
+                self.memo_msg("📝 时间留空 = 随手记（不会响铃）");
+            } else {
+                self.memo_msg("");
+            }
+            return;
+        }
+        let now = store::Now::get().dt;
+        match parse_when(&d, &t, repeat, now) {
+            Ok(Some(dt)) => {
+                let sample = store::Item {
+                    id: 0,
+                    text: String::new(),
+                    time: Some(dt.fmt()),
+                    repeat,
+                    done: false,
+                    created: String::new(),
+                    snooze: None,
+                    fired: false,
+                    extra: Default::default(),
+                };
+                self.memo_msg(&format!("⏰ 将在 {} 提醒你", sample.when_label(now)));
+            }
+            Ok(None) => self.memo_msg("📝 时间留空 = 随手记（不会响铃）"),
+            Err(e) => self.memo_msg(&format!("⚠️ {e}")),
+        }
+    }
+
+    /// 点列表里一条：填进下面的表单（列表为空时点占位提示行不清空用户正在填的草稿）
     pub(super) fn memo_pick(&mut self) {
+        if self.memo_ids.is_empty() {
+            send(self.c(ID_MEMO_LIST), LB_SETCURSEL, usize::MAX, 0);
+            return;
+        }
         let i = send(self.c(ID_MEMO_LIST), LB_GETCURSEL, 0, 0);
         let Some(&id) = usize::try_from(i).ok().and_then(|i| self.memo_ids.get(i)) else { return self.memo_clear_form() };
         let Some(it) = crate::core::memo::get(id) else { return };

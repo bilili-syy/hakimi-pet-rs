@@ -1,8 +1,22 @@
 //! 台词：原样照搬 renderer.js 的 LINES / COSTUME_LINE / MOYU_NAME（文案以原版为准）
 use crate::types::VoiceMood;
 
-pub const POKE: &[&str] = &["喵？找哈基米有事吗～", "再戳要挠你了喵！", "哈基米在思考宇宙的奥秘喵", "要哈基米帮你查点什么吗？", "哈基米什么都知道哦～"];
-pub const POKE_GREAT: &[&str] = &["今天心情超好喵！", "嘿嘿，你也在摸鱼吗？", "哈基米最喜欢你了～"];
+pub const POKE: &[&str] = &[
+    "喵？找哈基米有事吗～",
+    "再戳要挠你了喵！",
+    "哈基米在思考宇宙的奥秘喵",
+    "要哈基米帮你查点什么吗？",
+    "哈基米什么都知道哦～",
+    "戳一下就冒个泡～啵！",
+    "喵呜～手痒痒想撸猫了吗？",
+];
+pub const POKE_GREAT: &[&str] = &[
+    "今天心情超好喵！",
+    "嘿嘿，你也在摸鱼吗？",
+    "哈基米最喜欢你了～",
+    "尾巴摇成螺旋桨啦喵～",
+    "哼哼～今天也是元气满满的小猫喵！",
+];
 pub const POKE_SAD: &[&str] = &["……哈基米不想说话", "哼，没人理哈基米", "心情不好喵……"];
 pub const POKE_TIRED: &[&str] = &["好困……别戳了喵……", "让哈基米睡会儿嘛"];
 pub const POKE_HUNGRY: &[&str] = &["先、先给哈基米吃的嘛……", "肚子在叫喵……听到了吗", "没力气陪你玩了，饿……"];
@@ -14,7 +28,7 @@ pub const PAT: &[&str] = &["呼噜呼噜……再摸一下嘛", "耳朵、耳朵
 pub const DRAG: &[&str] = &["放、放哈基米下来喵！", "喵啊啊啊——", "不许拎哈基米！"];
 pub const LAND_BIG: &[&str] = &["好痛喵！你是故意的吧", "哈基米的尾巴……毛都炸了"];
 pub const HELLO: &[&str] = &["哈基米上线啦喵～", "今天也要一起加油喵！"];
-pub const WALK: &[&str] = &["去巡逻一下喵～", "哈基米出门散步！", "这边好像有什么好玩的"];
+pub const WALK: &[&str] = &["去巡逻一下喵～", "哈基米出门散步！", "这边好像有什么好玩的", "哒哒哒～小猫巡逻队路过喵"];
 pub const EDGE: &[&str] = &["到头了喵，掉头！", "屏幕的尽头……什么都没有喵"];
 pub const SIT: &[&str] = &["坐一会儿喵", "哈基米歇歇脚～"];
 pub const SLEEPY: &[&str] = &["哈——欠——困了喵……", "眼皮好重……"];
@@ -63,6 +77,38 @@ pub const CONFUSED: &[&str] = &["嗯？戳哈基米干嘛喵？", "诶……这�
 pub const SCARED: &[&str] = &["吓、吓死哈基米了！", "呜哇——好高好可怕喵！", "不要再摔哈基米了……"];
 pub const STARRY: &[&str] = &["哇——眼睛都要冒星星了喵！", "是小鱼干！是小鱼干！", "好厉害好厉害！哈基米超激动！"];
 pub const PUFF: &[&str] = &["哼！不理你了喵！", "气鼓鼓！再戳就咬你喵！", "要三条小鱼干才能哄好哈基米！"];
+// ---- 新表情与待机小动作台词
+pub const WINK: &[&str] = &[
+    "诶嘿～被哈基米电到了没有喵？",
+    "给你比个耶～今天也要开心哦喵！",
+    "略略略～猜猜哈基米在想什么喵",
+    "偷偷对你眨眨眼，这是我们的暗号喵～",
+];
+pub const DROOL: &[&str] = &[
+    "吸溜……突然好想吃烤小鱼干喵",
+    "刚才好像闻到炸鸡和小鱼干的味道了喵……",
+    "吸溜～金枪鱼罐头……梦里全都是罐头喵",
+];
+pub const SWEAT: &[&str] = &[
+    "呃……这、这题超纲了喵……",
+    "啊哈哈……哈基米什么都没看见喵",
+    "脑门冒汗了喵……假装无事发生～",
+];
+pub const CHEER: &[&str] = &[
+    "好耶——！给主人举爪爪打 call 喵！",
+    "冲呀冲呀！哈基米永远站你这边喵！",
+    "太棒啦！举高肉垫为你欢呼喵～",
+];
+pub const SLEEPY_NOD: &[&str] = &[
+    "唔……脑袋一点一点的，好犯困喵……",
+    "眼皮在打架了喵……揉揉眼睛",
+    "迷迷糊糊……差点站着睡着了喵",
+];
+pub const IDLE_CURIOUS: &[&str] = &[
+    "咦？刚才屏幕是不是闪了一下喵？",
+    "歪头——主人在忙什么好玩的呀？",
+    "唔？尾巴尖好像感应到什么了喵",
+];
 pub const ALONE: &[&str] = &["人呢？哈基米自己玩一会儿喵～", "好安静……主人去哪儿了喵", "没人陪……那哈基米先打个盹"];
 pub const TYPING: &[&str] = &["敲键盘好快喵！加油加油～", "噼里啪啦——你今天好认真喵！", "哈基米给你打气！冲呀～"];
 pub const POUNCE: &[&str] = &["抓到了！……诶？又跑了喵！", "鼠标别跑！哈基米来啦！", "喵！那个箭头在挑衅我！"];
@@ -152,6 +198,14 @@ pub const PREWARM: &[(&[&str], VoiceMood)] = &[
     (SCARED, VoiceMood::Sad),
     (STARRY, VoiceMood::Happy),
     (PUFF, VoiceMood::Mad),
+    (WINK, VoiceMood::Happy),
+    (DROOL, VoiceMood::Hungry),
+    (SWEAT, VoiceMood::Calm),
+    (CHEER, VoiceMood::Happy),
+    (SLEEPY_NOD, VoiceMood::Sleepy),
+    (IDLE_CURIOUS, VoiceMood::Think),
+    (ROAST_LOOK, VoiceMood::Think),
+    (CHAT_STOP, VoiceMood::Calm),
     (WELCOME, VoiceMood::Happy),
     (INTRO, VoiceMood::Happy),
     (ALONE, VoiceMood::Calm),

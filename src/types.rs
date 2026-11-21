@@ -16,15 +16,17 @@ pub enum Face {
     Shy, Dizzy, Surprised, Cry, Yawn, Love, Hiss, Stare, Dance, Honey,
     /// v1.1 新表情：委屈嘟嘴 / 得意叉腰 / 疑惑歪头 / 害怕发抖 / 星星眼 / 鼓脸生气
     Pout, Smug, Confused, Scared, Starry, Puff,
+    /// 新表情：俏皮眨眼 / 馋嘴流口水 / 尴尬流汗 / 举爪欢呼 / 迷糊犯困
+    Wink, Drool, Sweat, Cheer, Sleepy,
 }
 
 impl Face {
-    pub const ALL: [Face; 27] = [
+    pub const ALL: [Face; 32] = [
         Face::Idle, Face::Blink, Face::Happy, Face::Drag, Face::Sit, Face::Sleep, Face::Eat,
         Face::Hungry, Face::Think, Face::Walk1, Face::Walk2, Face::Shy, Face::Dizzy,
         Face::Surprised, Face::Cry, Face::Yawn, Face::Love, Face::Hiss, Face::Stare,
         Face::Dance, Face::Honey, Face::Pout, Face::Smug, Face::Confused, Face::Scared,
-        Face::Starry, Face::Puff,
+        Face::Starry, Face::Puff, Face::Wink, Face::Drool, Face::Sweat, Face::Cheer, Face::Sleepy,
     ];
     /// 对应 assets/sprites/<stem>.png
     pub fn stem(self) -> &'static str {
@@ -36,6 +38,8 @@ impl Face {
             Face::Yawn => "yawn", Face::Love => "love", Face::Hiss => "hiss", Face::Stare => "stare",
             Face::Dance => "dance", Face::Honey => "honey", Face::Pout => "pout", Face::Smug => "smug",
             Face::Confused => "confused", Face::Scared => "scared", Face::Starry => "starry", Face::Puff => "puff",
+            Face::Wink => "wink", Face::Drool => "drool", Face::Sweat => "sweat",
+            Face::Cheer => "cheer", Face::Sleepy => "sleepy",
         }
     }
 }
@@ -125,6 +129,10 @@ pub enum MenuAction {
     ExportChat,
     /// 「👀 看屏吐槽」：平台层截前台窗口、弹确认框，确认了发 ScreenRoast
     Roast,
+    /// 等回复时右键点「⏹ 停止等待回复」
+    ChatStop,
+    /// 「📋 复制刚才那句话」
+    CopyBubble,
 }
 
 // ---------------------------------------------------------------- 事件
@@ -373,6 +381,8 @@ pub enum WinCmd {
     /// 从坐着的地方跳下来（带重力落地，发 Landed）
     Unperch,
     Toy(ToyCmd),
+    /// 直接打开设置窗口指定分页（0 = AI 聊天）
+    OpenSettingsPage(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

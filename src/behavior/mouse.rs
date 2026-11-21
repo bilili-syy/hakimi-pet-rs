@@ -4,8 +4,8 @@ use super::*;
 impl Behavior {
     // ============================================================ 鼠标
     pub(super) fn zone(&self, x: f32, y: f32) -> Zone {
-        if self.ui.status.is_some_and(|r| r.contains(x, y)) { return Zone::Status; }
-        if self.ui.bubble.is_some_and(|r| r.contains(x, y)) { return Zone::Bubble; }
+        if self.status_fade.on && self.ui.status.is_some_and(|r| r.contains(x, y)) { return Zone::Status; }
+        if self.bubble_fade.on && self.ui.bubble.is_some_and(|r| r.contains(x, y)) { return Zone::Bubble; }
         Zone::Pet
     }
 
@@ -13,15 +13,46 @@ impl Behavior {
         match m {
             MouseEv::Down { button: Button::Left, x, y, sx, sy } => match self.zone(x, y) {
                 Zone::Status => { self.status_hide_at = None; self.status_fade.set(false, self.now); }
-                Zone::Bubble => {}
+                Zone::Bubble => {
+                    if self.memo_ringing() {
+                        let _ = self.memo_poke();
+                    } else if !self.waiting && !self.cv_click_bubble() {
+                        // 显示满 250ms 的普通气泡：左键一点即收起（避免刚弹出来误触）
+                        if self.bubble.as_ref().is_some_and(|b| self.now.saturating_sub(b.shown) >= 250) {
+                            self.dismiss_bubble();
+                        }
+                    }
+                }
                 Zone::Pet => { self.down = Some(Down { sx, sy, lx: None, dir: 0, flips: Vec::new() }); self.dragging = false; }
             },
-            MouseEv::Wheel { delta, x, y } => {
-                if self.zone(x, y) == Zone::Pet { self.on_wheel(delta); }
-            }
+            MouseEv::Wheel { delta, x, y } => match self.zone(x, y) {
+                Zone::Bubble if self.ui.bubble_overflow => {
+                    let now = self.now;
+                    if let Some(b) = &mut self.bubble {
+                        let cur = b.scroll_at(now, true);
+                        let step = -(delta as f32 / 120.0) * 0.22;
+                        b.manual_scroll = Some((cur + step).clamp(0.0, 1.0));
+                        b.hide_at = Some(b.hide_at.unwrap_or(now).max(now + 4500));
+                    }
+                }
+                Zone::Bubble if y >= PET_TOP => self.on_wheel(delta),
+                Zone::Pet => self.on_wheel(delta),
+                _ => {}
+            },
             MouseEv::Move { x, y, sx, sy } => {
+                let z = self.zone(x, y);
+                self.bubble_hover = self.down.is_none() && z == Zone::Bubble;
+                if self.bubble_hover && !self.memo_ringing()
+                    && let Some(b) = &mut self.bubble
+                    && self.bubble_fade.on
+                {
+                    b.hide_at = Some(b.hide_at.unwrap_or(self.now).max(self.now + 1800));
+                }
                 if self.down.is_none() { self.on_cursor(x, y); }
-                if self.down.is_some() { self.on_drag_move(sx, sy); } else if self.zone(x, y) == Zone::Pet { self.on_rub(x, y); }
+                if self.down.is_some() { self.on_drag_move(sx, sy); } else if z == Zone::Pet { self.on_rub(x, y); }
+            }
+            MouseEv::Leave => {
+                self.bubble_hover = false;
             }
             MouseEv::Up { button: Button::Left, .. } => {
                 if self.down.is_none() { return; }
@@ -37,11 +68,22 @@ impl Behavior {
                 self.down = None;
                 self.dragging = false;
             }
-            // 备忘提醒响着时双击 = 稍后再提醒，否则（不在逗猫棒游戏中）开聊天
-            MouseEv::DoubleClick { x, y }
-                if self.zone(x, y) == Zone::Pet && !self.memo_double_click() && self.play.game.is_none() =>
-            {
-                self.open_chat()
+            // 备忘提醒响着时双击（身体或气泡都认）= 稍后再提醒；连续狂戳（1.2s 内已戳 ≥2 次）继续算戳；否则双击身体开聊天
+            MouseEv::DoubleClick { x, y } => {
+                self.down = None;
+                self.dragging = false;
+                if self.memo_double_click() {
+                    return;
+                }
+                if self.zone(x, y) == Zone::Pet && self.play.game.is_none() && y >= PET_TOP - 10.0 {
+                    let now = self.now;
+                    let rapid_pokes = self.pokes.iter().filter(|&&t| now.saturating_sub(t) < 1200).count();
+                    if rapid_pokes >= 2 || now < self.angry_until {
+                        self.on_poke();
+                    } else {
+                        self.open_chat();
+                    }
+                }
             }
             _ => {}
         }
@@ -121,10 +163,15 @@ impl Behavior {
             return self.set_state(St::Sit, Some((8000.0, 15000.0)));
         }
         let now = self.now;
+        if now < self.angry_until {
+            self.play(Shot::Shake);
+            return;
+        }
         self.pokes.retain(|t| now.saturating_sub(*t) < 3000);
         self.pokes.push(now);
         if self.pokes.len() >= 5 {
             self.pokes.clear();
+            self.angry_until = now + 1500;
             self.act(Act::Angry);
             self.play(Shot::Shake);
             // 一半炸毛哈气，一半鼓脸赌气
@@ -153,7 +200,7 @@ impl Behavior {
             MoodLevel::Exhausted => {
                 self.play(Shot::Squash);
                 self.say(&pick(lines::POKE_TIRED), 2600);
-                return self.set_state(St::Sit, Some((8000.0, 12000.0)));
+                return self.set_state(St::Sleepy, Some((8000.0, 12000.0)));
             }
             MoodLevel::Sad => {
                 if fastrand::f64() < 0.4 {
@@ -181,7 +228,20 @@ impl Behavior {
             if great { self.fx(FxKind::Heart, 3) } else { self.fx(FxKind::Spark, 6) }
         }
         if let Some(l) = self.affinity_line() { return self.react(St::Love, 2000, Some(l)); }
-        if fastrand::f64() < 0.15 { return self.react(St::Confused, 1600, Some(pick(lines::CONFUSED))); }
+        let roll = fastrand::f64();
+        if roll < 0.14 {
+            self.fx(FxKind::Question, 1);
+            return self.react(St::Confused, 1600, Some(pick(lines::CONFUSED)));
+        }
+        if roll < 0.34 {
+            self.fx(FxKind::Heart, 2);
+            return self.react(St::Wink, 1600, Some(pick(lines::WINK)));
+        }
+        if great && roll < 0.50 {
+            self.play(Shot::Jump);
+            self.fx(FxKind::Spark, 6);
+            return self.react(St::Cheer, 1800, Some(pick(lines::CHEER)));
+        }
         let l = if great && fastrand::bool() { lines::POKE_GREAT } else { lines::POKE };
         self.react(St::Happy, 1200, Some(pick(l)));
     }

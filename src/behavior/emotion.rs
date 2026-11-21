@@ -69,6 +69,11 @@ pub fn emotion_state(e: Emotion) -> St {
         Emotion::Scared => St::Scared,
         Emotion::Starry => St::Starry,
         Emotion::Puff => St::Puff,
+        Emotion::Wink => St::Wink,
+        Emotion::Drool => St::Drool,
+        Emotion::Sweat => St::Sweat,
+        Emotion::Cheer => St::Cheer,
+        Emotion::Sleepy => St::Sleepy,
     }
 }
 
@@ -142,7 +147,32 @@ impl Behavior {
                 self.play(Shot::Shake);
                 self.fx(FxKind::Sweat, 1);
             }
-            Emotion::Think | Emotion::Stare | Emotion::Yawn | Emotion::Idle | Emotion::Confused => {}
+            Emotion::Wink => {
+                self.play(Shot::Bounce);
+                self.fx(FxKind::Heart, 2);
+                self.fx(FxKind::Spark, 3);
+            }
+            Emotion::Drool => {
+                self.play(Shot::Bounce);
+                self.fx(FxKind::Spark, 4);
+            }
+            Emotion::Sweat => {
+                self.play(Shot::Squash);
+                self.fx(FxKind::Sweat, 1);
+            }
+            Emotion::Cheer => {
+                self.play(Shot::Jump);
+                self.fx(FxKind::Spark, 7);
+                self.fx(FxKind::Note, 2);
+            }
+            Emotion::Sleepy => {
+                self.play(Shot::Squash);
+            }
+            Emotion::Confused => {
+                self.play(Shot::Bounce);
+                self.fx(FxKind::Question, 1);
+            }
+            Emotion::Think | Emotion::Stare | Emotion::Yawn | Emotion::Idle => {}
         }
     }
 

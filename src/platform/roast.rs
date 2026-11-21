@@ -4,12 +4,13 @@
 use crate::types::AppEvent;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmFlush, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, SetFocus, UnregisterHotKey,
+    GetFocus, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, SetFocus, UnregisterHotKey, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -25,8 +26,27 @@ const THUMB_W: f32 = 440.0;
 const THUMB_H: f32 = 280.0;
 const ID_OK: usize = 1;
 const ID_NO: usize = 2;
+const BS_OWNERDRAW_U32: u32 = 0x0B;
+const ODS_SELECTED_U32: u32 = 0x01;
+const ODS_FOCUS_U32: u32 = 0x10;
+const WM_DPICHANGED_U32: u32 = 0x02E0;
+
+// 和设置窗口保持完全一致的暖奶油色系
+const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
+}
+const BG: COLORREF = rgb(0xff, 0xfb, 0xf4);
+const FIELD: COLORREF = rgb(0xff, 0xff, 0xff);
+const LINE: COLORREF = rgb(0xea, 0xd9, 0xc3);
+const TEXT: COLORREF = rgb(0x3a, 0x24, 0x16);
+const GREY: COLORREF = rgb(0x9a, 0x85, 0x73);
+const ACCENT: COLORREF = rgb(0xf5, 0xa6, 0x23);
+const ACCENT_DOWN: COLORREF = rgb(0xdc, 0x8c, 0x10);
+const BTN: COLORREF = rgb(0xff, 0xf1, 0xdc);
+const BTN_DOWN: COLORREF = rgb(0xf6, 0xe0, 0xc2);
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
+static HOTKEY_CONFLICT: AtomicBool = AtomicBool::new(false);
 static DLG_HWND: AtomicIsize = AtomicIsize::new(0);
 
 struct Pending {
@@ -35,8 +55,12 @@ struct Pending {
     bgra: Vec<u8>,
     w: i32,
     h: i32,
+    title: String,
     dlg: HWND,
     font: HFONT,
+    bold: HFONT,
+    btn_bold: HFONT,
+    icon: Option<HICON>,
 }
 // SAFETY: 只在 UI 线程上创建/使用；放进 Mutex 只是为了能当 static
 unsafe impl Send for Pending {}
@@ -45,6 +69,7 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 const OFF: &str = "设置里没开";
 const NO_VISION: &str = "当前模型不能看图";
 const RECORDING: &str = "录屏中";
+const BUSY_MSG: &str = "正忙着想上一句";
 
 /// 现在不能用的原因（菜单灰掉时显示），None = 能用
 pub fn blocked() -> Option<&'static str> {
@@ -54,6 +79,9 @@ pub fn blocked() -> Option<&'static str> {
     }
     if !crate::services::ai::vision_ok(&c.provider, &c.model) {
         return Some(NO_VISION);
+    }
+    if super::chat::is_busy() {
+        return Some(BUSY_MSG);
     }
     if recorder_running() {
         return Some(RECORDING);
@@ -65,6 +93,7 @@ fn note_for(why: &str) -> &'static str {
     match why {
         OFF => "看屏吐槽还没开喵，在设置「常规」里打开～",
         NO_VISION => "现在用的模型看不了图片喵…换个能看图的（比如 Gemini）再给我看～",
+        BUSY_MSG => "哈基米还在想上一句呢，等我想完再看喵～",
         _ => "你在录屏/直播呢，哈基米先不看～",
     }
 }
@@ -103,22 +132,39 @@ fn recorder_running() -> bool {
     }
 }
 
+/// Ctrl+Alt+K 热键是否注册失败（被别的程序占了）
+pub fn hotkey_conflict() -> bool {
+    HOTKEY_CONFLICT.load(Ordering::Relaxed)
+}
+
 /// 按设置注册/注销 Ctrl+Alt+K（启动时、设置重新读取后调）
 pub fn sync_hotkey(hwnd: HWND) {
     let want = crate::core::config::get().screen_roast;
-    if REGISTERED.load(Ordering::Relaxed) == want {
+    if want && REGISTERED.load(Ordering::Relaxed) {
+        return;
+    }
+    if !want && !REGISTERED.load(Ordering::Relaxed) {
+        HOTKEY_CONFLICT.store(false, Ordering::Relaxed);
         return;
     }
     // SAFETY: hwnd 是主窗口
     unsafe {
         if want {
             match RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_K) {
-                Ok(()) => REGISTERED.store(true, Ordering::Relaxed),
-                Err(e) => crate::core::log::log(&format!("roast hotkey Ctrl+Alt+K register failed: {e}")),
+                Ok(()) => {
+                    REGISTERED.store(true, Ordering::Relaxed);
+                    HOTKEY_CONFLICT.store(false, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    REGISTERED.store(false, Ordering::Relaxed);
+                    HOTKEY_CONFLICT.store(true, Ordering::Relaxed);
+                    crate::core::log::log(&format!("roast hotkey Ctrl+Alt+K register failed: {e}"));
+                }
             }
         } else {
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
             REGISTERED.store(false, Ordering::Relaxed);
+            HOTKEY_CONFLICT.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -126,6 +172,7 @@ pub fn sync_hotkey(hwnd: HWND) {
 /// 退出时注销热键并关闭确认框
 pub fn shutdown(hwnd: HWND) {
     close_existing();
+    HOTKEY_CONFLICT.store(false, Ordering::Relaxed);
     if REGISTERED.swap(false, Ordering::Relaxed) {
         unsafe {
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
@@ -140,13 +187,32 @@ pub fn dialog_message(msg: &MSG) -> bool {
         return false;
     }
     let dlg = HWND(h as *mut _);
-    unsafe { IsWindow(Some(dlg)).as_bool() && IsDialogMessageW(dlg, msg).as_bool() }
+    unsafe {
+        if !IsWindow(Some(dlg)).as_bool() || (msg.hwnd != dlg && !IsChild(dlg, msg.hwnd).as_bool()) {
+            return false;
+        }
+        // BS_OWNERDRAW 按钮下显式支持回车（焦点在「算了」上触发取消，否则默认触发「给她看」）与 Esc
+        if msg.message == WM_KEYDOWN {
+            if msg.wParam.0 == VK_ESCAPE.0 as usize {
+                let _ = PostMessageW(Some(dlg), WM_COMMAND, WPARAM(ID_NO), LPARAM(0));
+                return true;
+            }
+            if msg.wParam.0 == VK_RETURN.0 as usize {
+                let focus = GetFocus();
+                let no_btn = GetDlgItem(Some(dlg), ID_NO as i32).unwrap_or_default();
+                let cmd = if !no_btn.is_invalid() && focus == no_btn { ID_NO } else { ID_OK };
+                let _ = PostMessageW(Some(dlg), WM_COMMAND, WPARAM(cmd), LPARAM(0));
+                return true;
+            }
+        }
+        IsDialogMessageW(dlg, msg).as_bool()
+    }
 }
 
 /// 热键 / 菜单：截图并弹确认框
 pub fn trigger() {
     // 先关掉上一张未处理的确认框，避免把它自己拍进新截图里
-    close_existing();
+    let was_open = close_existing();
     if let Some(why) = blocked() {
         super::post_event(AppEvent::RoastNote(note_for(why).into()));
         return;
@@ -155,7 +221,7 @@ pub fn trigger() {
         super::post_event(AppEvent::RoastNote("先点一下你想让我看的窗口嘛～".into()));
         return;
     };
-    let Some((rgba, w, h)) = capture(target) else {
+    let Some((rgba, w, h)) = capture(target, was_open) else {
         super::post_event(AppEvent::RoastNote("唔…这个窗口我看不清".into()));
         return;
     };
@@ -232,7 +298,7 @@ fn frame(h: HWND) -> Option<RECT> {
 }
 
 /// 从屏幕上拷这个窗口那块（截图前后临时给自身可见窗口挂 WDA_EXCLUDEFROMCAPTURE，保证 DWM 合成桌面里不含桌宠/聊天框/道具）。返回 RGBA
-fn capture(h: HWND) -> Option<(Vec<u8>, u32, u32)> {
+fn capture(h: HWND, flush_closed: bool) -> Option<(Vec<u8>, u32, u32)> {
     unsafe {
         let r = frame(h)?;
         let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -249,17 +315,11 @@ fn capture(h: HWND) -> Option<(Vec<u8>, u32, u32)> {
         for &ow in &own_wins {
             let _ = SetWindowDisplayAffinity(ow, WDA_EXCLUDEFROMCAPTURE);
         }
-        if !own_wins.is_empty() {
+        if flush_closed || !own_wins.is_empty() {
             let _ = DwmFlush();
         }
         let screen = GetDC(None);
-        if screen.is_invalid() {
-            for &ow in &own_wins {
-                let _ = SetWindowDisplayAffinity(ow, WDA_NONE);
-            }
-            return None;
-        }
-        let mem = CreateCompatibleDC(Some(screen));
+        let mem = CreateCompatibleDC((!screen.is_invalid()).then_some(screen));
         let out = if mem.is_invalid() {
             None
         } else {
@@ -280,7 +340,13 @@ fn capture(h: HWND) -> Option<(Vec<u8>, u32, u32)> {
                 Ok(bmp) => {
                     let got = if !bits.is_null() {
                         let old = SelectObject(mem, HGDIOBJ(bmp.0));
-                        let ok = BitBlt(mem, 0, 0, w, hgt, Some(screen), l, t, SRCCOPY).is_ok();
+                        #[link(name = "user32")]
+                        unsafe extern "system" {
+                            fn PrintWindow(hwnd: HWND, hdc_blt: HDC, flags: u32) -> i32;
+                        }
+                        let ok = (!screen.is_invalid() && BitBlt(mem, 0, 0, w, hgt, Some(screen), l, t, SRCCOPY).is_ok())
+                            || PrintWindow(h, mem, 2) != 0
+                            || PrintWindow(h, mem, 0) != 0;
                         let _ = GdiFlush();
                         let rgba: Vec<u8> = if ok {
                             let px = std::slice::from_raw_parts(bits as *const u8, byte_len);
@@ -301,7 +367,9 @@ fn capture(h: HWND) -> Option<(Vec<u8>, u32, u32)> {
             let _ = DeleteDC(mem);
             res
         };
-        ReleaseDC(None, screen);
+        if !screen.is_invalid() {
+            ReleaseDC(None, screen);
+        }
         for &ow in &own_wins {
             let _ = SetWindowDisplayAffinity(ow, WDA_NONE);
         }
@@ -309,7 +377,7 @@ fn capture(h: HWND) -> Option<(Vec<u8>, u32, u32)> {
     }
 }
 
-/// 等比缩到 max_w × max_h 以内（本来就小就不放大）
+/// 等比缩到 max_w × max_h 以内（本来就小就不放大；大于 2x 时走逐级对半盒式滤波防摩尔纹）
 pub fn shrink(rgba: Vec<u8>, w: u32, h: u32, max_w: u32, max_h: u32) -> Option<tiny_skia::Pixmap> {
     let src = tiny_skia::Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(w, h)?)?;
     let k = (max_w as f32 / w as f32).min(max_h as f32 / h as f32).min(1.0);
@@ -317,16 +385,27 @@ pub fn shrink(rgba: Vec<u8>, w: u32, h: u32, max_w: u32, max_h: u32) -> Option<t
         return Some(src);
     }
     let (nw, nh) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
-    let mut dst = tiny_skia::Pixmap::new(nw, nh)?;
-    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
-    dst.draw_pixmap(0, 0, src.as_ref(), &paint, tiny_skia::Transform::from_scale(nw as f32 / w as f32, nh as f32 / h as f32), None);
-    Some(dst)
+    crate::render::sprites::scale_pixmap(src, nw, nh)
 }
 
 // ---------------------------------------------------------------- 确认框
 
 const CLASS: PCWSTR = w!("HakimiRoastConfirm");
-const ASK: &str = "给哈基米看这一张？只发给你设的聊天模型，不存盘。";
+const TITLE_HEAD: &str = "给哈基米看看这个窗口？";
+const SUBTITLE_NOTE: &str = "只发给你当前设置的聊天模型，截图留在内存里不存盘。";
+const FOOT_HINT: &str = "回车发送 · Esc 算了";
+
+fn window_title(h: HWND) -> String {
+    unsafe {
+        let n = GetWindowTextLengthW(h).max(0) as usize;
+        if n == 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; n + 1];
+        let got = GetWindowTextW(h, &mut buf).max(0) as usize;
+        String::from_utf16_lossy(&buf[..got.min(n)]).trim().to_string()
+    }
+}
 
 fn dpi_for(hwnd: HWND) -> u32 {
     let d = unsafe {
@@ -342,12 +421,48 @@ fn thumb_size(w: i32, h: i32, s: f32) -> (i32, i32) {
     (((w as f32 * k).round() as i32).max(1), ((h as f32 * k).round() as i32).max(1))
 }
 
-pub fn close_existing() {
+pub fn close_existing() -> bool {
     let old = PENDING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.dlg);
     if let Some(h) = old {
         unsafe {
             let _ = DestroyWindow(h);
         }
+        true
+    } else {
+        false
+    }
+}
+
+unsafe fn make_roast_fonts(s: f32) -> (HFONT, HFONT, HFONT) {
+    let (body_face, bold_face) = super::settings::ui_faces();
+    let mk_font = |size: f32, weight: i32| unsafe {
+        let face_name = if weight >= FW_BOLD.0 as i32 { bold_face } else { body_face };
+        let fw = super::sys::wide(face_name);
+        CreateFontW(
+            -(size * s).round() as i32,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            FF_DONTCARE.0 as u32,
+            PCWSTR(fw.as_ptr()),
+        )
+    };
+    (mk_font(13.0, FW_NORMAL.0 as i32), mk_font(18.0, FW_BOLD.0 as i32), mk_font(14.0, FW_BOLD.0 as i32))
+}
+
+fn fill_solid(hdc: HDC, rc: RECT, c: COLORREF) {
+    unsafe {
+        let b = CreateSolidBrush(c);
+        FillRect(hdc, &rc, b);
+        let _ = DeleteObject(HGDIOBJ(b.0));
     }
 }
 
@@ -355,13 +470,19 @@ fn show_confirm(target: HWND, png: Vec<u8>, bgra: Vec<u8>, w: i32, h: i32) {
     close_existing();
     let dpi = dpi_for(target);
     let s = dpi as f32 / 96.0;
+    let px = |v: f32| (v * s).round() as i32;
     let (tw, th) = thumb_size(w, h, s);
-    let pad = (16.0 * s).round() as i32;
-    let text_h = (24.0 * s).round() as i32;
-    let btn_w = (96.0 * s).round() as i32;
-    let btn_h = (30.0 * s).round() as i32;
-    let cw = (tw + 2 * pad).max((THUMB_W * s) as i32 + 2 * pad);
-    let ch = pad + text_h + pad / 2 + th + pad + btn_h + pad;
+    let pad = px(20.0);
+    let card_pad = px(10.0);
+    let head_h = px(52.0);
+    let foot_h = px(56.0);
+    let btn_w = px(98.0);
+    let btn_h = px(32.0);
+    let card_w = (tw + 2 * card_pad).max(px(THUMB_W) + 2 * card_pad);
+    let card_h = th + 2 * card_pad;
+    let cw = card_w + 2 * pad;
+    let ch = pad + head_h + px(10.0) + card_h + px(14.0) + foot_h;
+    let win_title = window_title(target);
     unsafe {
         let Ok(hinst) = windows::Win32::System::LibraryLoader::GetModuleHandleW(None) else { return };
         let wc = WNDCLASSEXW {
@@ -370,7 +491,6 @@ fn show_confirm(target: HWND, png: Vec<u8>, bgra: Vec<u8>, w: i32, h: i32) {
             hInstance: hinst.into(),
             lpszClassName: CLASS,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as usize as *mut _),
             ..Default::default()
         };
         RegisterClassExW(&wc);
@@ -382,31 +502,46 @@ fn show_confirm(target: HWND, png: Vec<u8>, bgra: Vec<u8>, w: i32, h: i32) {
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         let (x, y) = if GetMonitorInfoW(mon, &mut mi).as_bool() {
             let wa = mi.rcWork;
-            (wa.left + (wa.right - wa.left - ww) / 2, wa.top + (wa.bottom - wa.top - wh) / 2)
+            (wa.left + (wa.right - wa.left - ww) / 2, wa.top + (wa.bottom - wa.top - wh).max(0) / 2)
         } else {
-            ((GetSystemMetrics(SM_CXSCREEN) - ww) / 2, (GetSystemMetrics(SM_CYSCREEN) - wh) / 2)
+            ((GetSystemMetrics(SM_CXSCREEN) - ww) / 2, (GetSystemMetrics(SM_CYSCREEN) - wh).max(0) / 2)
         };
         let Ok(dlg) = CreateWindowExW(WS_EX_TOPMOST, CLASS, w!("哈基米 · 看屏吐槽"), style, x, y, ww, wh, None, None, Some(hinst.into()), None) else {
             return;
         };
         let _ = SetWindowDisplayAffinity(dlg, WDA_EXCLUDEFROMCAPTURE);
+        super::settings::style_caption(dlg);
+        let icon = super::settings::make_icon();
+        if let Some(ic) = icon {
+            SendMessageW(dlg, WM_SETICON, Some(WPARAM(0)), Some(LPARAM(ic.0 as isize)));
+            SendMessageW(dlg, WM_SETICON, Some(WPARAM(1)), Some(LPARAM(ic.0 as isize)));
+        }
         DLG_HWND.store(dlg.0 as isize, Ordering::Relaxed);
-        let font = CreateFontW(
-            -(13.0 * s).round() as i32, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FF_DONTCARE.0 as u32, w!("Microsoft YaHei"),
-        );
-        let by = ch - pad - btn_h;
-        let mk = |text: PCWSTR, id: usize, x: i32, def: bool| {
-            let st = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(if def { BS_DEFPUSHBUTTON as u32 } else { 0 });
-            let b = CreateWindowExW(WINDOW_EX_STYLE(0), w!("BUTTON"), text, st, x, by, btn_w, btn_h, Some(dlg), Some(HMENU(id as *mut _)), Some(hinst.into()), None);
+        let (font, bold, btn_bold) = make_roast_fonts(s);
+        let by = ch - foot_h + (foot_h - btn_h) / 2;
+        let mk = |text: PCWSTR, id: usize, bx: i32| {
+            let st = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW_U32);
+            let b = CreateWindowExW(WINDOW_EX_STYLE(0), w!("BUTTON"), text, st, bx, by, btn_w, btn_h, Some(dlg), Some(HMENU(id as *mut _)), Some(hinst.into()), None);
             if let Ok(b) = b {
                 SendMessageW(b, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
             }
             b
         };
-        let ok = mk(w!("给她看"), ID_OK, cw - pad - 2 * btn_w - pad / 2, true);
-        let _ = mk(w!("算了"), ID_NO, cw - pad - btn_w, false);
-        *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pending { png, bgra, w, h, dlg, font });
+        let gap = px(10.0);
+        let ok = mk(w!("给她看"), ID_OK, cw - pad - 2 * btn_w - gap);
+        let _ = mk(w!("算了"), ID_NO, cw - pad - btn_w);
+        *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pending {
+            png,
+            bgra,
+            w,
+            h,
+            title: win_title,
+            dlg,
+            font,
+            bold,
+            btn_bold,
+            icon,
+        });
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
         if let Ok(b) = ok {
@@ -418,26 +553,133 @@ fn show_confirm(target: HWND, png: Vec<u8>, bgra: Vec<u8>, w: i32, h: i32) {
 unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_ERASEBKGND => LRESULT(1),
+            WM_SETCURSOR => {
+                let child = HWND(wp.0 as *mut _);
+                if child != hwnd {
+                    let id = GetDlgCtrlID(child) as usize;
+                    if id == ID_OK || id == ID_NO {
+                        let _ = SetCursor(LoadCursorW(None, IDC_HAND).ok());
+                        return LRESULT(1);
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_DPICHANGED_U32 => {
+                let dpi = (wp.0 & 0xffff) as f32;
+                if let Some(r) = (lp.0 as *const RECT).as_ref() {
+                    let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                if dpi > 0.0 {
+                    let s = dpi / 96.0;
+                    let px = |v: f32| (v * s).round() as i32;
+                    let (new_font, new_bold, new_btn_bold) = make_roast_fonts(s);
+                    let mut old_fonts = [HFONT::default(); 3];
+                    if let Some(p) = PENDING.lock().unwrap_or_else(|e| e.into_inner()).as_mut().filter(|p| p.dlg == hwnd) {
+                        old_fonts = [
+                            std::mem::replace(&mut p.font, new_font),
+                            std::mem::replace(&mut p.bold, new_bold),
+                            std::mem::replace(&mut p.btn_bold, new_btn_bold),
+                        ];
+                    }
+                    let mut cr = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut cr);
+                    let (pad, foot_h, btn_w, btn_h, gap) = (px(20.0), px(56.0), px(98.0), px(32.0), px(10.0));
+                    let by = cr.bottom - foot_h + (foot_h - btn_h) / 2;
+                    for (id, bx) in [(ID_OK, cr.right - pad - 2 * btn_w - gap), (ID_NO, cr.right - pad - btn_w)] {
+                        if let Ok(b) = GetDlgItem(Some(hwnd), id as i32) {
+                            SendMessageW(b, WM_SETFONT, Some(WPARAM(new_font.0 as usize)), Some(LPARAM(0)));
+                            let _ = SetWindowPos(b, None, bx, by, btn_w, btn_h, SWP_NOZORDER | SWP_NOACTIVATE);
+                        }
+                    }
+                    for f in old_fonts {
+                        if !f.is_invalid() {
+                            let _ = DeleteObject(HGDIOBJ(f.0));
+                        }
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                }
+                LRESULT(0)
+            }
+            WM_DRAWITEM => {
+                let di = &*(lp.0 as *const DRAWITEMSTRUCT);
+                let s = dpi_for(hwnd) as f32 / 96.0;
+                let primary = di.CtlID as usize == ID_OK;
+                let down = di.itemState.0 & ODS_SELECTED_U32 != 0;
+                let focused = di.itemState.0 & ODS_FOCUS_U32 != 0;
+                let (bg, border, fg) = match (primary, down) {
+                    (true, false) => (ACCENT, focused.then_some((TEXT, 1.5 * s)), rgb(0xff, 0xff, 0xff)),
+                    (true, true) => (ACCENT_DOWN, focused.then_some((TEXT, 1.5 * s)), rgb(0xff, 0xff, 0xff)),
+                    (false, false) => (BTN, Some(if focused { (ACCENT, 1.6 * s) } else { (LINE, 1.0 * s) }), TEXT),
+                    (false, true) => (BTN_DOWN, Some(if focused { (ACCENT, 1.6 * s) } else { (LINE, 1.0 * s) }), TEXT),
+                };
+                super::settings::aa_round(di.hDC, di.rcItem, 8.0 * s, BG, bg, border);
+                let f = PENDING
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .filter(|p| p.dlg == hwnd)
+                    .map(|p| if primary { p.btn_bold } else { p.font })
+                    .unwrap_or_default();
+                let old = if !f.is_invalid() { SelectObject(di.hDC, HGDIOBJ(f.0)) } else { HGDIOBJ::default() };
+                SetBkMode(di.hDC, TRANSPARENT);
+                SetTextColor(di.hDC, fg);
+                let label = if primary { "给她看" } else { "算了" };
+                let mut t: Vec<u16> = label.encode_utf16().collect();
+                let mut rc = di.rcItem;
+                DrawTextW(di.hDC, &mut t, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                if !old.is_invalid() {
+                    SelectObject(di.hDC, old);
+                }
+                LRESULT(1)
+            }
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
                 let s = dpi_for(hwnd) as f32 / 96.0;
-                let pad = (16.0 * s).round() as i32;
-                let text_h = (24.0 * s).round() as i32;
+                let px = |v: f32| (v * s).round() as i32;
+                let pad = px(20.0);
+                let card_pad = px(10.0);
+                let head_h = px(52.0);
+                let foot_h = px(56.0);
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
+                fill_solid(hdc, rc, BG);
                 let g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(p) = g.as_ref().filter(|p| p.dlg == hwnd) {
-                    let of = SelectObject(hdc, HGDIOBJ(p.font.0));
                     SetBkMode(hdc, TRANSPARENT);
-                    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(0x2e3b5a));
-                    let mut tr = RECT { left: pad, top: pad, right: rc.right - pad, bottom: pad + text_h };
-                    let mut t: Vec<u16> = ASK.encode_utf16().collect();
-                    DrawTextW(hdc, &mut t, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-                    SelectObject(hdc, of);
+                    // 顶部主标题（与设置页标题同字重同色）
+                    let of = SelectObject(hdc, HGDIOBJ(p.bold.0));
+                    SetTextColor(hdc, TEXT);
+                    let mut head_rc = RECT { left: pad, top: pad - px(2.0), right: rc.right - pad, bottom: pad + px(26.0) };
+                    let mut head_t: Vec<u16> = TITLE_HEAD.encode_utf16().collect();
+                    DrawTextW(hdc, &mut head_t, &mut head_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+                    // 副标题（带目标窗口名 + 隐私说明，暖灰字）
+                    SelectObject(hdc, HGDIOBJ(p.font.0));
+                    SetTextColor(hdc, GREY);
+                    let sub = if p.title.is_empty() {
+                        SUBTITLE_NOTE.to_string()
+                    } else {
+                        let short: String = if p.title.chars().count() > 18 {
+                            p.title.chars().take(17).collect::<String>() + "…"
+                        } else {
+                            p.title.clone()
+                        };
+                        format!("「{short}」 · {SUBTITLE_NOTE}")
+                    };
+                    let mut sub_rc = RECT { left: pad, top: pad + px(28.0), right: rc.right - pad, bottom: pad + head_h };
+                    let mut sub_t: Vec<u16> = sub.encode_utf16().collect();
+                    DrawTextW(hdc, &mut sub_t, &mut sub_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+                    // 圆角白底预览卡片 + 居中截图缩略图
+                    let card_top = pad + head_h + px(10.0);
                     let (tw, th) = thumb_size(p.w, p.h, s);
+                    let card_rc = RECT { left: pad, top: card_top, right: rc.right - pad, bottom: card_top + th + 2 * card_pad };
+                    super::settings::aa_round(hdc, card_rc, 10.0 * s, BG, FIELD, Some((LINE, 1.0 * s)));
+
                     let tx = (rc.right - tw) / 2;
-                    let ty = pad + text_h + pad / 2;
+                    let ty = card_top + card_pad;
                     let bmi = BITMAPINFO {
                         bmiHeader: BITMAPINFOHEADER {
                             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -453,14 +695,22 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     SetStretchBltMode(hdc, HALFTONE);
                     let _ = SetBrushOrgEx(hdc, 0, 0, None);
                     StretchDIBits(hdc, tx, ty, tw, th, 0, 0, p.w, p.h, Some(p.bgra.as_ptr() as *const _), &bmi, DIB_RGB_COLORS, SRCCOPY);
-                    // 细边框
-                    let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(0xc8c8c8));
+                    // 截图四周浅暖色细边，白底网页也不会糊进卡片底色里
+                    let pen = CreatePen(PS_SOLID, 1, LINE);
                     let op = SelectObject(hdc, HGDIOBJ(pen.0));
                     let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
                     let _ = Rectangle(hdc, tx - 1, ty - 1, tx + tw + 1, ty + th + 1);
                     SelectObject(hdc, op);
                     SelectObject(hdc, ob);
                     let _ = DeleteObject(HGDIOBJ(pen.0));
+
+                    // 底部分隔线 + 左侧快捷键轻提示
+                    let foot_y = rc.bottom - foot_h;
+                    fill_solid(hdc, RECT { left: pad, top: foot_y, right: rc.right - pad, bottom: foot_y + px(1.0).max(1) }, LINE);
+                    let mut hint_rc = RECT { left: pad, top: foot_y, right: rc.right / 2, bottom: rc.bottom };
+                    let mut hint_t: Vec<u16> = FOOT_HINT.encode_utf16().collect();
+                    DrawTextW(hdc, &mut hint_t, &mut hint_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    SelectObject(hdc, of);
                 }
                 drop(g);
                 let _ = EndPaint(hwnd, &ps);
@@ -488,13 +738,19 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 LRESULT(0)
             }
             WM_NCDESTROY => {
-                // 等子按钮全部销毁后再释放共享 HFONT 和内存截图，避免 GDI UAF
+                // 等子按钮全部销毁后再释放共享字体、图标和内存截图，避免 GDI UAF
                 let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
                 if g.as_ref().is_some_and(|p| p.dlg == hwnd)
                     && let Some(p) = g.take()
-                    && !p.font.is_invalid()
                 {
-                    let _ = DeleteObject(HGDIOBJ(p.font.0));
+                    for f in [p.font, p.bold, p.btn_bold] {
+                        if !f.is_invalid() {
+                            let _ = DeleteObject(HGDIOBJ(f.0));
+                        }
+                    }
+                    if let Some(ic) = p.icon {
+                        let _ = DestroyIcon(ic);
+                    }
                 }
                 LRESULT(0)
             }

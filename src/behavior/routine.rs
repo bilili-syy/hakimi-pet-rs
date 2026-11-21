@@ -53,11 +53,12 @@ impl Behavior {
             }
             PomodoroEv::Done { .. } => {
                 self.pomo_running = false;
-                self.play(Shot::Bounce);
+                self.play(Shot::Jump);
+                self.fx(FxKind::Spark, 7);
                 if fastrand::bool() {
                     self.react(St::Smug, 3500, Some(pick(lines::SMUG)));
                 } else {
-                    self.react(St::Happy, 3500, Some(pick(lines::POMO_DONE)));
+                    self.react(St::Cheer, 3500, Some(pick(lines::POMO_DONE)));
                 }
                 self.act(Act::Pat);
             }

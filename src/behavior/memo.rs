@@ -1,6 +1,6 @@
 //! 备忘录的行为部分：到点跳出来喊、点她=知道了、双击=稍后、聊天里加备忘/问待办、菜单动作。
 //! 数据和定时在 core::memo / 平台层；这里只管她怎么反应。
-use super::{Behavior, Bubble, Later, Shot, St, StateAct, lines, pick};
+use super::{Behavior, Later, Shot, St, StateAct, lines, pick};
 use crate::core::memo::{self as store, Dt, Now};
 use crate::services::memo_parse::{self as mp, Parsed};
 use crate::types::{ChatInputCmd, ChatReply, MemoAct, MemoEv, MemoHit, SpeakKind, VoiceMood, WinCmd};
@@ -119,8 +119,7 @@ impl Behavior {
     /// 气泡和语音分开给（气泡带操作提示，语音只念内容）。聊天类语音：只念聊天模式下也念
     fn memo_say(&mut self, bubble: &str, voice: &str, ms: u64) -> u64 {
         let token = self.next_token();
-        self.bubble = Some(Bubble { text: bubble.to_string(), shown: self.now, hide_at: Some(self.now + ms), dur: ms, token });
-        self.bubble_fade.set(true, self.now);
+        self.show_bubble(bubble.to_string(), Some(self.now + ms), ms, token, true);
         self.voice(voice, SpeakKind::Chat, token);
         token
     }
@@ -168,8 +167,7 @@ impl Behavior {
             self.later(NAG_MS * n as u64, Later::MemoNag(n));
         }
         let token = self.next_token();
-        self.bubble = Some(Bubble { text: bubble, shown: self.now, hide_at: Some(self.now + ALERT_MS), dur: ALERT_MS, token });
-        self.bubble_fade.set(true, self.now);
+        self.show_bubble(bubble, Some(self.now + ALERT_MS), ALERT_MS, token, true);
         self.memo.bubble_token = token;
         self.memo_chime(voice);
     }

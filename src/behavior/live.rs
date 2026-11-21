@@ -104,9 +104,10 @@ impl Behavior {
         if self.routine.is_some() || self.dragging || self.dragging_cls { return None; }
         match self.state {
             St::Sleep => (!self.live_low_power()).then_some(true),
-            // 站着的平静表情也呼吸（含 v1.1 的 6 个新表情）
+            // 站着的平静表情也呼吸（含新表情）
             St::Idle | St::Sit | St::Think | St::Hungry | St::Stare | St::Love | St::Shy | St::Happy | St::Surprised
             | St::Pout | St::Smug | St::Confused | St::Scared | St::Starry | St::Puff
+            | St::Wink | St::Drool | St::Sweat | St::Cheer | St::Sleepy
                 if !self.live_low_power() => Some(false),
             _ => None,
         }
@@ -191,7 +192,8 @@ impl Behavior {
         let group = |f: Face| match f {
             Face::Idle | Face::Happy | Face::Hungry | Face::Think | Face::Shy | Face::Surprised | Face::Love
             | Face::Stare | Face::Cry | Face::Hiss | Face::Honey | Face::Eat | Face::Yawn
-            | Face::Pout | Face::Smug | Face::Confused | Face::Scared | Face::Starry | Face::Puff => Some(0),
+            | Face::Pout | Face::Smug | Face::Confused | Face::Scared | Face::Starry | Face::Puff
+            | Face::Wink | Face::Drool | Face::Sweat | Face::Cheer | Face::Sleepy => Some(0),
             Face::Sit => Some(1),
             _ => None,
         };

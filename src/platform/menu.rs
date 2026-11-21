@@ -71,6 +71,7 @@ const MIND: &[Node] = &[
     Item("mind:open", "📂 打开 memory.json"),
     Item("mind:clear", "🗑️ 清空记忆…"),
 ];
+pub const TOOLS_TITLE: &str = "🧰 工具";
 const TOOLS: &[Node] = &[
     Gen("memo"),
     Sub(MIND_TITLE, MIND),
@@ -79,6 +80,7 @@ const TOOLS: &[Node] = &[
     Item("weather", "🌦️ 天气播报"),
     Item("report", "📊 本周陪伴报告"),
     Item("chatexport", "💬 导出聊天记录"),
+    Item("copybubble", "📋 复制刚才那句话"),
     Item("roast", "👀 看屏吐槽（Ctrl+Alt+K）"),
 ];
 const COSTUME: &[Node] = &[
@@ -107,7 +109,7 @@ pub const MENU: &[Node] = &[
     Sub("🍽️ 喂养", FEED),
     Sub("🤲 互动", PLAY),
     Sub("🎮 娱乐", FUN),
-    Sub("🧰 工具", TOOLS),
+    Sub(TOOLS_TITLE, TOOLS),
     Sub("👗 换装", COSTUME),
     Item("status", "📊 看看状态"),
     Sep,
@@ -126,6 +128,12 @@ pub struct Ctx {
     pub pomo_left: Option<u32>,
     /// 看屏吐槽现在不能用的原因（None = 能用）
     pub roast_block: Option<&'static str>,
+    /// 看屏吐槽热键 Ctrl+Alt+K 是否被其他软件占用
+    pub roast_conflict: bool,
+    /// 当前是否正在等 AI 回复
+    pub chat_waiting: bool,
+    /// 是否已经有过可以复制的气泡文字
+    pub has_bubble: bool,
 }
 
 /// 勾选项现在该不该勾
@@ -142,8 +150,10 @@ pub fn checked(id: &str, c: &Ctx) -> bool {
 /// 要换文字的项（None = 用表里的）
 pub fn label(id: &str, c: &Ctx) -> Option<String> {
     match id {
+        "chat" => Some(if c.chat_waiting { "⏹ 停止等待回复（Esc）".into() } else { "💬 和哈基米聊天".into() }),
         "roast" => Some(match c.roast_block {
             Some(why) => format!("👀 看屏吐槽（{why}）"),
+            None if c.roast_conflict => "👀 看屏吐槽（热键被占用，点此触发）".into(),
             None => "👀 看屏吐槽（Ctrl+Alt+K）".into(),
         }),
         "visible" => Some(if c.visible { "🙈 先藏起来" } else { "👀 叫她出来" }.into()),
@@ -154,6 +164,10 @@ pub fn label(id: &str, c: &Ctx) -> Option<String> {
         POMO_TITLE => Some(match c.pomo_left {
             Some(m) => format!("🍅 番茄钟（还剩 {m} 分钟）"),
             None => POMO_TITLE.into(),
+        }),
+        TOOLS_TITLE => Some(match c.pomo_left {
+            Some(m) => format!("🧰 工具（🍅 剩 {m} 分钟）"),
+            None => TOOLS_TITLE.into(),
         }),
         _ => None,
     }
@@ -166,6 +180,9 @@ pub fn enabled(id: &str, c: &Ctx) -> bool {
     }
     if id == "roast" {
         return c.roast_block.is_none();
+    }
+    if id == "copybubble" {
+        return c.has_bubble;
     }
     if id.starts_with("pomo:") {
         return c.pomo_left.is_none();
@@ -228,6 +245,8 @@ thread_local! {
     /// 右键菜单弹出期间 muda 借着 Menu，不能增删项
     static POPUP_OPEN: Cell<bool> = const { Cell::new(false) };
 }
+/// 双击托盘后紧跟着还会收到一次左键松开（WM_LBUTTONUP）：吞掉它，防 500ms 后误触发单击「先藏起来」
+static SUPPRESS_NEXT_TRAY_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn push_id(id: String) {
     MENU_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push_back(id);
@@ -310,8 +329,14 @@ pub fn init() {
     MenuEvent::set_event_handler(Some(|e: MenuEvent| push_id(e.id.0)));
     TrayIconEvent::set_event_handler(Some(|e: TrayIconEvent| match e {
         TrayIconEvent::Click { button, button_state, .. } => match (button, button_state) {
+            (MouseButton::Left, MouseButtonState::Down) => {
+                SUPPRESS_NEXT_TRAY_UP.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             // 左键单击托盘：藏起来 / 叫出来。等双击时间过了才执行，免得双击时先藏再出
             (MouseButton::Left, MouseButtonState::Up) => {
+                if SUPPRESS_NEXT_TRAY_UP.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 if let Some(h) = main_hwnd() {
                     unsafe {
                         SetTimer(Some(h), TRAY_CLICK_TIMER, GetDoubleClickTime(), None);
@@ -322,8 +347,9 @@ pub fn init() {
             (MouseButton::Right, MouseButtonState::Down) => refresh(),
             _ => {}
         },
-        // 双击托盘 = 打开设置
+        // 双击托盘 = 打开设置（同时标记吞掉紧随其后的那次左键 Up）
         TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
+            SUPPRESS_NEXT_TRAY_UP.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(h) = main_hwnd() {
                 unsafe {
                     let _ = KillTimer(Some(h), TRAY_CLICK_TIMER);
@@ -375,6 +401,9 @@ fn ctx_now() -> Ctx {
         visible: main_hwnd().is_some_and(|h| unsafe { IsWindowVisible(h).as_bool() }),
         pomo_left: pomodoro_left(),
         roast_block: super::roast::blocked(),
+        roast_conflict: super::roast::hotkey_conflict(),
+        chat_waiting: super::chat::is_busy(),
+        has_bubble: super::has_copyable_bubble(),
     }
 }
 
@@ -401,7 +430,11 @@ pub fn refresh() {
             }
         }
         if let Some(t) = &m.tray {
-            let _ = t.set_tooltip(Some(if c.pomo_left.is_some() { "哈基米 · 番茄钟进行中" } else { "哈基米（双击打开设置）" }));
+            let tip = match c.pomo_left {
+                Some(m) => format!("哈基米 · 🍅 番茄钟还剩 {m} 分钟（双击打开设置）"),
+                None => "哈基米（双击打开设置）".into(),
+            };
+            let _ = t.set_tooltip(Some(&tip));
         }
     });
     super::memo_menu::refresh(POPUP_OPEN.with(|p| p.get()));
@@ -435,6 +468,9 @@ pub fn shutdown() {
 
 /// 菜单 id → MenuAction。checked = 勾选项点击后的新状态（muda 已经自己翻转过）
 pub fn action_for(id: &str) -> Option<MenuAction> {
+    if id == "chat" && super::chat::is_busy() {
+        return Some(MenuAction::ChatStop);
+    }
     let now_checked = |id: &str| {
         MENUS
             .with(|m| {
@@ -457,6 +493,8 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
     use MenuAction as A;
     Some(match id {
         "chat" => A::Chat,
+        "chat:stop" => A::ChatStop,
+        "copybubble" => A::CopyBubble,
         "feed" => A::Feed,
         "feednow" => A::FeedNow,
         "game" => A::Game,
@@ -587,7 +625,16 @@ mod tests {
 
     #[test]
     fn dynamic_state() {
-        let mut c = Ctx { costume: "maid".into(), outfits: vec!["santa".into()], visible: true, pomo_left: None, roast_block: None };
+        let mut c = Ctx {
+            costume: "maid".into(),
+            outfits: vec!["santa".into()],
+            visible: true,
+            pomo_left: None,
+            roast_block: None,
+            roast_conflict: false,
+            chat_waiting: false,
+            has_bubble: false,
+        };
         assert!(checked("costume:maid", &c));
         assert!(!checked("costume:", &c));
         assert!(checked("outfit:santa", &c));
@@ -601,12 +648,19 @@ mod tests {
         assert!(checked("costume:hoodie", &c) && !checked("costume:sailor", &c));
         assert_eq!(label("visible", &c).unwrap(), "🙈 先藏起来");
         assert!(enabled("pomo:25", &c) && !enabled("pomo:stop", &c));
+        assert!(!enabled("copybubble", &c));
         c.pomo_left = Some(12);
         c.visible = false;
+        c.has_bubble = true;
+        c.roast_conflict = true;
         assert_eq!(label("visible", &c).unwrap(), "👀 叫她出来");
         assert_eq!(label("pomo:stop", &c).unwrap(), "结束番茄钟（还剩 12 分钟）");
         assert_eq!(label(POMO_TITLE, &c).unwrap(), "🍅 番茄钟（还剩 12 分钟）");
-        assert!(!enabled("pomo:25", &c) && enabled("pomo:stop", &c));
-        assert_eq!(label("chat", &c), None);
+        assert_eq!(label(TOOLS_TITLE, &c).unwrap(), "🧰 工具（🍅 剩 12 分钟）");
+        assert_eq!(label("roast", &c).unwrap(), "👀 看屏吐槽（热键被占用，点此触发）");
+        assert!(!enabled("pomo:25", &c) && enabled("pomo:stop", &c) && enabled("copybubble", &c));
+        assert_eq!(label("chat", &c).unwrap(), "💬 和哈基米聊天");
+        c.chat_waiting = true;
+        assert_eq!(label("chat", &c).unwrap(), "⏹ 停止等待回复（Esc）");
     }
 }

@@ -326,6 +326,17 @@ fn drawn_stem(face: Face, costume: &str) -> &'static str {
     if is_original(costume) {
         return match face { Face::Walk1 | Face::Walk2 => "idle", f => f.stem() };
     }
+    if costume == "sailor" {
+        if matches!(face, Face::Walk1 | Face::Walk2 | Face::Blink) {
+            return "idle";
+        }
+        if matches!(face, Face::Idle | Face::Happy | Face::Eat | Face::Hungry) {
+            return face.stem();
+        }
+        if crate::render::sprites::sailor_has_direct(face.stem()) {
+            return face.stem();
+        }
+    }
     crate::render::sprites::costume_face_stem(face)
 }
 

@@ -260,7 +260,7 @@ pub struct Play {
     pub wheel: WheelPet,
     pub food: Option<Food>,
     pub perch: Option<PerchKind>,
-    climbing: Option<u64>,
+    pub climbing: Option<u64>,
     climb_manual: bool,
     pub jumping_down: bool,
     pub weather: Option<Weather>,
@@ -379,7 +379,11 @@ impl Behavior {
 
     /// 能不能看光标
     fn gaze_ok(&self) -> bool {
-        !self.dragging && matches!(self.state, St::Idle | St::Sit | St::Hungry | St::Stare | St::Happy | St::Shy | St::Love | St::Think)
+        !self.dragging && matches!(
+            self.state,
+            St::Idle | St::Sit | St::Hungry | St::Stare | St::Happy | St::Shy | St::Love | St::Think
+            | St::Wink | St::Drool | St::Sweat | St::Cheer | St::Sleepy
+        )
     }
 
     /// 每次事件/帧之后：光标轮询开关、眼神跟随
@@ -416,6 +420,9 @@ impl Behavior {
         let moved = self.play.cursor.is_none_or(|(lx, ly, _)| (lx - x).abs() > 3.0 || (ly - y).abs() > 3.0);
         if moved { self.play.cursor_moved = now; }
         self.play.cursor = Some((x, y, now));
+        if self.down.is_none() {
+            self.bubble_hover = self.zone(x, y) == super::Zone::Bubble;
+        }
         if self.play.game.is_some() { return self.game_cursor(x, y); }
         // 偶尔偷看：光标停在附近 2.5 秒以上
         let near = ((x - 120.0).powi(2) + (y - 150.0).powi(2)).sqrt() < 260.0;
@@ -572,13 +579,13 @@ impl Behavior {
             ToyEv::Grabbed => {
                 if let Some(f) = &mut self.play.food { f.phase = FoodPhase::Held; f.expire = self.now + 60_000; }
                 if matches!(self.state, St::Drag | St::Fall) { return; }
-                if self.state == St::Walk { self.set_state(St::Hungry, None); }
-                if self.state != St::Hungry { self.set_state(St::Hungry, None); }
+                self.set_state(St::Drool, None);
+                self.fx(FxKind::Spark, 3);
                 self.play(Shot::Bounce);
                 self.say(&pick(FOOD_GRAB), 2200);
             }
             ToyEv::Dropped { dx, dy } => {
-                if is_feed_drop(dx, dy) && !matches!(self.state, St::Drag | St::Fall) && self.play.perch != Some(PerchKind::WindowTop) {
+                if is_feed_drop(dx, dy) && !matches!(self.state, St::Drag | St::Fall) {
                     self.eat_food();
                 } else {
                     if let Some(f) = &mut self.play.food { f.phase = FoodPhase::Falling; }
@@ -673,11 +680,15 @@ impl Behavior {
         match kind {
             PerchKind::WindowTop => {
                 self.set_state(St::Sit, Some((12000.0, 25000.0)));
-                self.say(&pick(PERCH_WIN), 2400);
+                if !self.memo_ringing() {
+                    self.say(&pick(PERCH_WIN), 2400);
+                }
             }
             PerchKind::ScreenSide => {
                 self.set_state(St::Stare, Some((6000.0, 12000.0)));
-                self.say(&pick(PERCH_SIDE), 2400);
+                if !self.memo_ringing() {
+                    self.say(&pick(PERCH_SIDE), 2400);
+                }
             }
         }
     }
@@ -686,6 +697,7 @@ impl Behavior {
         self.play.climbing = None;
         if std::mem::take(&mut self.play.climb_manual) {
             self.play(Shot::Shake);
+            self.fx(FxKind::Sweat, 1);
             self.say(&pick(PERCH_NONE), 2400);
         }
         self.set_state(St::Idle, Some((4000.0, 9000.0)));
@@ -710,8 +722,13 @@ impl Behavior {
     /// 落地时：主动跳下来的不喊疼。返回 true = 已处理
     pub(super) fn landed_play(&mut self) -> bool {
         self.play.perch = None;
+        let pounce = std::mem::take(&mut self.sense.pounce_after_land);
         if !std::mem::take(&mut self.play.jumping_down) { return false; }
         self.play(Shot::Squash);
+        if pounce {
+            self.pounce_cursor();
+            return true;
+        }
         if fastrand::f64() < 0.5 { self.say(&pick(LAND_SAFE), 1800); }
         self.set_state(St::Idle, Some((3000.0, 6000.0)));
         if self.play.food.as_ref().is_some_and(|f| f.phase == FoodPhase::Ground) { self.chase_food(); }
@@ -722,6 +739,7 @@ impl Behavior {
     pub(super) fn drag_started_play(&mut self) {
         self.play.perch = None;
         self.play.jumping_down = false;
+        self.sense.pounce_after_land = false;
         if let Some(f) = &mut self.play.food && f.phase == FoodPhase::Chasing { f.phase = FoodPhase::Ground; }
     }
 
@@ -758,13 +776,14 @@ impl Behavior {
         match slot {
             Slot::Late => {
                 self.say(&line, 3000);
-                self.react(St::Yawn, 2200, None);
+                self.react(St::Sleepy, 2400, None);
             }
             Slot::Lunch | Slot::Dinner => {
                 self.play(Shot::Bounce);
-                self.react(St::Hungry, 2600, Some(line));
+                self.fx(FxKind::Spark, 4);
+                self.react(St::Drool, 2600, Some(line));
             }
-            Slot::Morning => self.react(St::Happy, 2200, Some(line)),
+            Slot::Morning => self.react(St::Cheer, 2200, Some(line)),
         }
     }
 
@@ -857,10 +876,11 @@ impl Behavior {
     }
 
     pub(super) fn do_checkin(&mut self, manual: bool) {
-        // 自动签到别打断正在追小鱼干/玩游戏/被拎着：过几秒再来
+        // 自动签到别打断正在追小鱼干/玩游戏/被拎着/备忘响铃：过几秒再来
         let busy = self.play.game.is_some()
             || self.play.food.is_some()
             || self.chatting
+            || self.memo_ringing()
             || matches!(self.state, St::Walk | St::Drag | St::Fall | St::Eat);
         if !manual && busy {
             self.play.checkin_at = Some(self.now + 4000);

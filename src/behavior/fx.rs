@@ -2,7 +2,7 @@
 use crate::render::{FxShape, FxSprite, Xf, anim};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FxKind { Heart, Note, Spark, Sweat, Anger, Tear, Honey, Dizzy, Exclaim, Rain, Snow }
+pub enum FxKind { Heart, Note, Spark, Sweat, Anger, Tear, Honey, Dizzy, Exclaim, Question, Rain, Snow }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Motion { Rise, Burst, Pop, Fall }
@@ -51,7 +51,14 @@ impl Fx {
             FxKind::Exclaim => {
                 self.parts.push(Particle {
                     shape: FxShape::Exclaim, color: 0xea4335, x: 128.0, y: 0.0, dx: 0.0, dy: 0.0, size: 16.0,
-                    motion: Motion::Pop, start: now, remove_at: now + 900,
+                    motion: Motion::Pop, start: now, remove_at: now + 1650,
+                });
+                return;
+            }
+            FxKind::Question => {
+                self.parts.push(Particle {
+                    shape: FxShape::Question, color: 0x4285f4, x: 132.0, y: 2.0, dx: 0.0, dy: 0.0, size: 18.0,
+                    motion: Motion::Pop, start: now, remove_at: now + 1650,
                 });
                 return;
             }

@@ -163,7 +163,16 @@ pub fn maybe_poll(now: u64, pet: HWND, evs: &mut Vec<AppEvent>) {
             s.slow(fs, music, &mut out);
         }
     });
+    let vis = super::is_pet_visible();
     for e in out {
+        if !vis && !matches!(e, SenseEv::Fullscreen(_)) {
+            continue;
+        }
+        if e == SenseEv::CursorShake
+            && let Some((x, y)) = super::with(|s| ((p.cursor.0 - s.x) as f32 / s.scale, (p.cursor.1 - s.y) as f32 / s.scale))
+        {
+            evs.push(AppEvent::Cursor { x, y });
+        }
         crate::core::log::trace(&format!("sense {e:?}"));
         evs.push(AppEvent::Sense(e));
     }

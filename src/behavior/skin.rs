@@ -27,6 +27,9 @@ pub const CATEGORIES: &[(&str, &[&str])] = &[
     ("xmas", lines::XMAS), ("year_end", lines::YEAR_END), ("spring", lines::SPRING), ("lantern", lines::LANTERN),
     ("dragon_boat", lines::DRAGON_BOAT), ("qixi", lines::QIXI), ("mid_autumn", lines::MID_AUTUMN),
     ("intro", lines::INTRO), ("welcome", lines::WELCOME),
+    ("wink", lines::WINK), ("drool", lines::DROOL), ("sweat", lines::SWEAT), ("cheer", lines::CHEER),
+    ("sleepy_nod", lines::SLEEPY_NOD), ("idle_curious", lines::IDLE_CURIOUS),
+    ("roast_look", lines::ROAST_LOOK), ("chat_stop", lines::CHAT_STOP),
 ];
 
 /// 换角色成功后她说的话（分类名 skin_on，可以在 lines 里覆盖）

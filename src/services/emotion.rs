@@ -7,13 +7,18 @@ use crate::types::{Face, VoiceMood};
 
 /// 只用现有立绘名
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Emotion { Happy, Love, Shy, Surprised, Cry, Hiss, Think, Dizzy, Stare, Yawn, Idle, Pout, Smug, Confused, Scared, Starry, Puff }
+pub enum Emotion {
+    Happy, Love, Shy, Surprised, Cry, Hiss, Think, Dizzy, Stare, Yawn, Idle,
+    Pout, Smug, Confused, Scared, Starry, Puff,
+    Wink, Drool, Sweat, Cheer, Sleepy,
+}
 
 impl Emotion {
-    pub const ALL: [Emotion; 17] = [
+    pub const ALL: [Emotion; 22] = [
         Emotion::Happy, Emotion::Love, Emotion::Shy, Emotion::Surprised, Emotion::Cry, Emotion::Hiss,
         Emotion::Think, Emotion::Dizzy, Emotion::Stare, Emotion::Yawn, Emotion::Idle,
         Emotion::Pout, Emotion::Smug, Emotion::Confused, Emotion::Scared, Emotion::Starry, Emotion::Puff,
+        Emotion::Wink, Emotion::Drool, Emotion::Sweat, Emotion::Cheer, Emotion::Sleepy,
     ];
 
     pub fn label(self) -> &'static str { self.face().stem() }
@@ -37,6 +42,11 @@ impl Emotion {
             Emotion::Scared => Face::Scared,
             Emotion::Starry => Face::Starry,
             Emotion::Puff => Face::Puff,
+            Emotion::Wink => Face::Wink,
+            Emotion::Drool => Face::Drool,
+            Emotion::Sweat => Face::Sweat,
+            Emotion::Cheer => Face::Cheer,
+            Emotion::Sleepy => Face::Sleepy,
         }
     }
 
@@ -44,12 +54,13 @@ impl Emotion {
     /// 同一种表情不管是标签给的还是状态给的，念出来语气一样，缓存键也一样（能互相命中）
     pub fn voice_mood(self) -> VoiceMood {
         match self {
-            Emotion::Happy | Emotion::Love | Emotion::Shy | Emotion::Smug | Emotion::Starry => VoiceMood::Happy,
+            Emotion::Happy | Emotion::Love | Emotion::Shy | Emotion::Smug | Emotion::Starry | Emotion::Wink | Emotion::Cheer => VoiceMood::Happy,
             Emotion::Cry | Emotion::Dizzy | Emotion::Pout | Emotion::Scared => VoiceMood::Sad,
-            Emotion::Yawn => VoiceMood::Sleepy,
+            Emotion::Drool => VoiceMood::Hungry,
+            Emotion::Yawn | Emotion::Sleepy => VoiceMood::Sleepy,
             Emotion::Hiss | Emotion::Puff => VoiceMood::Mad,
             Emotion::Think | Emotion::Confused => VoiceMood::Think,
-            Emotion::Surprised | Emotion::Stare | Emotion::Idle => VoiceMood::Calm,
+            Emotion::Surprised | Emotion::Stare | Emotion::Idle | Emotion::Sweat => VoiceMood::Calm,
         }
     }
 
@@ -69,6 +80,11 @@ impl Emotion {
             "puzzled" | "huh" | "question" => Emotion::Confused,
             "scare" | "afraid" | "fear" | "frightened" => Emotion::Scared,
             "huff" | "humph" | "tsundere" | "pouty" => Emotion::Puff,
+            "playful" | "tease" | "teasing" | "cheeky" | "blep" => Emotion::Wink,
+            "drooling" | "yummy" | "craving" | "greedy" | "foodie" => Emotion::Drool,
+            "awkward" | "oops" | "nervous" | "facepalm" | "speechless_sweat" => Emotion::Sweat,
+            "cheering" | "hooray" | "yay" | "celebrate" | "bravo" | "fighting" => Emotion::Cheer,
+            "drowsy" | "nodding" | "doze" | "dozing" | "tired" => Emotion::Sleepy,
             "heart" | "loving" | "affection" => Emotion::Love,
             "blush" | "shyness" | "embarrassed" => Emotion::Shy,
             "surprise" | "shock" | "shocked" | "wow" => Emotion::Surprised,
@@ -77,7 +93,7 @@ impl Emotion {
             "thinking" | "thoughtful" | "curious" => Emotion::Think,
             "giddy" => Emotion::Dizzy,
             "staring" | "speechless" => Emotion::Stare,
-            "sleepy" | "tired" | "yawning" => Emotion::Yawn,
+            "yawning" | "stretch" => Emotion::Yawn,
             "neutral" | "calm" | "normal" | "none" => Emotion::Idle,
             _ => return None,
         })
@@ -85,7 +101,7 @@ impl Emotion {
 }
 
 /// 写进系统提示词的一句
-pub const PROMPT: &str = "每条回复的最开头必须先写一个表情标签，只能从这些里选一个：[happy] [love] [shy] [surprised] [cry] [hiss] [think] [dizzy] [stare] [yawn] [idle] [pout] [smug] [confused] [scared] [starry] [puff]（hiss 是炸毛哈气，puff 是鼓着脸赌气，pout 是委屈嘟嘴，smug 是得意，confused 是听不懂歪头，scared 是害怕，starry 是兴奋星星眼），例如「[happy]答对啦，快夸我喵！」。标签只写一次，正文里不要再出现方括号标签。";
+pub const PROMPT: &str = "每条回复的最开头必须先写一个表情标签，只能从这些里选一个：[happy] [love] [shy] [surprised] [cry] [hiss] [think] [dizzy] [stare] [yawn] [idle] [pout] [smug] [confused] [scared] [starry] [puff] [wink] [drool] [sweat] [cheer] [sleepy]（hiss 是炸毛哈气，puff 是鼓着脸赌气，pout 是委屈嘟嘴，smug 是得意叉腰，confused 是歪头疑惑，scared 是害怕，starry 是兴奋星星眼，wink 是俏皮眨眼吐舌，drool 是馋嘴流口水，sweat 是尴尬流汗，cheer 是举爪欢呼打气，sleepy 是迷糊犯困），尽量多变生动，例如「[wink]答对啦，快夸我喵！」。标签只写一次，正文里不要再出现方括号标签。";
 
 const OPENS: [char; 3] = ['[', '【', '［'];
 const CLOSES: [char; 3] = [']', '】', '］'];
@@ -193,9 +209,14 @@ pub fn guess(text: &str) -> Emotion {
         (Emotion::Cry, &["呜", "难过", "伤心", "哭", "委屈", "好惨", "心疼", "对不起"]),
         (Emotion::Love, &["喜欢你", "爱你", "抱抱", "贴贴", "亲亲", "mua", "最喜欢", "想你"]),
         (Emotion::Shy, &["害羞", "脸红", "不好意思", "人家", "讨厌啦", "才没有", "羞"]),
+        (Emotion::Drool, &["流口水", "吸溜", "好香", "馋", "美味"]),
+        (Emotion::Sweat, &["冒汗", "尴尬", "无语", "这这这", "呃……", "翻车"]),
+        (Emotion::Wink, &["眨眼", "略略略", "逗你的", "暗号", "wink"]),
+        (Emotion::Cheer, &["加油", "冲呀", "万岁", "打call", "打 call", "奥利给"]),
         (Emotion::Surprised, &["诶？", "欸？", "哇", "真的吗", "居然", "竟然", "吓", "天哪", "什么？", "！？", "?!"]),
         (Emotion::Dizzy, &["晕", "头好乱", "绕晕", "搞不懂", "好复杂"]),
-        (Emotion::Yawn, &["困", "哈欠", "好累", "睡觉", "晚安", "犯困"]),
+        (Emotion::Sleepy, &["犯困", "眼皮", "迷糊", "打盹"]),
+        (Emotion::Yawn, &["困", "哈欠", "好累", "睡觉", "晚安", "伸懒腰"]),
         // 「可能/也许/大概」在普通回答里太常见，不算
         (Emotion::Think, &["让我想想", "想想", "嗯……", "嗯...", "不确定", "思考", "我猜"]),
         (Emotion::Happy, &["哈哈", "嘿嘿", "开心", "太好了", "好耶", "棒", "厉害", "耶", "嘻嘻", "夸我", "~", "～"]),
@@ -382,6 +403,11 @@ mod tests {
         assert_eq!(guess("最喜欢你啦"), Emotion::Love);
         assert_eq!(guess("人家才没有脸红"), Emotion::Shy);
         assert_eq!(guess("头好晕"), Emotion::Dizzy);
+        assert_eq!(guess("吸溜……好香呀"), Emotion::Drool);
+        assert_eq!(guess("略略略逗你的"), Emotion::Wink);
+        assert_eq!(guess("尴尬得脑门冒汗"), Emotion::Sweat);
+        assert_eq!(guess("加油！冲呀！"), Emotion::Cheer);
+        assert_eq!(guess("眼皮打架好犯困"), Emotion::Sleepy);
     }
 
     #[test]
