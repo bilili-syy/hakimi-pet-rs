@@ -99,6 +99,9 @@ impl Behavior {
     /// 开口之前：换表情 + 小动作（开心跳一下、害羞冒心、生气哈气……）。状态先定好，TTS 的语气也跟着走
     pub(super) fn emotion_face(&mut self, e: Option<Emotion>) {
         let Some(e) = e else { return };
+        if self.io {
+            crate::core::usage::add_face(&format!("{e:?}"));
+        }
         self.set_state(emotion_state(e), None);
         match e {
             Emotion::Happy => {

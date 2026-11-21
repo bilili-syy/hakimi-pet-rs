@@ -738,6 +738,7 @@ impl Behavior {
         self.next_tick = real_now.max(self.now) + 20_000;
         self.stats.tick(self.state == St::Sleep);
         if self.io {
+            crate::core::usage::add_seconds(20);
             let food = crate::core::usage::today().food();
             self.feed_from_usage(food);
         }
@@ -809,6 +810,9 @@ impl Behavior {
         let before = self.stats.level().0;
         self.maybe_checkin(kind);
         let r = self.stats.act(kind);
+        if self.io && kind == Act::Feed && r != ActResult::Full {
+            crate::core::usage::add_feed();
+        }
         let (idx, name) = self.stats.level();
         if idx > before { self.later(2700, Later::LevelUp(name)); }
         self.save();

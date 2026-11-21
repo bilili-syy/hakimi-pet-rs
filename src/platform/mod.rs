@@ -16,6 +16,7 @@ mod skin_menu;
 mod menu;
 mod perch;
 mod power;
+mod report;
 mod sense;
 mod settings;
 mod sys;
@@ -749,6 +750,7 @@ fn after(a: MenuAction) {
         MenuAction::Quit => do_quit(),
         MenuAction::Memo(crate::types::MemoAct::OpenFile) => open_path(&crate::core::memo::ensure_file()),
         MenuAction::Memo(crate::types::MemoAct::OpenWindow) => settings::open(3),
+        MenuAction::Report => settings::open(4),
         MenuAction::Mind(crate::types::MindAct::OpenFile) => open_path(&crate::core::memory::ensure_file()),
         // 清空记忆：推迟到 pump() 外弹模态确认框，避免在 PUMPING=true 期间阻塞事件队列
         MenuAction::Mind(crate::types::MindAct::ClearAsk) => {

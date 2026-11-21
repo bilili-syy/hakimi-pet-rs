@@ -87,6 +87,17 @@ pub struct CheckIn {
     pub bonus: f64,
 }
 
+/// day_number 的反过来：天数 → "YYYY-MM-DD"
+pub fn date_of_day(n: i64) -> String {
+    let d = super::memo::Dt::from_min(n * 1440);
+    format!("{:04}-{:02}-{:02}", d.y, d.mo, d.d)
+}
+
+/// 亲密度对应的等级名
+pub fn level_name(affection: f64) -> &'static str {
+    LEVELS.iter().rev().find(|(min, _)| affection >= *min).map(|x| x.1).unwrap_or(LEVELS[0].1)
+}
+
 /// "YYYY-MM-DD" → 自 1970-01-01 起的天数（公历；格式不对返回 None）
 pub fn day_number(date: &str) -> Option<i64> {
     let mut it = date.trim().splitn(3, '-');

@@ -5,6 +5,7 @@ pub mod anim;
 pub mod dance;
 pub mod live;
 pub mod perf;
+pub mod report;
 pub mod shapes;
 pub mod skin_loader;
 pub mod sprites;

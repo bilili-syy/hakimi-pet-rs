@@ -108,6 +108,9 @@ impl Behavior {
         if r.ok && self.io && crate::core::usage::now_fullness() != crate::core::usage::Fullness::Normal {
             r.text = stuffed_text(&r.text, fastrand::f64());
         }
+        if r.ok && self.io {
+            crate::core::usage::add_chat();
+        }
         // 语音回答：先合成，字和声音一起出来（chatvoice.rs）；这期间保持思考中
         if r.ok && self.chat_voice_on() {
             self.cv_start(&r.text, emo);

@@ -1,5 +1,6 @@
 //! 今天吃了多少「粮食」：云端聊天模型的 token + MiMo 语音的字数（1 字算 1 份）。
 //! 本机模型（Ollama / GPT-SoVITS）不花钱，不记。存在数据目录 usage.json，只留最近 30 天。
+//! 顺便记每天的陪伴：开着的时长、喂小鱼干、聊天次数、出现过的表情（每周报告图用）。
 //! 每日上限（config.dailyFoodCap，0 = 不限）到了：聊天和语音先降级（固定台词 / 内置录音），不直接停。
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -15,6 +16,14 @@ pub struct Day {
     pub tts_chars: u64,
     /// 云端请求次数
     pub requests: u32,
+    /// 她开着陪你的秒数
+    pub seconds: u64,
+    /// 喂了几次小鱼干
+    pub feeds: u32,
+    /// 聊天回了几句
+    pub chats: u32,
+    /// 表情 → 次数（Emotion 的英文名）
+    pub faces: std::collections::BTreeMap<String, u32>,
 }
 impl Day {
     /// 粮食总数：token + 语音字数
@@ -73,6 +82,19 @@ impl Book {
         if tokens > 0 {
             d.requests += 1;
         }
+    }
+    /// 改今天那一条
+    pub fn bump(&mut self, today: &str, f: impl FnOnce(&mut Day)) { f(self.day_mut(today)) }
+    /// 截到 today 为止最近 7 天（老的在前，没记录的日子补空）
+    pub fn week(&self, today: &str) -> Vec<Day> {
+        let Some(end) = super::stats::day_number(today) else { return vec![self.get(today)] };
+        (0..7)
+            .rev()
+            .map(|back| {
+                let date = super::stats::date_of_day(end - back);
+                self.get(&date)
+            })
+            .collect()
     }
     pub fn get(&self, today: &str) -> Day {
         self.days.iter().rev().find(|d| d.date == today).cloned().unwrap_or_else(|| Day { date: today.to_string(), ..Day::default() })
@@ -149,6 +171,24 @@ pub fn add_tts_chars(n: u64) {
     });
 }
 
+fn bump_now(f: impl FnOnce(&mut Day)) {
+    let today = today_str();
+    with(|b| {
+        b.bump(&today, f);
+        save(b);
+    });
+}
+/// 她开着又过了 secs 秒（每 20 秒记一次，存盘也跟着这个节奏）
+pub fn add_seconds(secs: u64) { bump_now(|d| d.seconds += secs) }
+pub fn add_feed() { bump_now(|d| d.feeds += 1) }
+pub fn add_chat() { bump_now(|d| d.chats += 1) }
+pub fn add_face(name: &str) { bump_now(|d| *d.faces.entry(name.to_string()).or_insert(0) += 1) }
+/// 最近 7 天
+pub fn week() -> Vec<Day> {
+    let t = today_str();
+    with(|b| b.week(&t))
+}
+
 /// 今天的用量
 pub fn today() -> Day {
     let t = today_str();
@@ -190,6 +230,24 @@ mod tests {
     }
 
     #[test]
+    fn week_fills_gaps() {
+        let mut b = Book::default();
+        b.bump("2026-11-16", |d| d.seconds = 600);
+        b.bump("2026-11-21", |d| {
+            d.feeds = 2;
+            *d.faces.entry("Happy".into()).or_insert(0) += 3;
+        });
+        let w = b.week("2026-11-21");
+        assert_eq!(w.len(), 7);
+        assert_eq!(w[0].date, "2026-11-15");
+        assert_eq!(w[1].seconds, 600);
+        assert_eq!(w[6].feeds, 2);
+        assert_eq!(w[6].faces["Happy"], 3);
+        // 跨月
+        assert_eq!(b.week("2026-12-02")[0].date, "2026-11-26");
+    }
+
+    #[test]
     fn fullness_levels() {
         assert_eq!(fullness(999_999, 0), Fullness::Normal);
         assert_eq!(fullness(79, 100), Fullness::Normal);
@@ -209,7 +267,7 @@ mod tests {
 
     #[test]
     fn summary_text() {
-        let d = Day { date: "x".into(), tokens: 11_000, tts_chars: 800, requests: 3 };
+        let d = Day { date: "x".into(), tokens: 11_000, tts_chars: 800, requests: 3, ..Day::default() };
         assert_eq!(summary(&d), "今天已用 1.2 万（聊天 1.1 万 token · 语音 800 字）");
     }
 }

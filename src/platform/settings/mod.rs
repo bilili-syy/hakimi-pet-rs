@@ -1,6 +1,6 @@
 //! 设置窗口：原生 Win32 控件（不用 webview / GUI 库）。点「⚙️ 设置…」时才创建，关掉就整个销毁，不常驻。
 //!
-//! - 左边分类列表（AI 聊天 / 语音 / 常规 / 备忘录），右边是对应的一页控件；底部「恢复默认」「保存」「取消」。
+//! - 左边分类列表（AI 聊天 / 语音 / 常规 / 备忘录 / 周报），右边是对应的一页控件；底部「恢复默认」「保存」「取消」。
 //! - 「备忘录」页例外：增删改直接写 memo.json（core::memo），不等底部「保存」。
 //! - 只在保存时写 config.json：拿 `config::get()` 的副本改已知字段（未知字段原样留着），原子写回，
 //!   然后走和菜单「重新加载设置」同一条路（`settings:reload`）让改动马上生效。
@@ -36,6 +36,7 @@ use windows::core::{PCWSTR, w};
 
 mod logic;
 mod memo_page;
+mod report_page;
 mod paint;
 pub use logic::*;
 use memo_page::*;
@@ -172,6 +173,12 @@ const ID_MEMO_DONE: i32 = 187;
 const ID_MEMO_DEL: i32 = 188;
 const ID_MEMO_CLEAR: i32 = 189;
 const ID_MEMO_MSG: i32 = 190;
+const ID_REPORT_INFO: i32 = 191;
+const ID_REPORT_MAKE: i32 = 192;
+const ID_REPORT_OPEN: i32 = 193;
+const ID_REPORT_MSG: i32 = 194;
+/// 周报页记忆勾选框 700..706
+const ID_REPORT_MEM0: i32 = 700;
 /// 灰色说明文字
 const ID_HINT0: i32 = 200;
 /// 粗体标题
@@ -179,7 +186,7 @@ const ID_TITLE0: i32 = 300;
 /// 普通标签
 const ID_LABEL0: i32 = 400;
 
-const PAGES: [&str; 4] = ["AI 聊天", "语音", "常规", "备忘录"];
+const PAGES: [&str; 5] = ["AI 聊天", "语音", "常规", "备忘录", "周报"];
 const REPEATS: [(Repeat, &str); 4] = [(Repeat::None, "不重复"), (Repeat::Daily, "每天"), (Repeat::Workday, "工作日"), (Repeat::Weekly, "每周")];
 const SPEAK: [(&str, &str); 3] = [("all", "所有气泡都念"), ("chat", "只念聊天回复"), ("off", "都不念")];
 const MODES: [(&str, &str); 4] = [
@@ -259,6 +266,8 @@ struct Dlg {
     memo_ids: Vec<u64>,
     memo_sel: Option<u64>,
     memo_ver: u64,
+    /// 周报页：勾选框第 i 个对应的记忆
+    report_mems: Vec<String>,
 }
 
 thread_local! {
@@ -444,6 +453,7 @@ fn create_inner(page: u8) -> windows::core::Result<()> {
             memo_ids: Vec::new(),
             memo_sel: None,
             memo_ver: 0,
+            report_mems: Vec::new(),
         };
         let _ = d.make_fonts();
         if let Some(i) = d.icon {
@@ -821,6 +831,9 @@ impl Dlg {
         self.button(p, ID_MEMO_CLEAR, "清空已完成", 0, [X0, 406.0, 110.0, 30.0]);
         self.add(p, w!("STATIC"), "", SS_CENTERIMAGE, 0, ID_MEMO_MSG, [X0 + 122.0, 406.0, mw - 122.0, 30.0]);
 
+        // ---------------- 周报
+        self.report_build();
+
         // ---------------- 底部按钮（每页都有）
         let y = H - 50.0;
         self.button(0, ID_DEFAULTS, "恢复默认", 0, [X0, y, 100.0, 32.0]);
@@ -942,7 +955,7 @@ impl Dlg {
         }
         // 备忘录页不走「保存」，「恢复默认」藏起来免得误会；只在备忘录页开 1 秒刷新定时器
         unsafe {
-            let _ = ShowWindow(self.c(ID_DEFAULTS), if self.page == 4 { SW_HIDE } else { SW_SHOW });
+            let _ = ShowWindow(self.c(ID_DEFAULTS), if self.page >= 4 { SW_HIDE } else { SW_SHOW });
             if self.page == 4 {
                 windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(self.hwnd), 1, 1000, None);
             } else {
@@ -951,6 +964,9 @@ impl Dlg {
         }
         if self.page == 4 {
             self.memo_refresh();
+        }
+        if self.page == 5 {
+            self.report_refresh();
         }
         // 自定义服务商没有官网链接
         self.update_ai_hints();
@@ -1200,6 +1216,12 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 });
                 unsafe { windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 2, 50, None); }
             }
+        }
+        (ID_REPORT_MAKE, 0) => report_page::report_make(),
+        (ID_REPORT_OPEN, 0) => {
+            let d = super::report::dir();
+            let _ = std::fs::create_dir_all(&d);
+            super::open_path(&d);
         }
         (ID_MEMO_CLEAR, 0) => {
             menu("memo:clear");
