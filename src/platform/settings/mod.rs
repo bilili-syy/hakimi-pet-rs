@@ -139,6 +139,7 @@ const ID_VOLUME_LABEL: i32 = 140;
 const ID_PLAY: i32 = 141;
 const ID_PLAY_RESULT: i32 = 142;
 const ID_AUTOSTART: i32 = 150;
+const ID_FS_HIDE: i32 = 166;
 const ID_SCALE: i32 = 151;
 const ID_FPS: i32 = 164;
 const ID_BIRTHDAY: i32 = 165;
@@ -735,7 +736,8 @@ impl Dlg {
         // ---------------- 常规
         let p = 3;
         self.title(p, "常规");
-        self.button(p, ID_AUTOSTART, "开机自动启动", BS_AUTOCHECKBOX, [X0, 50.0, 300.0, 24.0]);
+        self.button(p, ID_AUTOSTART, "开机自动启动", BS_AUTOCHECKBOX, [X0, 50.0, 130.0, 24.0]);
+        self.button(p, ID_FS_HIDE, "全屏（游戏/视频）时自动隐藏", BS_AUTOCHECKBOX, [X0 + 140.0, 50.0, 260.0, 24.0]);
         self.label(p, "哈基米大小", [X0, 82.0, LW, 26.0]);
         let sc = self.combo(p, ID_SCALE, false, [FX, 82.0, 170.0, 0.0]);
         combo_fill(sc, &SCALES.map(|x| x.1));
@@ -835,6 +837,7 @@ impl Dlg {
         self.update_tts_enable();
 
         set_checked(self.c(ID_AUTOSTART), autostart);
+        set_checked(self.c(ID_FS_HIDE), c.fullscreen_hide);
         combo_set(self.c(ID_SCALE), nearest_scale(c.scale));
         combo_set(self.c(ID_FPS), FPS.iter().position(|x| x.0 == crate::core::config::clamp_fps(c.fps)).unwrap_or(1));
         set_text(self.c(ID_CITY), &c.weather_city);
@@ -950,6 +953,7 @@ impl Dlg {
         c.tts.volume = send(self.c(ID_VOLUME), TBM_GETPOS, 0, 0).clamp(0, 100) as f32 / 100.0;
 
         let autostart = checked(self.c(ID_AUTOSTART));
+        c.fullscreen_hide = checked(self.c(ID_FS_HIDE));
         c.scale = SCALES[combo_sel(self.c(ID_SCALE)).min(SCALES.len() - 1)].0;
         c.fps = FPS[combo_sel(self.c(ID_FPS)).min(FPS.len() - 1)].0;
         c.weather_city = get_text(self.c(ID_CITY)).trim().to_string();
@@ -1016,6 +1020,7 @@ fn differs(a: &Config, b: &Config) -> bool {
             (c.weather_city.clone(), c.birthday.clone()),
             (c.moyu.enabled, c.moyu.minutes, c.moyu.pomodoro_minutes, c.reminders.water, c.reminders.stand_up),
             c.reminders.off_work.clone(),
+            c.fullscreen_hide,
         )
     };
     pick(a) != pick(b)
@@ -1599,5 +1604,9 @@ mod tests {
         assert!(!differs(&a, &b));
         b.tts.volume = 0.5;
         assert!(differs(&a, &b));
+        let mut c = a.clone();
+        assert!(c.fullscreen_hide, "默认全屏自动隐藏");
+        c.fullscreen_hide = false;
+        assert!(differs(&a, &c));
     }
 }

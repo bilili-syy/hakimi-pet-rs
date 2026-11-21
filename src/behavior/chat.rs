@@ -102,6 +102,8 @@ impl Behavior {
         let ms = (2500 + r.text.encode_utf16().count() as u64 * 150).min(20_000);
         // 语音回答关了：聊天回复只出字
         let voice = !(r.ok && self.chat_voice_disabled_by_user());
+        // 主人在等这句回复：全屏安静模式下也念
+        self.sense_touch();
         self.say_opts(&r.text, ms, voice, if r.ok { SpeakKind::Chat } else { SpeakKind::Line });
         if !busy_phys {
             self.hold_timer(2500, StateAct::ChatIdle);

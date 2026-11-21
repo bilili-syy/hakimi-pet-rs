@@ -95,6 +95,31 @@ pub(crate) fn current_scale() -> f32 {
 thread_local! {
     /// 外部事件限流（platform/ipc.rs）
     static EXT_THROTTLE: RefCell<ipc::Throttle> = RefCell::new(ipc::Throttle::default());
+    /// 全屏程序（游戏等）在前台时是我们把她藏起来的：退出全屏再放出来；主人自己藏的不管
+    static FS_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 全屏自动隐藏：(现在全屏没有, 她现在可见没有, 之前是不是全屏藏的) → (要不要改可见性, 新标记)
+fn fs_autohide(fs: bool, visible: bool, hidden_by_fs: bool) -> (Option<bool>, bool) {
+    match (fs, visible, hidden_by_fs) {
+        (true, true, _) => (Some(false), true),
+        (true, false, h) => (None, h),
+        (false, _, true) => (Some(true), false),
+        (false, _, false) => (None, false),
+    }
+}
+
+fn apply_fs_autohide(fs: bool) {
+    let visible = with(|s| s.is_visible()).unwrap_or(true);
+    // 设置里关了：不再藏；之前藏着的放出来
+    let fs = fs && crate::core::config::get().fullscreen_hide;
+    let (act, flag) = fs_autohide(fs, visible, FS_HIDDEN.with(|c| c.get()));
+    FS_HIDDEN.with(|c| c.set(flag));
+    if let Some(on) = act {
+        crate::core::log::trace(&format!("fullscreen autohide: visible={on}"));
+        with(|s| s.set_visible(on));
+        menu::refresh();
+    }
 }
 
 /// 单调毫秒时钟（起点 1000ms，永不回拨、永不为 0），驱动帧循环/物理/提醒间隔
@@ -525,6 +550,9 @@ fn tick() {
     if let Some(h) = with(|s| s.hwnd) {
         sense::maybe_poll(now, h, &mut evs);
     }
+    for e in &evs {
+        if let AppEvent::Sense(crate::types::SenseEv::Fullscreen(fs)) = e { apply_fs_autohide(*fs); }
+    }
     for e in evs {
         emit(e);
     }
@@ -660,6 +688,8 @@ fn after(a: MenuAction) {
     let now = now_ms();
     match a {
         MenuAction::ToggleVisible => {
+            // 主人自己动了显示/隐藏：以后全屏退出时不再替她做主
+            FS_HIDDEN.with(|c| c.set(false));
             let visible = with(|s| s.is_visible()).unwrap_or(true);
             with(|s| s.set_visible(!visible));
             if !visible {
@@ -1568,5 +1598,27 @@ mod pomo_clock_tests {
         let left = pomodoro_left();
         POMO_END.store(prev, Ordering::Relaxed);
         assert_eq!(left, Some(25));
+    }
+}
+
+#[cfg(test)]
+mod fs_autohide_tests {
+    use super::fs_autohide;
+
+    #[test]
+    fn hides_in_fullscreen_and_comes_back() {
+        // 进全屏：可见 → 藏起来并记下是我们藏的
+        assert_eq!(fs_autohide(true, true, false), (Some(false), true));
+        // 全屏期间保持
+        assert_eq!(fs_autohide(true, false, true), (None, true));
+        // 退出全屏 → 放出来
+        assert_eq!(fs_autohide(false, false, true), (Some(true), false));
+    }
+
+    #[test]
+    fn leaves_manual_hide_alone() {
+        // 主人自己藏的：进全屏、出全屏都不动
+        assert_eq!(fs_autohide(true, false, false), (None, false));
+        assert_eq!(fs_autohide(false, false, false), (None, false));
     }
 }

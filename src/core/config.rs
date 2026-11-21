@@ -121,6 +121,8 @@ pub struct Config {
     pub scale: f32,
     /// 动画帧率上限：30 / 60 / 120（载入时就近取这三档）
     pub fps: u32,
+    /// 全屏程序（游戏、全屏视频）在前台时自动藏起来，退出全屏再出来
+    pub fullscreen_hide: bool,
     /// 未知字段（_说明 之类）原样保留
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -158,6 +160,7 @@ impl Default for Config {
             weather_city: String::new(),
             scale: 1.0,
             fps: 60,
+            fullscreen_hide: true,
             extra,
         }
     }

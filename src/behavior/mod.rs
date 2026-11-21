@@ -413,9 +413,20 @@ impl Behavior {
         self.now = now;
         self.run_timers();
         match ev {
-            AppEvent::Mouse(m) => self.on_mouse(m),
-            AppEvent::Menu(a) => self.on_menu(a),
-            AppEvent::ChatSubmit(t) => self.on_chat_submit(t),
+            AppEvent::Mouse(m) => {
+                if matches!(m, MouseEv::Down { .. } | MouseEv::Up { .. } | MouseEv::DoubleClick { .. } | MouseEv::Wheel { .. }) {
+                    self.sense_touch();
+                }
+                self.on_mouse(m)
+            }
+            AppEvent::Menu(a) => {
+                self.sense_touch();
+                self.on_menu(a)
+            }
+            AppEvent::ChatSubmit(t) => {
+                self.sense_touch();
+                self.on_chat_submit(t)
+            }
             AppEvent::ChatCancel => self.close_chat(),
             AppEvent::ChatReply(r) => self.on_chat_reply(r),
             AppEvent::Speech { token, audio } if self.cv_wants(token) => self.cv_on_speech(token, audio),

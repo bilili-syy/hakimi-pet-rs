@@ -4,11 +4,16 @@ use super::fx::FxKind;
 use super::{Behavior, Shot, St, lines, pick};
 use crate::types::SenseEv;
 
+/// 安静模式下，主人点她之后多久内的回应照样出声
+const TOUCH_VOICE_MS: u64 = 2500;
+
 #[derive(Debug, Default)]
 pub struct SenseUi {
     /// 全屏程序在前台：安静模式（不念、不主动说话）
     pub quiet: bool,
     quiet_since: u64,
+    /// 主人最近一次直接找她（点、摸、滚轮、右键菜单、发聊天）的时刻：安静模式下这之后一小会儿照样出声
+    pub touched: u64,
     /// 后台在放音乐：跟着点头
     bob: bool,
     next_bob: u64,
@@ -135,8 +140,15 @@ impl Behavior {
         }
     }
 
-    /// 安静模式下只念提醒
-    pub(super) fn sense_mute(&self, token: u64) -> bool { self.sense.quiet && !self.memo_token(token) }
+    /// 安静模式（全屏程序在前台，比如游戏）只挡她自己冒出来的话：提醒照念；
+    /// 主人刚点了她 / 用了菜单 / 聊天回复到了，回应照念——是主人自己找的，不算打扰
+    pub(super) fn sense_mute(&self, token: u64) -> bool {
+        if !self.sense.quiet || self.memo_token(token) { return false; }
+        !(self.sense.touched > 0 && self.now.saturating_sub(self.sense.touched) <= TOUCH_VOICE_MS)
+    }
+
+    /// 记一下「主人直接找她了」
+    pub(super) fn sense_touch(&mut self) { self.sense.touched = self.now.max(1); }
 
     /// 每帧：放音乐时跟着点头（每 0.7 秒一下，偶尔冒音符）
     pub(super) fn sense_frame(&mut self) {
@@ -213,6 +225,25 @@ mod tests {
         b.set_state(St::Idle, None);
         ev(&mut b, AppEvent::Sense(SenseEv::UserIdle(2)), 9000 + 7 * 60_000);
         assert_eq!(b.state, St::Sleep);
+    }
+
+    #[test]
+    fn quiet_mode_still_answers_when_touched() {
+        use crate::types::{Button, MouseEv};
+        let mut b = mk();
+        tick(&mut b, 3000);
+        ev(&mut b, AppEvent::Sense(SenseEv::Fullscreen(true)), 4000);
+        // 自己冒出来的话：不念
+        b.say("自言自语喵", 2000);
+        assert!(!b.calls.iter().any(|c| c == "speak:自言自语喵"));
+        // 主人点了她：回应照念
+        ev(&mut b, AppEvent::Mouse(MouseEv::Down { button: Button::Left, x: 120.0, y: 250.0, sx: 500, sy: 500 }), 5000);
+        b.say("被点到了喵", 2000);
+        assert!(b.calls.iter().any(|c| c == "speak:被点到了喵"));
+        // 过了一会儿又是自己说话：还是不念
+        tick(&mut b, 9000);
+        b.say("又自言自语喵", 2000);
+        assert!(!b.calls.iter().any(|c| c == "speak:又自言自语喵"));
     }
 
     #[test]
