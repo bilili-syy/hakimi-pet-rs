@@ -140,6 +140,9 @@ pub struct Config {
     pub daily_food_cap: u64,
     /// 看屏吐槽：Ctrl+Alt+K 截前台窗口给她看（默认关；截图只在内存里，确认后发给聊天模型）
     pub screen_roast: bool,
+    /// 聊天「打开程序」安全白名单（键=口令/别名，值=本机 .exe 绝对路径；打开前仍会弹确认框，禁止命令行解释器）
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub allowed_apps: std::collections::BTreeMap<String, String>,
     /// 未知字段（_说明 之类）原样保留
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -180,6 +183,7 @@ impl Default for Config {
             fullscreen_hide: true,
             daily_food_cap: 0,
             screen_roast: false,
+            allowed_apps: std::collections::BTreeMap::new(),
             extra,
         }
     }

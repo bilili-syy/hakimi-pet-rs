@@ -919,3 +919,37 @@ fn click_zone_double_click_spam_poke_wheel_and_perch_feed() {
     assert!(out.contains(&WinCmd::Toy(crate::types::ToyCmd::Remove)));
     assert_eq!(b.state, St::Eat);
 }
+
+#[test]
+fn chat_actions_execute_both_via_ai_tags_and_local_direct() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+
+    // 1. AI 回复里带 [do:...] 标签：标签从气泡与语音里完全剥离，换装/配饰/番茄钟/备忘动作同步生效，且保留 AI 自己的气泡文字
+    ev(
+        &mut b,
+        AppEvent::ChatReply(ChatReply {
+            ok: true,
+            need_key: false,
+            text: "[wink]这就换上女仆装戴上眼镜陪你专注喵！[do:costume:maid][do:outfit:glasses:on][do:pomo:25][do:memo:2026-12-01 10:00|none|提交代码]".into(),
+        }),
+        4_000,
+    );
+    assert_eq!(b.scene.bubble.as_ref().unwrap().text, "这就换上女仆装戴上眼镜陪你专注喵！");
+    assert!(!b.calls.iter().any(|c| c.contains("[do:")));
+    assert_eq!(b.costume, "maid");
+    assert_eq!(b.outfits, vec!["glasses".to_string()]);
+    assert!(b.pomo_running);
+    assert!(b.calls.iter().any(|c| c == "tool:memo:提交代码|2026-12-01 10:00|None"));
+
+    // 2. 本地离线直达口令：不用等云端（waiting 保持 false），直接换装/跳舞/请求打开白名单工具
+    ev(&mut b, AppEvent::ChatSubmit("换套猫耳睡衣".into()), 6_000);
+    assert!(!b.waiting);
+    assert_eq!(b.costume, "pajama");
+
+    ev(&mut b, AppEvent::ChatSubmit("结束番茄钟".into()), 7_000);
+    assert!(!b.pomo_running);
+
+    ev(&mut b, AppEvent::ChatSubmit("打开记事本".into()), 8_000);
+    assert!(b.calls.iter().any(|c| c == "tool:open:记事本"));
+}

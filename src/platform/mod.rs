@@ -24,6 +24,7 @@ mod sys;
 mod timers;
 mod hrtimer;
 pub mod ipc;
+mod tool_confirm;
 mod toy;
 mod watch;
 #[cfg(test)]
@@ -119,6 +120,7 @@ pub(crate) fn own_visible_windows() -> Vec<HWND> {
             s.chat.as_ref().map(|c| c.host),
             s.toy.as_ref().map(|t| t.hwnd),
             settings::hwnd(),
+            tool_confirm::hwnd(),
         ]
         .into_iter()
         .flatten()
@@ -141,6 +143,31 @@ pub(crate) fn is_chat_open() -> bool {
 
 pub fn chat_is_focused() -> bool {
     chat::is_focused()
+}
+
+pub fn request_tool_open(target: &str) {
+    tool_confirm::request_open(target);
+}
+
+pub fn push_menu_id(id: &str) {
+    menu::push_id(id.to_string());
+}
+
+pub fn start_pomodoro_quiet(minutes: u32) {
+    with(|s| {
+        let p = Pomodoro::start(minutes, pomo_now_ms());
+        POMO_END.store(p.end, Ordering::Relaxed);
+        s.pomodoro = Some(p);
+    });
+    menu::refresh();
+}
+
+pub fn stop_pomodoro_quiet() {
+    with(|s| {
+        s.pomodoro = None;
+    });
+    POMO_END.store(0, Ordering::Relaxed);
+    menu::refresh();
 }
 
 pub(crate) fn current_scale() -> f32 {
@@ -299,7 +326,7 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
                     if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
                         break 'pump;
                     }
-                    if !settings::dialog_message(&msg) && !roast::dialog_message(&msg) {
+                    if !settings::dialog_message(&msg) && !roast::dialog_message(&msg) && !tool_confirm::dialog_message(&msg) {
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
                     }
@@ -312,8 +339,8 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
                     if msg.message == WM_QUIT {
                         break 'pump;
                     }
-                    // 设置窗口 / 看屏吐槽确认框：Tab 切换、回车确认、Esc 取消
-                    if settings::dialog_message(&msg) || roast::dialog_message(&msg) {
+                    // 设置窗口 / 看屏吐槽确认框 / 工具打开确认框：Tab 切换、回车确认、Esc 取消
+                    if settings::dialog_message(&msg) || roast::dialog_message(&msg) || tool_confirm::dialog_message(&msg) {
                         continue;
                     }
                     let _ = TranslateMessage(&msg);
@@ -322,7 +349,7 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
             }
         } else {
             while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-                if settings::dialog_message(&msg) || roast::dialog_message(&msg) {
+                if settings::dialog_message(&msg) || roast::dialog_message(&msg) || tool_confirm::dialog_message(&msg) {
                     continue;
                 }
                 let _ = TranslateMessage(&msg);
@@ -869,6 +896,7 @@ fn do_quit() {
     } else {
         roast::close_existing();
     }
+    tool_confirm::close_existing();
     settings::close_now();
     hrtimer::close();
     with_handler(|h| h.quit());

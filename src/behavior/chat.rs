@@ -140,6 +140,15 @@ impl Behavior {
             }
             None => {}
         }
+        // 本地明确动作口令（换装/配饰/跳舞/番茄钟/打开白名单工具）：免等云端，离线无 Key 也能直接执行
+        if let Some((act, hint)) = crate::services::actions::parse_local_direct(&text) {
+            self.act(Act::Chat);
+            if !hint.is_empty() {
+                self.say(hint, 2600);
+            }
+            self.run_chat_acts(vec![act], false);
+            return;
+        }
         let req_id = self.begin_chat_wait();
         self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(false)));
         if !self.dragging && !matches!(self.state, St::Drag | St::Fall) {
@@ -218,7 +227,7 @@ impl Behavior {
         self.on_chat_reply_id(0, r);
     }
 
-    pub(super) fn on_chat_reply_id(&mut self, req_id: u64, r: ChatReply) {
+    pub(super) fn on_chat_reply_id(&mut self, req_id: u64, mut r: ChatReply) {
         if req_id != 0 {
             if req_id != self.active_chat_req {
                 self.call("chat:dropped".into());
@@ -230,8 +239,24 @@ impl Behavior {
             self.call("chat:dropped".into());
             return;
         }
-        // 去掉情绪标签（气泡和 TTS 只拿干净文字）
+        // 先剥离受控动作标签 [do:...]，再剥离情绪标签（气泡和 TTS 只拿干净文字）
+        let acts = if r.ok {
+            let (clean_txt, extracted) = crate::services::actions::extract(&r.text);
+            r.text = clean_txt;
+            extracted
+        } else {
+            Vec::new()
+        };
         let (mut r, emo) = self.emotion_split(r);
+        // 若模型只返回了 [do:...] 标签没有正文，直接按本地动作模式执行（带默认动作台词）
+        if r.ok && r.text.trim().is_empty() && !acts.is_empty() {
+            self.waiting = false;
+            self.cmds.push(WinCmd::ChatInput(ChatInputCmd::Enable(true)));
+            self.act(Act::Chat);
+            self.run_chat_acts(acts, false);
+            self.mind_after_reply(true);
+            return;
+        }
         // 今天快吃撑了：打嗝、拖长尾音
         if r.ok && self.io && crate::core::usage::now_fullness() != crate::core::usage::Fullness::Normal {
             r.text = stuffed_text(&r.text, fastrand::f64());
@@ -245,6 +270,9 @@ impl Behavior {
             if self.cv.is_some() {
                 // 第一段出字时再换表情（emotion_cv_reveal），整段念完 2 秒后回平时
                 self.emotion_cv_pending(emo, r.text.chars().count());
+                if !acts.is_empty() {
+                    self.run_chat_acts(acts, true);
+                }
                 self.mind_after_reply(true);
                 return;
             }
@@ -287,6 +315,187 @@ impl Behavior {
             self.hold_timer(2500, StateAct::ChatIdle);
             self.emotion_hold(emo);
         }
+        if !acts.is_empty() {
+            self.run_chat_acts(acts, true);
+        }
         self.mind_after_reply(r.ok);
+    }
+
+    /// 执行聊天解析出来的动作列表。`preserve_bubble = true` 表示 AI 已经给了自己的回复气泡和语音，动作只改状态/配置不覆盖气泡
+    pub(super) fn run_chat_acts(&mut self, acts: Vec<crate::services::actions::ChatAct>, preserve_bubble: bool) {
+        use crate::services::actions::ChatAct as A;
+        for act in acts {
+            match act {
+                A::Costume(id) => {
+                    let norm = crate::core::costume::normalize(&id).to_string();
+                    self.call(format!("tool:costume:{norm}"));
+                    if norm != self.costume {
+                        if self.io {
+                            let v = crate::core::costume::config_value(&norm);
+                            crate::core::config::update(|c| c.costume = v);
+                        }
+                        self.costume = norm;
+                        if preserve_bubble {
+                            self.play(Shot::Bounce);
+                        } else {
+                            self.outfit_changed(true, false);
+                        }
+                    } else if !preserve_bubble {
+                        self.play(Shot::Bounce);
+                        self.say(&pick(lines::costume_line(&self.costume)), 2500);
+                    }
+                }
+                A::Outfit(id, on) => {
+                    self.call(format!("tool:outfit:{id}:{on}"));
+                    let mut l: Vec<String> = self.outfits.iter().filter(|x| **x != id).cloned().collect();
+                    if on {
+                        l.push(id);
+                    }
+                    if preserve_bubble {
+                        if l != self.outfits {
+                            if self.io {
+                                let v = l.clone();
+                                crate::core::config::update(|c| c.outfit = v);
+                            }
+                            self.outfits = l;
+                            self.play(Shot::Bounce);
+                        }
+                    } else {
+                        self.set_outfits(l);
+                    }
+                }
+                A::ClearOutfit => {
+                    self.call("tool:outfit:clear".into());
+                    if preserve_bubble {
+                        if !self.outfits.is_empty() {
+                            if self.io {
+                                crate::core::config::update(|c| c.outfit.clear());
+                            }
+                            self.outfits.clear();
+                            self.play(Shot::Bounce);
+                        }
+                    } else {
+                        self.set_outfits(Vec::new());
+                    }
+                }
+                A::PomodoroStart(mins) => {
+                    self.call(format!("tool:pomo:{mins}"));
+                    if preserve_bubble {
+                        self.pomo_running = true;
+                        if self.io {
+                            crate::platform::start_pomodoro_quiet(mins);
+                        }
+                    } else if self.io {
+                        crate::platform::push_menu_id(&format!("pomo:{mins}"));
+                    } else {
+                        self.on_pomodoro(PomodoroEv::Start { minutes: mins });
+                    }
+                }
+                A::PomodoroStop => {
+                    self.call("tool:pomo:stop".into());
+                    if preserve_bubble {
+                        self.pomo_running = false;
+                        if self.io {
+                            crate::platform::stop_pomodoro_quiet();
+                        }
+                    } else if self.io {
+                        crate::platform::push_menu_id("pomo:stop");
+                    } else {
+                        self.on_pomodoro(PomodoroEv::Cancel);
+                    }
+                }
+                A::Memo { text, time, repeat } => {
+                    self.call(format!(
+                        "tool:memo:{}|{}|{:?}",
+                        text,
+                        time.map(crate::core::memo::Dt::fmt).unwrap_or_default(),
+                        repeat
+                    ));
+                    if self.io {
+                        crate::core::memo::add(&text, time, repeat);
+                    }
+                }
+                A::OpenTarget(target) => {
+                    self.call(format!("tool:open:{target}"));
+                    if self.io {
+                        crate::platform::request_tool_open(&target);
+                    }
+                }
+                A::Dance(id) => {
+                    self.call(format!("tool:dance:{id}"));
+                    let prev_bubble = preserve_bubble.then(|| self.bubble.as_ref().map(|b| (b.text.clone(), b.hide_at, b.dur, b.token))).flatten();
+                    self.start_routine(&id);
+                    if let Some((txt, hide, dur, tok)) = prev_bubble {
+                        self.show_bubble(txt, hide, dur, tok, false);
+                    }
+                }
+                A::Song => {
+                    self.call("tool:song".into());
+                    let prev_bubble = preserve_bubble.then(|| self.bubble.as_ref().map(|b| (b.text.clone(), b.hide_at, b.dur, b.token))).flatten();
+                    self.play_song();
+                    if let Some((txt, hide, dur, tok)) = prev_bubble {
+                        self.show_bubble(txt, hide, dur, tok, false);
+                    }
+                }
+                A::Weather => {
+                    self.call("tool:weather".into());
+                    self.weather_report(true);
+                }
+                A::Sleep => {
+                    self.call("tool:sleep".into());
+                    if preserve_bubble {
+                        self.set_state(St::Yawn, None);
+                        self.hold_timer(2200, StateAct::Set(St::Sleep, Some((60000.0, 150000.0))));
+                    } else {
+                        self.go_sleep();
+                    }
+                }
+                A::Walk => {
+                    self.call("tool:walk".into());
+                    if preserve_bubble {
+                        if self.play.perch != Some(crate::types::PerchKind::WindowTop) {
+                            self.play.perch = None;
+                            self.walk_dir = if fastrand::bool() { -1 } else { 1 };
+                            self.set_state(St::Walk, None);
+                            let dist = rand(160.0, 420.0) as f32 * self.scale;
+                            self.cmds.push(WinCmd::Walk { dir: self.walk_dir, distance: dist, speed: 1.6 * self.scale });
+                        } else {
+                            self.jump_down();
+                        }
+                    } else {
+                        self.go_walk();
+                    }
+                }
+                A::Honey => {
+                    self.call("tool:honey".into());
+                    if preserve_bubble {
+                        if self.act(Act::Feed) != ActResult::Full {
+                            self.set_state(St::Honey, None);
+                            self.fx(FxKind::Honey, 6);
+                            self.later(2700, Later::HoneyFast);
+                            self.hold_timer(2600, StateAct::Set(St::Idle, Some((5000.0, 9000.0))));
+                        }
+                    } else {
+                        self.drink_honey();
+                    }
+                }
+                A::Status => {
+                    self.call("tool:status".into());
+                    self.show_status();
+                }
+                A::Game => {
+                    self.call("tool:game".into());
+                    let prev_bubble = preserve_bubble.then(|| self.bubble.as_ref().map(|b| (b.text.clone(), b.hide_at, b.dur, b.token))).flatten();
+                    self.start_game();
+                    if let Some((txt, hide, dur, tok)) = prev_bubble {
+                        self.show_bubble(txt, hide, dur, tok, false);
+                    }
+                }
+                A::Climb => {
+                    self.call("tool:climb".into());
+                    self.start_climb(crate::types::PerchKind::WindowTop, true);
+                }
+            }
+        }
     }
 }

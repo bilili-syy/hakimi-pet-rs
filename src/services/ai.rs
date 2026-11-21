@@ -334,7 +334,12 @@ pub fn log_markdown(items: &[Value], title_time: &str, time: impl Fn(f64) -> Str
             last_day = day;
         }
         let who = if is_user(m) { "你" } else { "哈基米" };
-        let text = if is_user(m) { msg_text(m).to_string() } else { crate::services::emotion::split(msg_text(m)).text };
+        let text = if is_user(m) {
+            msg_text(m).to_string()
+        } else {
+            let stripped = crate::services::actions::extract(msg_text(m)).0;
+            crate::services::emotion::split(&stripped).text
+        };
         let clock = t.split(' ').nth(1).map(|c| format!(" {c}")).unwrap_or_default();
         out.push_str(&format!("\n**{who}**{clock}\n\n{}\n", text.trim().replace('\n', "  \n")));
     }
@@ -378,9 +383,11 @@ fn local_time() -> (u16, u16, u16, u16) {
 
 pub fn persona(c: &crate::core::config::Config, ctx: &ChatCtx) -> String {
     let mut p = persona_at(c, ctx, local_time());
-    // 情绪标签 + 长期记忆（services::emotion / core::memory）
+    // 情绪标签 + 受控动作标签 + 长期记忆（services::emotion / services::actions / core::memory）
     p.push('\n');
     p.push_str(super::emotion::PROMPT);
+    p.push('\n');
+    p.push_str(&super::actions::prompt_hint(&c.allowed_apps));
     let mem = crate::core::memory::prompt();
     if !mem.is_empty() {
         p.push('\n');
