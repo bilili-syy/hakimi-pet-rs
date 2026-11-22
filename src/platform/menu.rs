@@ -102,6 +102,16 @@ const COSTUME: &[Node] = &[
     // 「🎭 角色」：角色包列表 + 打开皮肤文件夹 + 刷新（platform/skin_menu.rs）
     Gen("skin"),
 ];
+pub const VOLUME_TITLE: &str = "🔊 音量";
+const VOLUME: &[Node] = &[
+    Item("vol:panel", "🎛️ 打开音量调节条…"),
+    Check("vol:mute", "🔇 一键总静音"),
+    Sep,
+    Check("vol:100", "🔊 100%（最大）"),
+    Check("vol:75", "🔉 75%"),
+    Check("vol:50", "🔉 50%（适中）"),
+    Check("vol:25", "🔈 25%（轻声）"),
+];
 
 /// 整个右键 / 托盘菜单
 pub const MENU: &[Node] = &[
@@ -113,6 +123,7 @@ pub const MENU: &[Node] = &[
     Sub("👗 换装", COSTUME),
     Item("status", "📊 看看状态"),
     Sep,
+    Sub(VOLUME_TITLE, VOLUME),
     Item("settings", "⚙️ 设置…"),
     Item("visible", "🙈 先藏起来"),
     Item("quit", "退出"),
@@ -134,10 +145,22 @@ pub struct Ctx {
     pub chat_waiting: bool,
     /// 是否已经有过可以复制的气泡文字
     pub has_bubble: bool,
+    /// 说话音量百分比（0..=100）
+    pub voice_pct: u8,
+    /// 伴奏音量百分比（0..=100）
+    pub music_pct: u8,
+    /// 是否处于一键总静音
+    pub muted: bool,
 }
 
 /// 勾选项现在该不该勾
 pub fn checked(id: &str, c: &Ctx) -> bool {
+    if id == "vol:mute" {
+        return c.muted;
+    }
+    if let Some(p) = id.strip_prefix("vol:").and_then(|s| s.parse::<i16>().ok()) {
+        return !c.muted && (c.voice_pct as i16 - p).abs() <= 3 && (c.music_pct as i16 - p).abs() <= 3;
+    }
     if let Some(k) = id.strip_prefix("costume:") {
         return crate::core::costume::normalize(k) == crate::core::costume::normalize(&c.costume);
     }
@@ -157,6 +180,14 @@ pub fn label(id: &str, c: &Ctx) -> Option<String> {
             None => "👀 看屏吐槽（Ctrl+Alt+K）".into(),
         }),
         "visible" => Some(if c.visible { "🙈 先藏起来" } else { "👀 叫她出来" }.into()),
+        VOLUME_TITLE => Some(if c.muted {
+            "🔇 音量（已静音）".into()
+        } else if c.voice_pct == c.music_pct {
+            format!("🔊 音量（{}%）", c.voice_pct)
+        } else {
+            format!("🔊 音量（{}% / {}%）", c.voice_pct, c.music_pct)
+        }),
+        "vol:panel" => Some(format!("🎛️ 音量调节条…（语音 {}% · 音乐 {}%）", c.voice_pct, c.music_pct)),
         "pomo:stop" => Some(match c.pomo_left {
             Some(m) => format!("结束番茄钟（还剩 {m} 分钟）"),
             None => "结束番茄钟".into(),
@@ -395,6 +426,9 @@ pub(crate) fn tray_click_timer() {
 
 fn ctx_now() -> Ctx {
     let cfg = crate::core::config::get();
+    let voice_pct = cfg.tts.voice_pct();
+    let music_pct = cfg.tts.music_pct();
+    let muted = cfg.tts.muted;
     Ctx {
         costume: cfg.costume,
         outfits: cfg.outfit,
@@ -404,6 +438,9 @@ fn ctx_now() -> Ctx {
         roast_conflict: super::roast::hotkey_conflict(),
         chat_waiting: super::chat::is_busy(),
         has_bubble: super::has_copyable_bubble(),
+        voice_pct,
+        music_pct,
+        muted,
     }
 }
 
@@ -524,6 +561,8 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
         "autostart" => A::AutoStart(checked(id)),
         "visible" | TRAY_LEFT => A::ToggleVisible,
         "center" => A::CallToCenter,
+        "vol:panel" => A::VolumePopup,
+        "vol:mute" => A::VolumeMute(checked(id)),
         "quit" => A::Quit,
         _ => {
             if let Some(a) = super::memo_menu::parse(id) {
@@ -532,6 +571,8 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
                 a
             } else if let Some(a) = super::skin_menu::parse(id) {
                 a
+            } else if let Some(v) = id.strip_prefix("vol:") {
+                A::VolumePreset(v.parse::<u8>().ok()?.min(100))
             } else if let Some(m) = id.strip_prefix("pomo:") {
                 A::PomodoroStart(m.parse().ok()?)
             } else if let Some(d) = id.strip_prefix("dance:") {
@@ -580,6 +621,9 @@ mod tests {
         assert_eq!(parse_id("settings", off), Some(A::OpenSettings));
         assert_eq!(parse_id("settings:file", off), Some(A::OpenConfigFile));
         assert_eq!(parse_id("settings:reload", off), Some(A::ReloadSettings));
+        assert_eq!(parse_id("vol:panel", off), Some(A::VolumePopup));
+        assert_eq!(parse_id("vol:mute", on), Some(A::VolumeMute(true)));
+        assert_eq!(parse_id("vol:75", on), Some(A::VolumePreset(75)));
     }
 
     /// 菜单表完整性：id 不重复、都能映射成动作、顶层够短、每个动作都还点得到
@@ -591,9 +635,9 @@ mod tests {
             assert!(seen.insert(id.clone()), "duplicate menu id {id}");
             assert!(parse_id(id, |_| false).is_some(), "menu id {id} has no action");
         }
-        // 顶层（不算分隔线）不超过 10 项
+        // 顶层（不算分隔线）不超过 11 项
         let top = MENU.iter().filter(|n| !matches!(n, Sep)).count();
-        assert!(top <= 10, "top level has {top} entries");
+        assert!(top <= 11, "top level has {top} entries");
         // 换装表和 COSTUMES / OUTFITS 一致
         for (c, _) in crate::core::costume::COSTUMES {
             assert!(ids.contains(&format!("costume:{c}")));
@@ -634,7 +678,18 @@ mod tests {
             roast_conflict: false,
             chat_waiting: false,
             has_bubble: false,
+            voice_pct: 75,
+            music_pct: 75,
+            muted: false,
         };
+        assert!(checked("vol:75", &c) && !checked("vol:50", &c) && !checked("vol:mute", &c));
+        assert_eq!(label(VOLUME_TITLE, &c).unwrap(), "🔊 音量（75%）");
+        c.muted = true;
+        assert!(checked("vol:mute", &c) && !checked("vol:75", &c));
+        assert_eq!(label(VOLUME_TITLE, &c).unwrap(), "🔇 音量（已静音）");
+        c.muted = false;
+        c.music_pct = 50;
+        assert_eq!(label(VOLUME_TITLE, &c).unwrap(), "🔊 音量（75% / 50%）");
         assert!(checked("costume:maid", &c));
         assert!(!checked("costume:", &c));
         assert!(checked("outfit:santa", &c));

@@ -14,6 +14,17 @@ use std::path::{Component, Path, PathBuf};
 /// 单轮回复最多执行的动作数（防止模型一次塞十几个动作）
 const MAX_ACTS_PER_REPLY: usize = 4;
 
+/// 音量调节的目标声道
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeChan {
+    /// 语音与伴奏同时调
+    All,
+    /// 仅说话语音
+    Voice,
+    /// 仅唱歌/跳舞伴奏
+    Music,
+}
+
 /// 聊天触发的一条受控动作
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatAct {
@@ -51,6 +62,20 @@ pub enum ChatAct {
     Game,
     /// 爬到当前窗口顶上
     Climb,
+    /// 设置指定声道音量百分比（0..=100，自动解除静音）
+    VolumeSet {
+        channel: VolumeChan,
+        percent: u8,
+    },
+    /// 相对增减音量百分比（-100..=100）
+    VolumeDelta {
+        channel: VolumeChan,
+        delta: i8,
+    },
+    /// 桌宠一键总静音开关
+    VolumeMute(bool),
+    /// 打开独立悬浮音量控制条
+    VolumePanel,
     /// 请求打开白名单程序或文件夹（必须经白名单校验 + 用户弹窗确认）
     OpenTarget(String),
 }
@@ -123,6 +148,7 @@ pub fn prompt_hint(allowed_apps: &BTreeMap<String, String>) -> String {
 - 跳舞/唱歌：`[do:dance]`（随机跳舞）、`[do:dance:song]`（放歌跳）、`[do:dance:listen]`（听电脑音乐跳）、`[do:song]`（唱歌）\n\
 - 换装/配饰：`[do:costume:maid]`（可选 `sailor`水手服/`hoodie`卫衣/`pajama`睡衣/`idol`偶像服/`swim`泳装/`xmas`圣诞裙/`maid`女仆装/`jk`）、`[do:outfit:glasses:on]`、`[do:outfit:santa:on]`、`[do:outfit:clear]`\n\
 - 番茄钟/日常：`[do:pomo:25]`（开N分钟番茄钟）、`[do:pomo:stop]`、`[do:weather]`、`[do:sleep]`、`[do:walk]`、`[do:honey]`、`[do:game]`、`[do:climb]`、`[do:status]`\n\
+- 桌宠音量控制：`[do:volume:50]`（调总音量0~100）、`[do:volume:voice:60]`（说话音量）、`[do:volume:music:40]`（伴奏音量）、`[do:volume:down]`（小声点）、`[do:volume:up]`（大声点）、`[do:volume:mute]`（静音）、`[do:volume:unmute]`（取消静音）、`[do:volume:panel]`（弹出音量条）\n\
 - 记备忘/提醒：`[do:memo:YYYY-MM-DD HH:MM|none|事项]`（重复填 `none`/`daily`/`workday`/`weekly`）或 `[do:memo:note|随手记内容]`\n\
 - 打开白名单工具（会先弹确认框请主人批准）：`[do:open:notepad]`（记事本）、`[do:open:calc]`（计算器）、`[do:open:mspaint]`（画图）、`[do:open:songs]`（歌单文件夹）、`[do:open:datadir]`（数据文件夹）、`[do:open:skins]`（皮肤文件夹）、`[do:open:reports]`（周报文件夹）",
     );
@@ -265,7 +291,40 @@ fn parse_act_spec(spec: &str) -> Option<ChatAct> {
         "status" => Some(ChatAct::Status),
         "game" | "teaser" => Some(ChatAct::Game),
         "climb" | "perch" => Some(ChatAct::Climb),
+        "volume" | "vol" => parse_volume_spec(&parts[1..]),
         _ => None,
+    }
+}
+
+fn parse_volume_spec(args: &[&str]) -> Option<ChatAct> {
+    let first = args.first().copied()?.trim().to_ascii_lowercase();
+    if first.is_empty() {
+        return Some(ChatAct::VolumePanel);
+    }
+    match first.as_str() {
+        "mute" | "off" => return Some(ChatAct::VolumeMute(true)),
+        "unmute" | "on" => return Some(ChatAct::VolumeMute(false)),
+        "panel" | "open" | "bar" | "popup" => return Some(ChatAct::VolumePanel),
+        _ => {}
+    }
+    let (chan, val_str) = match first.as_str() {
+        "voice" | "tts" | "speech" => (VolumeChan::Voice, args.get(1).copied()?.trim()),
+        "music" | "bgm" | "song" => (VolumeChan::Music, args.get(1).copied()?.trim()),
+        "all" | "master" => (VolumeChan::All, args.get(1).copied()?.trim()),
+        _ => (VolumeChan::All, first.as_str()),
+    };
+    let v = val_str.trim().trim_end_matches('%').to_ascii_lowercase();
+    match v.as_str() {
+        "up" | "louder" | "+" => Some(ChatAct::VolumeDelta { channel: chan, delta: 20 }),
+        "down" | "softer" | "quieter" | "-" => Some(ChatAct::VolumeDelta { channel: chan, delta: -20 }),
+        _ if v.starts_with('+') || v.starts_with('-') => {
+            let d: i16 = v.parse().ok()?;
+            Some(ChatAct::VolumeDelta { channel: chan, delta: d.clamp(-100, 100) as i8 })
+        }
+        _ => {
+            let p: u16 = v.parse().ok()?;
+            Some(ChatAct::VolumeSet { channel: chan, percent: p.min(100) as u8 })
+        }
     }
 }
 
@@ -336,6 +395,11 @@ pub fn parse_local_direct(text: &str) -> Option<(ChatAct, &'static str)> {
         .trim_start_matches("去")
         .trim();
 
+    // 0. 桌宠音量快捷口令（放在「打开…」之前，避免「打开音量条」「打开声音」被当成打开外部程序）
+    if let Some(vact) = parse_local_volume(s) {
+        return Some((vact, ""));
+    }
+
     // 1. 打开白名单工具/目录
     for prefix in ["打开", "启动", "开一下"] {
         if let Some(rest) = s.strip_prefix(prefix) {
@@ -404,6 +468,75 @@ pub fn parse_local_direct(text: &str) -> Option<(ChatAct, &'static str)> {
     }
     if matches!(s, "玩逗猫棒" | "逗猫棒") {
         return Some((ChatAct::Game, ""));
+    }
+
+    None
+}
+
+fn parse_local_volume(s: &str) -> Option<ChatAct> {
+    if matches!(
+        s,
+        "静音" | "总静音" | "闭嘴" | "别出声" | "别说话" | "先别出声" | "关掉声音" | "关闭声音" | "把声音关掉" | "消音"
+    ) {
+        return Some(ChatAct::VolumeMute(true));
+    }
+    if matches!(
+        s,
+        "取消静音" | "解除静音" | "恢复声音" | "打开声音" | "开启声音" | "把声音打开" | "恢复音量" | "可以说话了"
+    ) {
+        return Some(ChatAct::VolumeMute(false));
+    }
+    if matches!(
+        s,
+        "调音量" | "音量控制" | "打开音量" | "打开音量条" | "音量面板" | "调节音量" | "音量设置"
+    ) {
+        return Some(ChatAct::VolumePanel);
+    }
+
+    let chan = if ["音乐", "伴奏", "唱歌", "跳舞", "背景音"].iter().any(|k| s.contains(k)) {
+        VolumeChan::Music
+    } else if ["语音", "说话", "人声"].iter().any(|k| s.contains(k)) {
+        VolumeChan::Voice
+    } else {
+        VolumeChan::All
+    };
+
+    let core = s
+        .trim_start_matches("把")
+        .trim_start_matches("音乐")
+        .trim_start_matches("伴奏")
+        .trim_start_matches("唱歌")
+        .trim_start_matches("语音")
+        .trim_start_matches("说话")
+        .trim();
+
+    if matches!(
+        core,
+        "小声点" | "小点声" | "小声一点" | "声音小点" | "声音小一点" | "轻点声" | "轻声点"
+            | "太吵了" | "太大声了" | "声音太大了" | "音量小点" | "音量小一点" | "调小音量" | "调低音量" | "降低音量" | "音量调小"
+    ) {
+        return Some(ChatAct::VolumeDelta { channel: chan, delta: -20 });
+    }
+    if matches!(
+        core,
+        "大声点" | "大点声" | "大声一点" | "声音大点" | "声音大一点" | "听不清"
+            | "太小声了" | "声音太小了" | "音量大点" | "音量大一点" | "调大音量" | "调高音量" | "提高音量" | "音量调大"
+    ) {
+        return Some(ChatAct::VolumeDelta { channel: chan, delta: 20 });
+    }
+    if matches!(core, "最大音量" | "音量最大" | "音量拉满" | "声音最大") {
+        return Some(ChatAct::VolumeSet { channel: chan, percent: 100 });
+    }
+
+    // 「音量 40%」/「音量调到30」/「音乐音量 25%」/「声音调到 50」
+    if (s.contains("音量") || s.contains("声音")) && !s.contains("分钟") {
+        let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty()
+            && let Ok(pct) = digits.parse::<u16>()
+            && pct <= 100
+        {
+            return Some(ChatAct::VolumeSet { channel: chan, percent: pct as u8 });
+        }
     }
 
     None
@@ -579,9 +712,42 @@ mod tests {
         assert_eq!(parse_local_direct("开个45分钟番茄钟").map(|x| x.0), Some(ChatAct::PomodoroStart(45)));
         assert_eq!(parse_local_direct("结束番茄钟").map(|x| x.0), Some(ChatAct::PomodoroStop));
         assert_eq!(parse_local_direct("打开记事本").map(|x| x.0), Some(ChatAct::OpenTarget("记事本".into())));
+        assert_eq!(parse_local_direct("静音").map(|x| x.0), Some(ChatAct::VolumeMute(true)));
+        assert_eq!(parse_local_direct("取消静音").map(|x| x.0), Some(ChatAct::VolumeMute(false)));
+        assert_eq!(
+            parse_local_direct("小声点").map(|x| x.0),
+            Some(ChatAct::VolumeDelta { channel: VolumeChan::All, delta: -20 })
+        );
+        assert_eq!(
+            parse_local_direct("音乐小声点").map(|x| x.0),
+            Some(ChatAct::VolumeDelta { channel: VolumeChan::Music, delta: -20 })
+        );
+        assert_eq!(
+            parse_local_direct("说话大声点").map(|x| x.0),
+            Some(ChatAct::VolumeDelta { channel: VolumeChan::Voice, delta: 20 })
+        );
+        assert_eq!(
+            parse_local_direct("把音量调到 35%").map(|x| x.0),
+            Some(ChatAct::VolumeSet { channel: VolumeChan::All, percent: 35 })
+        );
+        assert_eq!(
+            parse_local_direct("伴奏音量 20").map(|x| x.0),
+            Some(ChatAct::VolumeSet { channel: VolumeChan::Music, percent: 20 })
+        );
+        assert_eq!(parse_local_direct("打开音量条").map(|x| x.0), Some(ChatAct::VolumePanel));
+        let (vtxt, vacts) = extract("[shy]好哒，哈基米小声一点喵～[do:volume:voice:40][do:volume:music:25]");
+        assert_eq!(vtxt, "[shy]好哒，哈基米小声一点喵～");
+        assert_eq!(
+            vacts,
+            vec![
+                ChatAct::VolumeSet { channel: VolumeChan::Voice, percent: 40 },
+                ChatAct::VolumeSet { channel: VolumeChan::Music, percent: 25 },
+            ]
+        );
         // 带疑问词不劫持
         assert_eq!(parse_local_direct("你会跳支舞吗？"), None);
         assert_eq!(parse_local_direct("为什么要打开记事本呢"), None);
+        assert_eq!(parse_local_direct("现在音量是多少？"), None);
     }
 
     #[test]

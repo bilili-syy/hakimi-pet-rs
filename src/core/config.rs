@@ -39,7 +39,12 @@ pub struct TtsConfig {
     pub style: String,
     /// all / chat / off
     pub speak: String,
+    /// 说话语音音量（0.0 ~ 1.0）
     pub volume: f32,
+    /// 唱歌 / 跳舞伴奏音量（0.0 ~ 1.0）
+    pub music_volume: f32,
+    /// 桌宠一键总静音（语音与音乐同时静音，取消静音后恢复原音量滑块值）
+    pub muted: bool,
     /// 语音回答：聊天回复等语音合成好了再和文字一起出来（关了 = 文字立刻出、聊天回复不念）
     pub chat_voice_reply: bool,
     /// 本机 GPT-SoVITS api_v2 地址（mode = sovits 时用）
@@ -58,6 +63,26 @@ pub struct TtsConfig {
 impl TtsConfig {
     /// 有没有办法在线合成：本机 GPT-SoVITS 不要 Key，MiMo 要
     pub fn can_synth(&self) -> bool { self.mode == "sovits" || !self.api_key.trim().is_empty() }
+
+    /// 实际生效的说话音量（总静音时为 0）
+    pub fn voice_vol(&self) -> f32 {
+        if self.muted { 0.0 } else { clamp_unit(self.volume, 0.9) }
+    }
+
+    /// 实际生效的唱歌/伴奏音量（总静音时为 0）
+    pub fn music_vol(&self) -> f32 {
+        if self.muted { 0.0 } else { clamp_unit(self.music_volume, 0.8) }
+    }
+
+    /// 说话音量百分比（0..=100，不受 muted 影响，供滑块显示）
+    pub fn voice_pct(&self) -> u8 {
+        (clamp_unit(self.volume, 0.9) * 100.0).round() as u8
+    }
+
+    /// 音乐音量百分比（0..=100，不受 muted 影响，供滑块显示）
+    pub fn music_pct(&self) -> u8 {
+        (clamp_unit(self.music_volume, 0.8) * 100.0).round() as u8
+    }
 }
 impl Default for TtsConfig {
     fn default() -> Self {
@@ -69,6 +94,8 @@ impl Default for TtsConfig {
             style: "十八岁左右的元气少女猫娘，声音清亮甜美、略带奶音，说话轻快俏皮，句尾喜欢拖长撒娇。".into(),
             speak: "all".into(),
             volume: 0.9,
+            music_volume: 0.8,
+            muted: false,
             chat_voice_reply: true,
             sovits_url: "http://127.0.0.1:9880".into(),
             sovits_ref: String::new(),
@@ -163,7 +190,7 @@ const DOC_FIELDS: [(&str, &str); 8] = [
     ("_reminders说明", "喝水/起身提醒间隔（分钟，0=关闭）；offWork 下班提醒时间，留空=关闭"),
     ("_outfit说明", "换装：costume 是整套衣服（空=默认奶白水手服，hoodie=原装卫衣，pajama=猫耳睡衣，idol=偶像演出服，swim=泳装，xmas=圣诞小红裙，maid=女仆装，jk=JK水手服）；outfit 是配件，可同时戴多个（santa=圣诞帽、glasses=圆眼镜）。右键「换装」里点就行"),
     ("_moyu说明", "摸鱼监督：前台窗口是视频/社交/购物/游戏（keywords 匹配窗口标题，processes 匹配进程名）连续 minutes 分钟就来催你；番茄钟期间 pomodoroMinutes 分钟就催。只在本机判断，不记录窗口标题。enabled=false 关闭"),
-    ("_tts说明", "语音用小米 MiMo TTS。apiKey 填 MiMo 开放平台的 Key；mode: clone=固定哈基米声线（默认）/ preset=预置音色(voice 填 冰糖、茉莉)/ design=按 style 文字现设计；speak: all=所有气泡都念 / chat=只念聊天回复 / off；volume 0~1"),
+    ("_tts说明", "语音用小米 MiMo TTS。apiKey 填 MiMo 开放平台的 Key；mode: clone=固定哈基米声线（默认）/ preset=预置音色(voice 填 冰糖、茉莉)/ design=按 style 文字现设计；speak: all=所有气泡都念 / chat=只念聊天回复 / off；volume 说话音量 0~1；musicVolume 伴奏音量 0~1；muted 总静音"),
 ];
 
 impl Default for Config {
@@ -230,9 +257,20 @@ pub fn merge(saved: &Value) -> Config {
     obj.insert("tts".into(), sub::<TtsConfig>(saved.get("tts")));
     obj.insert("moyu".into(), sub::<MoyuConfig>(saved.get("moyu")));
     let mut c: Config = lenient(obj);
+    sanitize(&mut c);
+    c
+}
+
+/// 0..=1 音量夹取（NaN/无穷退回 fallback）
+pub fn clamp_unit(v: f32, fallback: f32) -> f32 {
+    if v.is_finite() { v.clamp(0.0, 1.0) } else { fallback }
+}
+
+fn sanitize(c: &mut Config) {
     c.scale = clamp_scale(c.scale);
     c.fps = clamp_fps(c.fps);
-    c
+    c.tts.volume = clamp_unit(c.tts.volume, 0.9);
+    c.tts.music_volume = clamp_unit(c.tts.music_volume, 0.8);
 }
 
 /// 帧率就近取 30 / 60 / 120
@@ -338,19 +376,37 @@ pub fn update(f: impl FnOnce(&mut Config)) -> Config {
         None => load_from_disk(),
     };
     f(&mut c);
-    c.scale = clamp_scale(c.scale);
-    c.fps = clamp_fps(c.fps);
+    sanitize(&mut c);
     write(&c);
     publish(&c);
     *guard = Some(c.clone());
     c
 }
 
+/// 仅更新内存态配置（滑块高频拖动时实时生效，松手后再调 [`flush`] 一次性落盘）
+pub fn update_in_memory(f: impl FnOnce(&mut Config)) -> Config {
+    let mut guard = CONFIG.write().unwrap_or_else(|e| e.into_inner());
+    let mut c = match guard.as_ref() {
+        Some(c) => c.clone(),
+        None => load_from_disk(),
+    };
+    f(&mut c);
+    sanitize(&mut c);
+    publish(&c);
+    *guard = Some(c.clone());
+    c
+}
+
+/// 把当前内存配置原子落盘（配合 [`update_in_memory`] 使用）
+pub fn flush() {
+    let c = get();
+    write(&c);
+}
+
 /// 设置窗口「保存」：整份替换（c 是从 get() 拿的副本改出来的，未知字段都还在），原子写回文件。
 /// 返回写盘是否成功。
 pub fn replace(mut c: Config) -> bool {
-    c.scale = clamp_scale(c.scale);
-    c.fps = clamp_fps(c.fps);
+    sanitize(&mut c);
     let mut guard = CONFIG.write().unwrap_or_else(|e| e.into_inner());
     let ok = write(&c);
     publish(&c);
@@ -388,6 +444,15 @@ mod tests {
         assert_eq!(c.tts.voice, "冰糖");
         assert_eq!(c.tts.speak, "all");
         assert!((c.tts.volume - 0.9).abs() < 1e-6);
+        assert!((c.tts.music_volume - 0.8).abs() < 1e-6);
+        assert!(!c.tts.muted);
+        assert_eq!((c.tts.voice_pct(), c.tts.music_pct()), (90, 80));
+        assert!((c.tts.voice_vol() - 0.9).abs() < 1e-6);
+        assert!((c.tts.music_vol() - 0.8).abs() < 1e-6);
+        let mut muted_tts = c.tts.clone();
+        muted_tts.muted = true;
+        assert_eq!((muted_tts.voice_vol(), muted_tts.music_vol()), (0.0, 0.0));
+        assert_eq!((muted_tts.voice_pct(), muted_tts.music_pct()), (90, 80));
         assert!(c.moyu.enabled);
         assert_eq!((c.moyu.minutes, c.moyu.pomodoro_minutes), (20, 2));
         assert_eq!(c.moyu.keywords.len(), 29);

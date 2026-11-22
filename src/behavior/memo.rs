@@ -180,7 +180,7 @@ impl Behavior {
         self.memo.after_chime = Some(voice);
         self.call("chime".into());
         if self.io {
-            let vol = crate::core::config::get().tts.volume.max(0.5);
+            let vol = crate::core::config::get().tts.voice_vol();
             crate::services::audio::play(tok, crate::types::Audio(chime_wav()), vol);
         }
         self.voice_playing = Some(tok);

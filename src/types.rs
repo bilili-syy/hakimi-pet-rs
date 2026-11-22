@@ -86,6 +86,8 @@ pub enum MouseEv {
     Leave,
     /// 滚轮（WM_MOUSEWHEEL，光标在她身上时）。delta：一格 = ±120，向上为正；x/y 同上（窗口内逻辑像素）
     Wheel { delta: i32, x: f32, y: f32 },
+    /// 按住 Ctrl + 滚轮：快捷调节桌宠音量（不触发普通滚轮摸头）
+    CtrlWheel { delta: i32 },
 }
 
 /// 右键菜单 / 托盘菜单的动作。平台层把每个动作都交给 Handler::event，
@@ -133,6 +135,12 @@ pub enum MenuAction {
     ChatStop,
     /// 「📋 复制刚才那句话」
     CopyBubble,
+    /// 弹出独立奶油风迷你音量控制条
+    VolumePopup,
+    /// 一键总静音开关
+    VolumeMute(bool),
+    /// 快捷音量预设（0..=100，同时设语音与音乐音量并解除静音）
+    VolumePreset(u8),
 }
 
 // ---------------------------------------------------------------- 事件

@@ -26,6 +26,7 @@ mod hrtimer;
 pub mod ipc;
 mod tool_confirm;
 mod toy;
+mod volume;
 mod watch;
 #[cfg(test)]
 mod selftest;
@@ -61,8 +62,8 @@ const WM_APP_CLEAR_MIND: u32 = WM_APP + 5;
 const WM_APP_IMPORT_SKIN: u32 = WM_APP + 6;
 /// 自动化/自测用：PostMessage(hwnd, WM_APP+9, i, 0) 等于点了 DEBUG_MENU[i] 那个菜单项
 const WM_APP_DEBUG_MENU: u32 = WM_APP + 9;
-/// 10 = 打开设置窗口，11 = 打开聊天框，12 = 导入角色包(.zip)，13 = 切回内置哈基米
-const DEBUG_MENU: [&str; 14] = [
+/// 10 = 打开设置窗口，11 = 打开聊天框，12 = 导入角色包(.zip)，13 = 切回内置哈基米，14 = 打开音量调节条
+const DEBUG_MENU: [&str; 15] = [
     "feed",
     "feednow",
     "game",
@@ -77,6 +78,7 @@ const DEBUG_MENU: [&str; 14] = [
     "chat",
     "skin:@import",
     "skin:hakimi",
+    "vol:panel",
 ];
 /// 自测用：PostMessage(hwnd, WM_APP+10, 0, 0) = 在她身上弹出右键菜单（截图用）
 const WM_APP_DEBUG_POPUP: u32 = WM_APP + 10;
@@ -136,6 +138,7 @@ pub(crate) fn own_visible_windows() -> Vec<HWND> {
             s.toy.as_ref().map(|t| t.hwnd),
             settings::hwnd(),
             tool_confirm::hwnd(),
+            volume::hwnd(),
         ]
         .into_iter()
         .flatten()
@@ -162,6 +165,20 @@ pub fn chat_is_focused() -> bool {
 
 pub fn request_tool_open(target: &str) {
     tool_confirm::request_open(target);
+}
+
+pub fn open_volume_popup() {
+    volume::open_interactive();
+}
+
+pub fn open_volume_osd() {
+    volume::open_osd();
+}
+
+pub fn sync_volume_ui() {
+    menu::refresh();
+    volume::sync_if_open();
+    settings::sync_external_volume();
 }
 
 pub fn push_menu_id(id: &str) {
@@ -865,7 +882,14 @@ fn after(a: MenuAction) {
                 s.set_watch(cfg.moyu.enabled, now);
                 s.set_scale(dpi * cfg.scale);
             });
+            crate::services::audio::apply_config_volume();
+            volume::sync_if_open();
             apply_fs_autohide(sense::is_fullscreen());
+        }
+        MenuAction::VolumePopup => {
+            FS_HIDDEN.with(|c| c.set(false));
+            with(|s| s.set_visible(true));
+            volume::open_interactive();
         }
         MenuAction::ForgetChat => {
             chat::clear_input_history();
@@ -972,6 +996,7 @@ fn do_quit() {
         roast::close_existing();
     }
     tool_confirm::close_existing();
+    volume::shutdown();
     settings::close_now();
     hrtimer::close();
     with_handler(|h| h.quit());
@@ -1006,7 +1031,7 @@ pub(crate) fn chat_escape() {
 
 // ---------------------------------------------------------------- 窗口
 
-fn work_area_of(hwnd: HWND) -> RECT {
+pub(super) fn work_area_of(hwnd: HWND) -> RECT {
     unsafe {
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -1055,6 +1080,7 @@ impl Plat {
             self.layout_chat();
         } else {
             self.toy = None;
+            volume::hide();
         }
         if let Some(c) = &self.chat {
             c.show_with_pet(on);
@@ -1080,6 +1106,7 @@ impl Plat {
             let _ = SetWindowPos(self.hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
         self.layout_chat();
+        volume::follow_pet();
     }
 
     fn call_to_center(&mut self) {
@@ -1812,6 +1839,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wp.0 >> 16) & 0xffff) as u16 as i16 as i32;
+                // MK_CONTROL = 0x0008：按住 Ctrl 滚轮直接调桌宠音量，不触发摸头或翻气泡
+                if (wp.0 & 0x0008) != 0 {
+                    emit(AppEvent::Mouse(MouseEv::CtrlWheel { delta }));
+                    pump();
+                    return LRESULT(0);
+                }
                 let sx = (lp.0 & 0xffff) as u16 as i16 as i32;
                 let sy = ((lp.0 >> 16) & 0xffff) as u16 as i16 as i32;
                 if let Some(ev) = with(|s| MouseEv::Wheel { delta, x: (sx - s.x) as f32 / s.scale, y: (sy - s.y) as f32 / s.scale }) {

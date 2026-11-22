@@ -83,8 +83,8 @@ impl Behavior {
             MenuAction::ReloadSettings => {
                 let (c, o) = if self.io {
                     let cfg = crate::core::config::reload();
-                    // 设置窗口里关了声音：正在念的停掉，并中止未念完的语音回答队列
-                    if !cfg.tts.enabled {
+                    // 设置窗口里关了声音或勾了总静音：正在念的停掉，并中止未念完的语音回答队列
+                    if !cfg.tts.enabled || cfg.tts.muted {
                         self.stop_voice();
                         self.cv_disable_tts();
                     }
@@ -125,6 +125,32 @@ impl Behavior {
             }
             MenuAction::CallToCenter => {
                 self.reset_aerial_flags();
+            }
+            MenuAction::VolumePopup => {
+                self.call("vol:popup".into());
+            }
+            MenuAction::VolumeMute(on) => {
+                let (vp, mp, mu) = self.mutate_volume(false, |_, _, m| *m = on);
+                if !self.memo_ringing() && self.voice_playing.is_none() && self.cv.is_none() {
+                    let msg = if mu {
+                        "🔇 已开启桌宠静音喵～".to_string()
+                    } else {
+                        format!("🔊 声音恢复啦喵（语音 {vp}% · 音乐 {mp}%）")
+                    };
+                    self.show_bubble(msg, Some(self.now + 2200), 2200, 0, false);
+                }
+            }
+            MenuAction::VolumePreset(pct) => {
+                let p = pct.min(100);
+                let (vp, mp, _) = self.mutate_volume(false, |v, m, mu| {
+                    *v = p;
+                    *m = p;
+                    *mu = p == 0;
+                });
+                if !self.memo_ringing() && self.voice_playing.is_none() && self.cv.is_none() {
+                    let msg = format!("🔊 音量已调到 {vp}%（伴奏 {mp}%）喵～");
+                    self.show_bubble(msg, Some(self.now + 2000), 2000, 0, false);
+                }
             }
             // 平台层自己处理：番茄钟（会发 AppEvent::Pomodoro）、叫到中间（还会发 Peek）、
             // 打开文件/文件夹、自启、退出（会调 Handler::quit）

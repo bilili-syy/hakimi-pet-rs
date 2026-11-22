@@ -143,6 +143,9 @@ const ID_VOLUME_LABEL: i32 = 140;
 const ID_PLAY: i32 = 141;
 const ID_PLAY_RESULT: i32 = 142;
 const ID_VOICE_LABEL: i32 = 143;
+const ID_MUSIC_VOLUME: i32 = 144;
+const ID_MUSIC_VOLUME_LABEL: i32 = 145;
+const ID_MUTE: i32 = 146;
 const ID_SOVITS_URL: i32 = 167;
 const ID_FOOD_CAP: i32 = 168;
 const ID_USAGE: i32 = 169;
@@ -838,13 +841,18 @@ impl Dlg {
         self.label(p, "声音描述", [X0, 272.0, LW, 26.0]);
         // 三行高：不带滚动条，写长了用滚轮/方向键翻
         self.edit(p, ID_STYLE, ES_MULTILINE | ES_AUTOVSCROLL, [FX, 272.0, FW, 78.0]);
-        self.label(p, "音量", [X0, 360.0, LW, 30.0]);
-        let vol = self.add(p, w!("msctls_trackbar32"), "", WS_TABSTOP | TBS_NOTICKS, 0, ID_VOLUME, [FX - 6.0, 360.0, FW - 54.0, 30.0]);
+        self.label(p, "语音音量", [X0, 356.0, LW, 28.0]);
+        let vol = self.add(p, w!("msctls_trackbar32"), "", WS_TABSTOP | TBS_NOTICKS, 0, ID_VOLUME, [FX - 6.0, 356.0, FW - 54.0, 28.0]);
         send(vol, TBM_SETRANGE, 1, (100 << 16) as isize);
-        self.add(p, w!("STATIC"), "90%", SS_CENTERIMAGE, 0, ID_VOLUME_LABEL, [FX + FW - 52.0, 360.0, 52.0, 30.0]);
-        self.button(p, ID_PLAY, "试听", 0, [FX, 400.0, 110.0, 30.0]);
-        self.add(p, w!("STATIC"), "", 0, 0, ID_PLAY_RESULT, [FX + 118.0, 400.0, FW - 118.0, 44.0]);
-        self.hint(p, "没填 Key 时只能念内置的固定台词；AI 聊天回复要有 Key 才能出声。", [X0, 452.0, W - X0 - 16.0, 40.0]);
+        self.add(p, w!("STATIC"), "90%", SS_CENTERIMAGE, 0, ID_VOLUME_LABEL, [FX + FW - 52.0, 356.0, 52.0, 28.0]);
+        self.label(p, "伴奏音量", [X0, 388.0, LW, 28.0]);
+        let mvol = self.add(p, w!("msctls_trackbar32"), "", WS_TABSTOP | TBS_NOTICKS, 0, ID_MUSIC_VOLUME, [FX - 6.0, 388.0, FW - 54.0, 28.0]);
+        send(mvol, TBM_SETRANGE, 1, (100 << 16) as isize);
+        self.add(p, w!("STATIC"), "80%", SS_CENTERIMAGE, 0, ID_MUSIC_VOLUME_LABEL, [FX + FW - 52.0, 388.0, 52.0, 28.0]);
+        self.button(p, ID_MUTE, "桌宠总静音（语音和伴奏同时静音，也可右键「🔊 音量」或 Ctrl+滚轮快调）", BS_AUTOCHECKBOX, [X0, 420.0, W - X0 - 18.0, 24.0]);
+        self.button(p, ID_PLAY, "试听", 0, [FX, 452.0, 110.0, 30.0]);
+        self.add(p, w!("STATIC"), "", 0, 0, ID_PLAY_RESULT, [FX + 118.0, 452.0, FW - 118.0, 40.0]);
+        self.hint(p, "没填 Key 时只能念内置的固定台词；AI 聊天回复要有 Key 才能出声。", [X0, 498.0, W - X0 - 16.0, 36.0]);
 
         // ---------------- 常规
         let p = 3;
@@ -964,6 +972,9 @@ impl Dlg {
         set_text(self.c(ID_STYLE), &c.tts.style);
         let v = (c.tts.volume.clamp(0.0, 1.0) * 100.0).round() as isize;
         send(self.c(ID_VOLUME), TBM_SETPOS, 1, v);
+        let mv = (c.tts.music_volume.clamp(0.0, 1.0) * 100.0).round() as isize;
+        send(self.c(ID_MUSIC_VOLUME), TBM_SETPOS, 1, mv);
+        set_checked(self.c(ID_MUTE), c.tts.muted);
         self.update_volume_label();
         self.update_tts_enable();
 
@@ -1049,6 +1060,15 @@ impl Dlg {
     fn update_volume_label(&self) {
         let v = send(self.c(ID_VOLUME), TBM_GETPOS, 0, 0);
         set_text(self.c(ID_VOLUME_LABEL), &format!("{v}%"));
+        let mv = send(self.c(ID_MUSIC_VOLUME), TBM_GETPOS, 0, 0);
+        set_text(self.c(ID_MUSIC_VOLUME_LABEL), &format!("{mv}%"));
+    }
+
+    fn preview_live_volume(&self) {
+        let muted = checked(self.c(ID_MUTE));
+        let v = if muted { 0.0 } else { send(self.c(ID_VOLUME), TBM_GETPOS, 0, 0).clamp(0, 100) as f32 / 100.0 };
+        let mv = if muted { 0.0 } else { send(self.c(ID_MUSIC_VOLUME), TBM_GETPOS, 0, 0).clamp(0, 100) as f32 / 100.0 };
+        crate::services::audio::set_volumes(v, mv);
     }
 
     fn update_tts_enable(&self) {
@@ -1151,6 +1171,8 @@ impl Dlg {
             c.tts.style = style;
         }
         c.tts.volume = send(self.c(ID_VOLUME), TBM_GETPOS, 0, 0).clamp(0, 100) as f32 / 100.0;
+        c.tts.music_volume = send(self.c(ID_MUSIC_VOLUME), TBM_GETPOS, 0, 0).clamp(0, 100) as f32 / 100.0;
+        c.tts.muted = checked(self.c(ID_MUTE));
 
         let autostart = checked(self.c(ID_AUTOSTART));
         c.fullscreen_hide = checked(self.c(ID_FS_HIDE));
@@ -1232,7 +1254,13 @@ fn differs(a: &Config, b: &Config) -> bool {
                 c.tts.style.clone(),
                 sovits_url.to_string(),
             ),
-            ((c.tts.volume * 100.0).round() as i32, (c.scale * 100.0).round() as i32, crate::core::config::clamp_fps(c.fps)),
+            (
+                (c.tts.volume * 100.0).round() as i32,
+                (c.tts.music_volume * 100.0).round() as i32,
+                c.tts.muted,
+                (c.scale * 100.0).round() as i32,
+                crate::core::config::clamp_fps(c.fps),
+            ),
             (c.weather_city.clone(), c.birthday.clone()),
             (c.moyu.enabled, c.moyu.minutes, c.moyu.pomodoro_minutes, c.reminders.water, c.reminders.stand_up),
             c.reminders.off_work.clone(),
@@ -1249,6 +1277,21 @@ const X0: f32 = 140.0;
 const LW: f32 = 84.0;
 const FX: f32 = 228.0;
 const FW: f32 = W - FX - 18.0;
+
+/// 外部（右键音量菜单、迷你音量浮窗、Ctrl+滚轮、聊天口令）改了音量时，若设置窗口开着则同步刷新其控件与基准
+pub fn sync_external_volume() {
+    let tts = config::get().tts;
+    with(|d| {
+        d.orig.tts.volume = tts.volume;
+        d.orig.tts.music_volume = tts.music_volume;
+        d.orig.tts.muted = tts.muted;
+        send(d.c(ID_VOLUME), TBM_SETPOS, 1, tts.voice_pct() as isize);
+        send(d.c(ID_MUSIC_VOLUME), TBM_SETPOS, 1, tts.music_pct() as isize);
+        set_checked(d.c(ID_MUTE), tts.muted);
+        d.update_volume_label();
+        repaint(d.hwnd);
+    });
+}
 
 fn with<R>(f: impl FnOnce(&mut Dlg) -> R) -> Option<R> {
     DLG.with(|c| {
@@ -1339,6 +1382,9 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
         (ID_PLAY, 0) => start_play(),
         (ID_TTS_ON, 0) | (ID_MODE, CBN_SELCHANGE) => {
             with(|d| d.update_tts_enable());
+        }
+        (ID_MUTE, 0) => {
+            with(|d| d.preview_live_volume());
         }
         (ID_MOYU, 0) => {
             with(|d| d.update_moyu_enable());
@@ -1481,6 +1527,7 @@ fn save(hwnd: HWND) {
     }
     // 和菜单「重新加载设置」同一条路：重排提醒、启停摸鱼监督、套用大小、她说一句「设置换好了」
     menu("settings:reload");
+    crate::services::audio::apply_config_volume();
     destroy(hwnd);
 }
 
@@ -1495,6 +1542,7 @@ fn close(hwnd: HWND, ask: bool) {
             return;
         }
     }
+    crate::services::audio::apply_config_volume();
     destroy(hwnd);
 }
 
@@ -1720,7 +1768,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_HSCROLL => {
-                with(|d| d.update_volume_label());
+                with(|d| {
+                    d.update_volume_label();
+                    d.preview_live_volume();
+                });
                 LRESULT(0)
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => ctl_color(HDC(wp.0 as *mut _), HWND(lp.0 as *mut _)),

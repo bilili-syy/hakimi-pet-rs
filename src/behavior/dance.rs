@@ -526,7 +526,7 @@ impl Behavior {
                 self.call(format!("dance-song:{}", score.id));
                 if self.io {
                     r.set_pending(beat::analyze_file(p.clone(), secs.min(30)));
-                    let vol = crate::core::config::get().tts.volume;
+                    let vol = crate::core::config::get().tts.music_vol();
                     crate::services::audio::play_file(tok, p, vol, secs);
                 }
             }
@@ -545,8 +545,8 @@ impl Behavior {
 
     fn play_builtin_beat(&mut self, tok: u64, bpm: f32, secs: f32) {
         if !self.io { return; }
-        let vol = crate::core::config::get().tts.volume * 0.8;
-        crate::services::audio::play_music_mem(tok, Audio(beat::synth_wav(bpm, secs + 0.5)), vol, secs.ceil() as u32 + 2);
+        let vol = crate::core::config::get().tts.music_vol();
+        crate::services::audio::play_music_mem_scaled(tok, Audio(beat::synth_wav(bpm, secs + 0.5)), vol, 0.8, secs.ceil() as u32 + 2);
     }
 
     /// 每帧推进（frame_at 里调）

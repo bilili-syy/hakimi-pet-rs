@@ -149,7 +149,7 @@ impl Behavior {
             return self.fake_chat_voice;
         }
         let t = crate::core::skin::effective_tts(crate::core::config::get().tts);
-        t.enabled && t.chat_voice_reply && t.speak != "off" && crate::services::tts::online_ok(&t)
+        t.enabled && !t.muted && t.voice_vol() > 0.0 && t.chat_voice_reply && t.speak != "off" && crate::services::tts::online_ok(&t)
     }
 
     /// 语音回答关着：聊天回复也不念（只是关掉这一项，不影响别的台词）
@@ -371,7 +371,7 @@ impl Behavior {
             }
             if self.io {
                 crate::services::tts::lat_link(req, token);
-                let vol = crate::core::config::get().tts.volume;
+                let vol = crate::core::config::get().tts.voice_vol();
                 crate::services::audio::play(token, a, vol);
             }
             self.voice_req = token;

@@ -495,6 +495,81 @@ impl Behavior {
                     self.call("tool:climb".into());
                     self.start_climb(crate::types::PerchKind::WindowTop, true);
                 }
+                A::VolumeSet { channel, percent } => {
+                    use crate::services::actions::VolumeChan as C;
+                    let p = percent.min(100);
+                    self.call(format!("tool:vol:set:{channel:?}:{p}"));
+                    let (vp, mp, mu) = self.mutate_volume(!preserve_bubble, |v, m, muted| {
+                        match channel {
+                            C::All => {
+                                *v = p;
+                                *m = p;
+                            }
+                            C::Voice => *v = p,
+                            C::Music => *m = p,
+                        }
+                        if p > 0 {
+                            *muted = false;
+                        } else if matches!(channel, C::All) {
+                            *muted = true;
+                        }
+                    });
+                    if !preserve_bubble {
+                        self.play(Shot::Squash);
+                        let msg = if mu {
+                            "好哒，哈基米先安静一会儿喵～（🔇 已静音）".to_string()
+                        } else {
+                            format!("好喵，音量调好啦～（语音 {vp}% · 音乐 {mp}%）")
+                        };
+                        self.say_opts(&msg, 2600, !mu && vp > 0, SpeakKind::Line);
+                    }
+                }
+                A::VolumeDelta { channel, delta } => {
+                    use crate::services::actions::VolumeChan as C;
+                    self.call(format!("tool:vol:delta:{channel:?}:{delta}"));
+                    let d = delta as i32;
+                    let (vp, mp, mu) = self.mutate_volume(!preserve_bubble, |v, m, muted| {
+                        if *muted && d > 0 {
+                            *muted = false;
+                        }
+                        match channel {
+                            C::All => {
+                                *v = (*v as i32 + d).clamp(0, 100) as u8;
+                                *m = (*m as i32 + d).clamp(0, 100) as u8;
+                            }
+                            C::Voice => *v = (*v as i32 + d).clamp(0, 100) as u8,
+                            C::Music => *m = (*m as i32 + d).clamp(0, 100) as u8,
+                        }
+                    });
+                    if !preserve_bubble {
+                        self.play(Shot::Squash);
+                        let msg = format!("好哒，现在语音 {vp}% · 音乐 {mp}% 喵～");
+                        self.say_opts(&msg, 2600, !mu && vp > 0, SpeakKind::Line);
+                    }
+                }
+                A::VolumeMute(on) => {
+                    self.call(format!("tool:vol:mute:{on}"));
+                    let (vp, mp, mu) = self.mutate_volume(false, |_, _, muted| *muted = on);
+                    if !preserve_bubble {
+                        self.play(Shot::Squash);
+                        if mu {
+                            self.say_opts("好哒，哈基米先不吭声啦喵～（🔇 已静音）", 2600, false, SpeakKind::Line);
+                        } else {
+                            let msg = format!("哇，又可以开口说话啦喵！（语音 {vp}% · 音乐 {mp}%）");
+                            self.say_opts(&msg, 2600, vp > 0, SpeakKind::Line);
+                        }
+                    }
+                }
+                A::VolumePanel => {
+                    self.call("tool:vol:panel".into());
+                    if self.io {
+                        crate::platform::open_volume_popup();
+                    }
+                    if !preserve_bubble {
+                        self.play(Shot::Bounce);
+                        self.say("音量调节条给你打开啦喵，随手拖就行～", 2600);
+                    }
+                }
             }
         }
     }

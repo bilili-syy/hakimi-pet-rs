@@ -316,6 +316,8 @@ pub struct Behavior {
     /// 测试用：io=false 时假装「语音回答」开着且 TTS 可用 / 用户关了语音回答
     pub(crate) fake_chat_voice: bool,
     pub(crate) fake_chat_voice_off: bool,
+    /// 测试用：io=false 时模拟的 (语音音量%, 伴奏音量%, 是否静音)
+    pub(crate) sim_vol: (u8, u8, bool),
     /// 这次运行里已经提醒过「去设置里填 Key」
     key_hint_shown: bool,
     /// 被全屏安静/忙碌挡住的下班提醒截止时刻（过期后不再补说）
@@ -411,6 +413,7 @@ impl Behavior {
             cv: None,
             fake_chat_voice: false,
             fake_chat_voice_off: false,
+            sim_vol: (90, 80, false),
             key_hint_shown: false,
             pending_off_work: None,
             memo: memo::MemoUi::default(),
@@ -463,7 +466,10 @@ impl Behavior {
         self.run_timers();
         match ev {
             AppEvent::Mouse(m) => {
-                if matches!(m, MouseEv::Down { .. } | MouseEv::Up { .. } | MouseEv::DoubleClick { .. } | MouseEv::Wheel { .. }) {
+                if matches!(
+                    m,
+                    MouseEv::Down { .. } | MouseEv::Up { .. } | MouseEv::DoubleClick { .. } | MouseEv::Wheel { .. } | MouseEv::CtrlWheel { .. }
+                ) {
                     self.sense_touch();
                 }
                 self.on_mouse(m)
@@ -509,7 +515,7 @@ impl Behavior {
                 if !same { return self.flush(out); }
                 self.call(format!("play:{token}"));
                 if self.io {
-                    let vol = crate::core::config::get().tts.volume;
+                    let vol = crate::core::config::get().tts.voice_vol();
                     crate::services::audio::play(token, a, vol);
                 }
                 self.voice_playing = Some(token);
@@ -1207,8 +1213,49 @@ impl Behavior {
         self.song = Some(tok);
         // 不知道歌多长：先按最长 60 秒跳，放完（AudioDone）就停
         self.go_dance(60_000, Some(lines::SONG_PLAYING.to_string()));
-        let vol = crate::core::config::get().tts.volume;
+        let vol = crate::core::config::get().tts.music_vol();
         crate::services::audio::play_file(tok, path, vol, 60);
+    }
+
+    /// 统一修改桌宠语音/伴奏音量与静音标记，并实时同步正在播放的音频与 UI
+    pub(super) fn mutate_volume(
+        &mut self,
+        show_osd: bool,
+        f: impl FnOnce(&mut u8, &mut u8, &mut bool),
+    ) -> (u8, u8, bool) {
+        if self.io {
+            let c = crate::core::config::update(|cfg| {
+                let mut vp = cfg.tts.voice_pct();
+                let mut mp = cfg.tts.music_pct();
+                let mut mu = cfg.tts.muted;
+                f(&mut vp, &mut mp, &mut mu);
+                cfg.tts.volume = vp.min(100) as f32 / 100.0;
+                cfg.tts.music_volume = mp.min(100) as f32 / 100.0;
+                cfg.tts.muted = mu;
+            });
+            if c.tts.muted {
+                self.stop_voice();
+                self.cv_disable_tts();
+            }
+            crate::services::audio::apply_config_volume();
+            crate::platform::sync_volume_ui();
+            if show_osd {
+                crate::platform::open_volume_osd();
+            }
+            (c.tts.voice_pct(), c.tts.music_pct(), c.tts.muted)
+        } else {
+            let (mut vp, mut mp, mut mu) = self.sim_vol;
+            f(&mut vp, &mut mp, &mut mu);
+            vp = vp.min(100);
+            mp = mp.min(100);
+            self.sim_vol = (vp, mp, mu);
+            if mu {
+                self.stop_voice();
+                self.cv_disable_tts();
+            }
+            self.call(format!("vol:{vp}:{mp}:{}", if mu { "mute" } else { "on" }));
+            (vp, mp, mu)
+        }
     }
 
     /// 蜂蜜水：「舔了蜂蜜，脚步就会变快」——喝完一分钟内走路飞快

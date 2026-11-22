@@ -437,7 +437,7 @@ fn speak_inner(tx: &EventSender, token: u64, text: String, mood: Option<VoiceMoo
     };
     for (_, tok, otx) in old { otx.send(AppEvent::Speech { token: tok, audio: None }); }
 
-    if !t.enabled || t.speak == "off" || (t.speak == "chat" && kind != SpeakKind::Chat) {
+    if !t.enabled || t.muted || t.voice_vol() <= 0.0 || t.speak == "off" || (t.speak == "chat" && kind != SpeakKind::Chat) {
         answer(seq, None);
         return;
     }
@@ -518,7 +518,7 @@ fn worker() {
                             break Work::Fg(job);
                         }
                         // 本机 GPT-SoVITS 合成慢且占本地 GPU/CPU，不做百句后台预热；设了每日粮食上限时也别在后台悄悄扣额度
-                        let warm_ok = t.enabled && online_ok(&t) && t.speak != "off" && t.mode != "sovits" && cfg.daily_food_cap == 0;
+                        let warm_ok = t.enabled && !t.muted && online_ok(&t) && t.speak != "off" && t.mode != "sovits" && cfg.daily_food_cap == 0;
                         if !warm_ok || st.warm.is_empty() {
                             st.warm_at = None;
                             continue;

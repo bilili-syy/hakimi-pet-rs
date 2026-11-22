@@ -25,6 +25,19 @@ impl Behavior {
                 }
                 Zone::Pet => { self.down = Some(Down { sx, sy, lx: None, dir: 0, flips: Vec::new() }); self.dragging = false; }
             },
+            MouseEv::CtrlWheel { delta } => {
+                if delta != 0 {
+                    let raw = (delta as f32 / 120.0 * 5.0).round() as i32;
+                    let step = if raw == 0 { delta.signum() } else { raw };
+                    self.mutate_volume(true, |vp, mp, mu| {
+                        if *mu && step > 0 {
+                            *mu = false;
+                        }
+                        *vp = (*vp as i32 + step).clamp(0, 100) as u8;
+                        *mp = (*mp as i32 + step).clamp(0, 100) as u8;
+                    });
+                }
+            }
             MouseEv::Wheel { delta, x, y } => match self.zone(x, y) {
                 Zone::Bubble if self.ui.bubble_overflow => {
                     let now = self.now;

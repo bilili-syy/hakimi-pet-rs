@@ -42,7 +42,8 @@ enum Src {
 }
 
 enum Cmd {
-    Play { token: u64, src: Src, volume: f32, max_secs: u32, music: bool },
+    Play { token: u64, src: Src, volume: f32, gain: f32, max_secs: u32, music: bool },
+    SetVolume { voice: f32, music: f32 },
     Stop { voice: bool, music: bool },
     /// 停掉正在放这个 token 的声道（不管是语音还是音乐）
     StopToken(u64),
@@ -103,7 +104,7 @@ pub fn play(token: u64, audio: Audio, volume: f32) {
         Some(s) => Src::Stream(s),
         None => Src::Mem(audio.0),
     };
-    if !send(Cmd::Play { token, src, volume, max_secs: 0, music: false }) && tracked {
+    if !send(Cmd::Play { token, src, volume, gain: 1.0, max_secs: 0, music: false }) && tracked {
         let prev = PENDING_VOICE.fetch_sub(1, Ordering::SeqCst);
         if prev <= 1 {
             PLAYING.store(false, Ordering::SeqCst);
@@ -114,7 +115,7 @@ pub fn play(token: u64, audio: Audio, volume: f32) {
 /// 播放本地歌曲文件（mp3/ogg/wav/m4a/flac/aac），最多 max_secs 秒；放完或到时发 AudioDone。
 /// 顶掉正在放的上一首，不打断语音（有语音时自动压低）
 pub fn play_file(token: u64, path: PathBuf, volume: f32, max_secs: u32) {
-    let _ = send(Cmd::Play { token, src: Src::File(path), volume, max_secs, music: true });
+    let _ = send(Cmd::Play { token, src: Src::File(path), volume, gain: 1.0, max_secs, music: true });
 }
 
 /// 全停（语音和音乐）
@@ -125,7 +126,28 @@ pub fn stop_token(token: u64) { let _ = send(Cmd::StopToken(token)); }
 
 /// 内存里的一段音乐（比如跳舞的内置鼓点）走音乐声道：不被说话顶掉，说话时自动压低
 pub fn play_music_mem(token: u64, audio: Audio, volume: f32, max_secs: u32) {
-    let _ = send(Cmd::Play { token, src: Src::Mem(audio.0), volume, max_secs, music: true });
+    play_music_mem_scaled(token, audio, volume, 1.0, max_secs);
+}
+
+/// 带相对增益系数的内存音乐播放（如内置鼓点固定乘 0.8，实时调音量时也保留 0.8 比例）
+pub fn play_music_mem_scaled(token: u64, audio: Audio, base_volume: f32, gain: f32, max_secs: u32) {
+    let g = gain.clamp(0.0, 1.0);
+    let volume = (base_volume.clamp(0.0, 1.0) * g).clamp(0.0, 1.0);
+    let _ = send(Cmd::Play { token, src: Src::Mem(audio.0), volume, gain: g, max_secs, music: true });
+}
+
+/// 实时调节正在播放的语音与音乐声道音量（滑块拖动、静音切换、Ctrl+滚轮时立即生效；未初始化声道时不拉起后台线程）
+pub fn set_volumes(voice: f32, music: f32) {
+    if let Some(m) = TX.get() {
+        let s = m.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let _ = s.send(Cmd::SetVolume { voice: voice.clamp(0.0, 1.0), music: music.clamp(0.0, 1.0) });
+    }
+}
+
+/// 按当前内存配置同步正在播放的语音与音乐音量
+pub fn apply_config_volume() {
+    let t = crate::core::config::get().tts;
+    set_volumes(t.voice_vol(), t.music_vol());
 }
 
 /// 只停语音（歌照放）
@@ -330,8 +352,10 @@ impl rodio::Source for StreamSrc {
 struct Current {
     token: u64,
     player: rodio::Player,
-    /// 音乐的原始音量（压低/恢复用）
+    /// 当前目标音量（音乐声道未乘 DUCK 前的音量）
     volume: f32,
+    /// 曲目固有增益（如内置鼓点 0.8，歌曲/语音 1.0）
+    gain: f32,
 }
 
 fn worker(rx: Receiver<Cmd>) {
@@ -350,7 +374,7 @@ fn worker(rx: Receiver<Cmd>) {
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
         };
         match msg {
-            Ok(Cmd::Play { token, src, volume, max_secs, music: is_music }) => {
+            Ok(Cmd::Play { token, src, volume, gain, max_secs, music: is_music }) => {
                 let tracked = !is_music && !is_preview(token);
                 if tracked {
                     PENDING_VOICE.fetch_sub(1, Ordering::SeqCst);
@@ -362,13 +386,25 @@ fn worker(rx: Receiver<Cmd>) {
                     Ok(player) => {
                         crate::core::log::trace(&format!("audio start:{token}{}", if is_music { " music" } else { "" }));
                         if !is_music { super::tts::lat_sound(token); }
-                        *slot = Some(Current { token, player, volume });
+                        *slot = Some(Current { token, player, volume, gain });
                         ducked = false; // 下面按现状重新压
                     }
                     Err(e) => {
                         crate::core::log::log(&format!("audio error {e}"));
                         done(token);
                     }
+                }
+            }
+            Ok(Cmd::SetVolume { voice: v_vol, music: m_vol }) => {
+                let talking = voice.is_some();
+                if let Some(v) = &mut voice {
+                    v.volume = (v_vol.clamp(0.0, 1.0) * v.gain).clamp(0.0, 1.0);
+                    v.player.set_volume(v.volume);
+                }
+                if let Some(m) = &mut music {
+                    m.volume = (m_vol.clamp(0.0, 1.0) * m.gain).clamp(0.0, 1.0);
+                    m.player.set_volume(duck_volume(m.volume, talking));
+                    ducked = talking;
                 }
             }
             Ok(Cmd::Stop { voice: v, music: m }) => {

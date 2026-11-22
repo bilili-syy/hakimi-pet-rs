@@ -953,3 +953,43 @@ fn chat_actions_execute_both_via_ai_tags_and_local_direct() {
     ev(&mut b, AppEvent::ChatSubmit("打开记事本".into()), 8_000);
     assert!(b.calls.iter().any(|c| c == "tool:open:记事本"));
 }
+
+#[test]
+fn volume_controls_work_via_ctrl_wheel_menu_and_chat() {
+    let mut b = mk();
+    tick(&mut b, 3_000);
+    assert_eq!(b.sim_vol, (90, 80, false));
+
+    // 1. Ctrl + 滚轮：不触发摸头（不进 Shy），语音与伴奏同步按每格 ±5% 调节
+    ev(&mut b, AppEvent::Mouse(MouseEv::CtrlWheel { delta: -240 }), 3_200);
+    assert_eq!(b.sim_vol, (80, 70, false));
+    assert_ne!(b.state, St::Shy);
+
+    // 2. 右键菜单一键静音 & 取消静音（保留原滑块值）& 档位预设
+    ev(&mut b, AppEvent::Menu(MenuAction::VolumeMute(true)), 3_500);
+    assert_eq!(b.sim_vol, (80, 70, true));
+    assert!(b.scene.bubble.as_ref().unwrap().text.contains("静音"));
+
+    // 静音状态下向上 Ctrl+滚轮自动解除静音并上调
+    ev(&mut b, AppEvent::Mouse(MouseEv::CtrlWheel { delta: 120 }), 3_800);
+    assert_eq!(b.sim_vol, (85, 75, false));
+
+    ev(&mut b, AppEvent::Menu(MenuAction::VolumePreset(50)), 4_100);
+    assert_eq!(b.sim_vol, (50, 50, false));
+
+    // 3. 聊天离线口令：单调伴奏、单调语音、静音、打开面板
+    ev(&mut b, AppEvent::ChatSubmit("音乐小声点".into()), 4_500);
+    assert_eq!(b.sim_vol, (50, 30, false));
+
+    ev(&mut b, AppEvent::ChatSubmit("说话大声点".into()), 4_800);
+    assert_eq!(b.sim_vol, (70, 30, false));
+
+    ev(&mut b, AppEvent::ChatSubmit("静音".into()), 5_100);
+    assert_eq!(b.sim_vol, (70, 30, true));
+
+    ev(&mut b, AppEvent::ChatSubmit("取消静音".into()), 5_400);
+    assert_eq!(b.sim_vol, (70, 30, false));
+
+    ev(&mut b, AppEvent::ChatSubmit("调音量".into()), 5_700);
+    assert!(b.calls.iter().any(|c| c == "tool:vol:panel"));
+}
