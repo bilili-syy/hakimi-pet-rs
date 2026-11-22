@@ -15,7 +15,7 @@ use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, KillTimer, PostMessageW, SetTimer};
 
-pub const OUTFITS: [(&str, &str); 2] = [("santa", "🎅 圣诞帽"), ("glasses", "👓 圆眼镜")];
+pub const OUTFITS: [(&str, &str); 1] = [("glasses", "👓 圆眼镜")];
 /// 托盘左键单击的伪菜单 id
 pub const TRAY_LEFT: &str = "tray:left";
 /// 托盘左键单击要等双击时间过了才算（双击 = 打开设置），用主窗口上的这个定时器
@@ -94,7 +94,6 @@ const COSTUME: &[Node] = &[
     Check("costume:maid", "🎀 女仆装"),
     Check("costume:jk", "🏫 JK 水手服"),
     Sep,
-    Check("outfit:santa", "🎅 圣诞帽"),
     Check("outfit:glasses", "👓 圆眼镜"),
     Sep,
     Item("outfit:clear", "摘掉配件"),
@@ -601,7 +600,7 @@ mod tests {
         assert_eq!(parse_id("pomo:stop", off), Some(A::PomodoroStop));
         assert_eq!(parse_id("costume:", off), Some(A::Costume(String::new())));
         assert_eq!(parse_id("costume:jk", off), Some(A::Costume("jk".into())));
-        assert_eq!(parse_id("outfit:santa", on), Some(A::Outfit("santa".into(), true)));
+        assert_eq!(parse_id("outfit:glasses", on), Some(A::Outfit("glasses".into(), true)));
         assert_eq!(parse_id("outfit:clear", on), Some(A::ClearOutfit));
         assert_eq!(parse_id("tts", on), Some(A::Tts(true)));
         assert_eq!(parse_id("ttschat", off), Some(A::TtsChatOnly(false)));
@@ -671,7 +670,7 @@ mod tests {
     fn dynamic_state() {
         let mut c = Ctx {
             costume: "maid".into(),
-            outfits: vec!["santa".into()],
+            outfits: vec!["glasses".into()],
             visible: true,
             pomo_left: None,
             roast_block: None,
@@ -692,8 +691,8 @@ mod tests {
         assert_eq!(label(VOLUME_TITLE, &c).unwrap(), "🔊 音量（75% / 50%）");
         assert!(checked("costume:maid", &c));
         assert!(!checked("costume:", &c));
-        assert!(checked("outfit:santa", &c));
-        assert!(!checked("outfit:glasses", &c));
+        assert!(checked("outfit:glasses", &c));
+        assert!(!checked("outfit:other", &c));
         c.costume = "bogus".into();
         assert!(checked("costume:", &c));
         // 老配置的 "" = 默认水手服；卫衣要单独选

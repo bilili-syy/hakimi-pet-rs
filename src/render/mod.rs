@@ -82,7 +82,7 @@ pub struct Scene {
     pub face: Face,
     /// core::costume 的 id（"" / "hoodie" = 原装卫衣立绘，"sailor" = 默认水手服）
     pub costume: String,
-    /// santa / glasses（按配置里的顺序叠）
+    /// 配饰（如 glasses，按配置里的顺序叠）
     pub outfits: Vec<String>,
     /// #pet 的动画变换（原点：盒子底边中点）
     pub pet: Xf,
@@ -851,7 +851,7 @@ mod tests {
         let mut sc2 = Scene::default();
         sc2.face = Face::Sit;
         sc2.costume = "maid".into();
-        sc2.outfits = vec!["santa".into()];
+        sc2.outfits = vec!["glasses".into()];
         sc2.pet = Xf { rot: -6.0, ..Xf::ID };
         sc2.flip = -1.0;
         sc2.bubble = Some(BubbleView { text: "欢迎回来，主人喵～".into(), opacity: 0.8, scroll: 0.0 });

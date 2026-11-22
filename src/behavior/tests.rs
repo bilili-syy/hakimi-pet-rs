@@ -243,11 +243,11 @@ fn costume_and_outfits_change_scene() {
     ev(&mut b, AppEvent::Menu(MenuAction::Costume("maid".into())), 3000);
     assert_eq!(b.scene.costume, "maid");
     assert_eq!(b.state, St::Happy);
-    ev(&mut b, AppEvent::Menu(MenuAction::Outfit("santa".into(), true)), 3100);
     ev(&mut b, AppEvent::Menu(MenuAction::Outfit("glasses".into(), true)), 3200);
-    assert_eq!(b.scene.outfits, vec!["santa".to_string(), "glasses".to_string()]);
-    ev(&mut b, AppEvent::Menu(MenuAction::Outfit("santa".into(), false)), 3300);
     assert_eq!(b.scene.outfits, vec!["glasses".to_string()]);
+    ev(&mut b, AppEvent::Menu(MenuAction::Outfit("glasses".into(), false)), 3300);
+    assert!(b.scene.outfits.is_empty());
+    ev(&mut b, AppEvent::Menu(MenuAction::Outfit("glasses".into(), true)), 3350);
     ev(&mut b, AppEvent::Menu(MenuAction::ClearOutfit), 3400);
     assert!(b.scene.outfits.is_empty());
     ev(&mut b, AppEvent::Menu(MenuAction::Costume("bogus".into())), 3500);

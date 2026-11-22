@@ -6,7 +6,7 @@
 use crate::core::skin;
 use crate::types::MenuAction;
 use std::cell::RefCell;
-use tray_icon::menu::{CheckMenuItem, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{CheckMenuItem, ContextMenu, MenuItem, PredefinedMenuItem, Submenu};
 
 /// 子菜单里最多列多少个角色包
 const MAX_ITEMS: usize = 40;
@@ -82,6 +82,17 @@ pub fn shutdown() {
             *g = None;
         }
     });
+}
+
+/// 在指定窗口光标处单独弹出「🎭 角色」菜单（供快捷面板顶部的角色切换胶囊调用）
+pub fn popup(hwnd: windows::Win32::Foundation::HWND) {
+    refresh(false);
+    let sub = SM.with(|m| m.borrow().as_ref().map(|s| s.sub.clone()));
+    if let Some(sub) = sub {
+        unsafe {
+            sub.show_context_menu_for_hwnd(hwnd.0 as isize, None);
+        }
+    }
 }
 
 /// 菜单 id → 动作（纯映射，可测试）

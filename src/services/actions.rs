@@ -34,7 +34,7 @@ pub enum ChatAct {
     Song,
     /// 换整套衣服：`sailor`/`hoodie`/`pajama`/`idol`/`swim`/`xmas`/`maid`/`jk`
     Costume(String),
-    /// 戴或摘配饰：`("santa"|"glasses", on)`
+    /// 戴或摘配饰：`("glasses", on)`
     Outfit(String, bool),
     /// 摘掉全部配饰
     ClearOutfit,
@@ -146,7 +146,7 @@ pub fn prompt_hint(allowed_apps: &BTreeMap<String, String>) -> String {
     let mut s = String::from(
         "【动作能力】只有当主人明确要求你做某个动作，或顺手帮主人设提醒/打开工具时，才在回复末尾附上对应标签（可不加，平时普通闲聊绝对不要加！标签不会显示给主人）：\n\
 - 跳舞/唱歌：`[do:dance]`（随机跳舞）、`[do:dance:song]`（放歌跳）、`[do:dance:listen]`（听电脑音乐跳）、`[do:song]`（唱歌）\n\
-- 换装/配饰：`[do:costume:maid]`（可选 `sailor`水手服/`hoodie`卫衣/`pajama`睡衣/`idol`偶像服/`swim`泳装/`xmas`圣诞裙/`maid`女仆装/`jk`）、`[do:outfit:glasses:on]`、`[do:outfit:santa:on]`、`[do:outfit:clear]`\n\
+- 换装/配饰：`[do:costume:maid]`（可选 `sailor`水手服/`hoodie`卫衣/`pajama`睡衣/`idol`偶像服/`swim`泳装/`xmas`圣诞裙/`maid`女仆装/`jk`）、`[do:outfit:glasses:on]`、`[do:outfit:clear]`\n\
 - 番茄钟/日常：`[do:pomo:25]`（开N分钟番茄钟）、`[do:pomo:stop]`、`[do:weather]`、`[do:sleep]`、`[do:walk]`、`[do:honey]`、`[do:game]`、`[do:climb]`、`[do:status]`\n\
 - 桌宠音量控制：`[do:volume:50]`（调总音量0~100）、`[do:volume:voice:60]`（说话音量）、`[do:volume:music:40]`（伴奏音量）、`[do:volume:down]`（小声点）、`[do:volume:up]`（大声点）、`[do:volume:mute]`（静音）、`[do:volume:unmute]`（取消静音）、`[do:volume:panel]`（弹出音量条）\n\
 - 记备忘/提醒：`[do:memo:YYYY-MM-DD HH:MM|none|事项]`（重复填 `none`/`daily`/`workday`/`weekly`）或 `[do:memo:note|随手记内容]`\n\
@@ -266,7 +266,7 @@ fn parse_act_spec(spec: &str) -> Option<ChatAct> {
             if item == "clear" || item == "none" || item == "off" {
                 return Some(ChatAct::ClearOutfit);
             }
-            if !matches!(item.as_str(), "santa" | "glasses") {
+            if item != "glasses" {
                 return None;
             }
             let on = match parts.get(2).copied().unwrap_or("on").to_ascii_lowercase().as_str() {
@@ -421,7 +421,7 @@ pub fn parse_local_direct(text: &str) -> Option<(ChatAct, &'static str)> {
     }
 
     // 3. 换装与配饰
-    if matches!(s, "摘掉配饰" | "摘掉配件" | "取下配饰" | "摘掉帽子和眼镜") {
+    if matches!(s, "摘掉配饰" | "摘掉配件" | "取下配饰") {
         return Some((ChatAct::ClearOutfit, ""));
     }
     if matches!(s, "戴上眼镜" | "戴眼镜" | "戴圆眼镜" | "戴上圆眼镜") {
@@ -429,12 +429,6 @@ pub fn parse_local_direct(text: &str) -> Option<(ChatAct, &'static str)> {
     }
     if matches!(s, "摘掉眼镜" | "摘眼镜" | "取下眼镜") {
         return Some((ChatAct::Outfit("glasses".into(), false), ""));
-    }
-    if matches!(s, "戴上圣诞帽" | "戴圣诞帽" | "戴帽子" | "戴上帽子") {
-        return Some((ChatAct::Outfit("santa".into(), true), ""));
-    }
-    if matches!(s, "摘掉圣诞帽" | "摘圣诞帽" | "摘掉帽子" | "摘帽子") {
-        return Some((ChatAct::Outfit("santa".into(), false), ""));
     }
     if s.starts_with('换') || s.starts_with('穿') {
         let lower = s.to_ascii_lowercase();

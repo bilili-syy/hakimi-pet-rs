@@ -14,8 +14,10 @@ mod memo_menu;
 mod mind_menu;
 mod skin_menu;
 mod menu;
+mod panel_icons;
 mod perch;
 mod power;
+mod quick_panel;
 mod report;
 mod roast;
 mod sense;
@@ -139,6 +141,7 @@ pub(crate) fn own_visible_windows() -> Vec<HWND> {
             settings::hwnd(),
             tool_confirm::hwnd(),
             volume::hwnd(),
+            quick_panel::hwnd(),
         ]
         .into_iter()
         .flatten()
@@ -168,17 +171,28 @@ pub fn request_tool_open(target: &str) {
 }
 
 pub fn open_volume_popup() {
+    quick_panel::hide();
     volume::open_interactive();
 }
 
 pub fn open_volume_osd() {
-    volume::open_osd();
+    if quick_panel::is_visible() {
+        quick_panel::sync_if_open();
+    } else {
+        volume::open_osd();
+    }
 }
 
 pub fn sync_volume_ui() {
     menu::refresh();
     volume::sync_if_open();
+    quick_panel::sync_if_open();
     settings::sync_external_volume();
+}
+
+pub(crate) fn trigger_action(a: MenuAction) {
+    on_menu(a);
+    pump();
 }
 
 pub fn push_menu_id(id: &str) {
@@ -192,6 +206,7 @@ pub fn start_pomodoro_quiet(minutes: u32) {
         s.pomodoro = Some(p);
     });
     menu::refresh();
+    quick_panel::sync_if_open();
 }
 
 pub fn stop_pomodoro_quiet() {
@@ -200,6 +215,7 @@ pub fn stop_pomodoro_quiet() {
     });
     POMO_END.store(0, Ordering::Relaxed);
     menu::refresh();
+    quick_panel::sync_if_open();
 }
 
 pub(crate) fn current_scale() -> f32 {
@@ -884,11 +900,13 @@ fn after(a: MenuAction) {
             });
             crate::services::audio::apply_config_volume();
             volume::sync_if_open();
+            quick_panel::sync_if_open();
             apply_fs_autohide(sense::is_fullscreen());
         }
         MenuAction::VolumePopup => {
             FS_HIDDEN.with(|c| c.set(false));
             with(|s| s.set_visible(true));
+            quick_panel::hide();
             volume::open_interactive();
         }
         MenuAction::ForgetChat => {
@@ -934,6 +952,7 @@ fn after(a: MenuAction) {
         _ => {}
     }
     menu::refresh();
+    quick_panel::sync_if_open();
 }
 
 /// 弹出 .zip 选择框（支持测试环境变量 `HAKIMI_IMPORT_ZIP_PATH` 免弹窗注入）
@@ -997,6 +1016,7 @@ fn do_quit() {
     }
     tool_confirm::close_existing();
     volume::shutdown();
+    quick_panel::shutdown();
     settings::close_now();
     hrtimer::close();
     with_handler(|h| h.quit());
@@ -1081,6 +1101,7 @@ impl Plat {
         } else {
             self.toy = None;
             volume::hide();
+            quick_panel::hide();
         }
         if let Some(c) = &self.chat {
             c.show_with_pet(on);
@@ -1107,6 +1128,7 @@ impl Plat {
         }
         self.layout_chat();
         volume::follow_pet();
+        quick_panel::follow_pet();
     }
 
     fn call_to_center(&mut self) {
@@ -1740,7 +1762,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_APP_DEBUG_POPUP => {
-                menu::popup();
+                if wp.0 == 1 {
+                    quick_panel::open();
+                } else {
+                    menu::popup();
+                }
                 LRESULT(0)
             }
             WM_TIMER if wp.0 == TIMER_ID => {
@@ -1765,6 +1791,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                quick_panel::hide();
+                volume::hide();
                 let dbl = msg == WM_LBUTTONDBLCLK;
                 LEFT_DOWN.with(|d| d.set(true));
                 let _ = SetCapture(hwnd);
@@ -1818,7 +1846,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_RBUTTONUP => {
                 mouse(lp, |_, (x, y, sx, sy)| MouseEv::Up { button: Button::Right, x, y, sx, sy });
-                menu::popup();
+                // 普通右键呼出奶油风快捷面板；按住 Shift+右键仍可呼出原版系统菜单
+                let shift = (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+                    windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT.0 as i32,
+                ) as u16
+                    & 0x8000)
+                    != 0;
+                if shift {
+                    quick_panel::hide();
+                    menu::popup();
+                } else {
+                    quick_panel::toggle();
+                }
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {

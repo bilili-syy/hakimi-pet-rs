@@ -156,7 +156,7 @@ pub struct Config {
     pub tts: TtsConfig,
     /// "" = 默认水手服 / hoodie / pajama / idol / swim / xmas / maid / jk（见 core::costume）
     pub costume: String,
-    /// santa / glasses
+    /// 配饰列表（如 glasses=圆眼镜）
     pub outfit: Vec<String>,
     pub moyu: MoyuConfig,
     /// 天气城市（wttr.in 认的名字，如「北京」「Shanghai」）；空 = 按出口 IP 自动定位
@@ -188,7 +188,7 @@ const DOC_FIELDS: [(&str, &str); 8] = [
     ("_proxy说明", "留空=跟随系统代理；也可填 http://127.0.0.1:7890 这样的地址"),
     ("_userName说明", "哈基米怎么称呼你，留空就叫「你」"),
     ("_reminders说明", "喝水/起身提醒间隔（分钟，0=关闭）；offWork 下班提醒时间，留空=关闭"),
-    ("_outfit说明", "换装：costume 是整套衣服（空=默认奶白水手服，hoodie=原装卫衣，pajama=猫耳睡衣，idol=偶像演出服，swim=泳装，xmas=圣诞小红裙，maid=女仆装，jk=JK水手服）；outfit 是配件，可同时戴多个（santa=圣诞帽、glasses=圆眼镜）。右键「换装」里点就行"),
+    ("_outfit说明", "换装：costume 是整套衣服（空=默认奶白水手服，hoodie=原装卫衣，pajama=猫耳睡衣，idol=偶像演出服，swim=泳装，xmas=圣诞小红裙，maid=女仆装，jk=JK水手服）；outfit 是配饰（glasses=圆眼镜）。右键快捷面板里点就行"),
     ("_moyu说明", "摸鱼监督：前台窗口是视频/社交/购物/游戏（keywords 匹配窗口标题，processes 匹配进程名）连续 minutes 分钟就来催你；番茄钟期间 pomodoroMinutes 分钟就催。只在本机判断，不记录窗口标题。enabled=false 关闭"),
     ("_tts说明", "语音用小米 MiMo TTS。apiKey 填 MiMo 开放平台的 Key；mode: clone=固定哈基米声线（默认）/ preset=预置音色(voice 填 冰糖、茉莉)/ design=按 style 文字现设计；speak: all=所有气泡都念 / chat=只念聊天回复 / off；volume 说话音量 0~1；musicVolume 伴奏音量 0~1；muted 总静音"),
 ];
@@ -271,6 +271,7 @@ fn sanitize(c: &mut Config) {
     c.fps = clamp_fps(c.fps);
     c.tts.volume = clamp_unit(c.tts.volume, 0.9);
     c.tts.music_volume = clamp_unit(c.tts.music_volume, 0.8);
+    c.outfit.retain(|o| o == "glasses");
 }
 
 /// 帧率就近取 30 / 60 / 120
@@ -477,7 +478,7 @@ mod tests {
     #[test]
     fn merge_keeps_user_values_and_unknown_fields() {
         let c = parse(r#"{"apiKey":"k1","provider":"openai","myField":1,"_说明":"自定义",
-            "reminders":{"water":0},"tts":{"apiKey":"t1","volume":1,"custom":true},"moyu":{"enabled":false},"outfit":["santa"]}"#);
+            "reminders":{"water":0},"tts":{"apiKey":"t1","volume":1,"custom":true},"moyu":{"enabled":false},"outfit":["glasses","santa"]}"#);
         assert_eq!(c.api_key, "k1");
         assert_eq!(c.provider, "openai");
         assert_eq!(c.model, "gemini-2.5-flash");
@@ -488,7 +489,7 @@ mod tests {
         assert_eq!(c.tts.mode, "clone");
         assert!(!c.moyu.enabled);
         assert_eq!(c.moyu.minutes, 20);
-        assert_eq!(c.outfit, vec!["santa".to_string()]);
+        assert_eq!(c.outfit, vec!["glasses".to_string()]);
         assert_eq!(c.extra.get("myField"), Some(&Value::from(1)));
         assert_eq!(c.extra.get("_说明"), Some(&Value::from("自定义")));
         assert_eq!(c.tts.extra.get("custom"), Some(&Value::Bool(true)));
@@ -546,7 +547,7 @@ mod tests {
 
     #[test]
     fn bad_field_only_resets_that_field() {
-        let c = parse(r#"{"apiKey":"keep","model":123,"reminders":{"water":"x","standUp":30},"tts":null,"outfit":"santa"}"#);
+        let c = parse(r#"{"apiKey":"keep","model":123,"reminders":{"water":"x","standUp":30},"tts":null,"outfit":"glasses"}"#);
         assert_eq!(c.api_key, "keep");
         assert_eq!(c.model, "gemini-2.5-flash");
         assert_eq!(c.reminders.water, 45);

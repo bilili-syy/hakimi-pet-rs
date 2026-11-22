@@ -108,10 +108,9 @@ pub fn layers_for(face: Face, costume: &str, outfits: &[String]) -> Layers {
         "sailor" => sailor_layers(face),
         c => (costume_src(c, face), None),
     };
-    let hat = outfits.iter().any(|o| o == "santa");
     Layers {
         base,
-        star: l.is_some_and(|l| l.0) && !hat,
+        star: l.is_some_and(|l| l.0),
         tail: l.is_some_and(|l| l.1),
         outfit_offset: if outfits.is_empty() { None } else { outfit_offset(face) },
     }
@@ -275,8 +274,6 @@ mod tests {
         assert_eq!(layers_for(Face::Sleep, "", &["glasses".into()]).outfit_offset, None);
         assert_eq!(layers_for(Face::Sleepy, "", &["glasses".into()]).outfit_offset, None);
         assert_eq!(layers_for(Face::Cry, "", &["glasses".into()]).outfit_offset, None);
-        // 戴圣诞帽时藏星星
-        assert!(!layers_for(Face::Idle, "", &["santa".into()]).star);
     }
 
     #[test]
@@ -289,7 +286,7 @@ mod tests {
                 assert!(crate::assets::get(&l.base).is_some(), "{c} {}", l.base);
             }
         }
-        for p in [TAIL, STAR, "outfits/santa.png", "outfits/glasses.png"] {
+        for p in [TAIL, STAR, "outfits/glasses.png"] {
             assert!(crate::assets::get(p).is_some(), "{p}");
         }
     }
@@ -309,7 +306,6 @@ mod tests {
         assert!(l.star && !l.tail);
         assert_eq!(layers_for(Face::Honey, "sailor", &[]).base, "outfits/sailor/layered/eat.png");
         assert_eq!(layers_for(Face::Sleep, "sailor", &[]).base, "outfits/sailor/sleep.png");
-        assert!(!layers_for(Face::Idle, "sailor", &["santa".into()]).star);
         // 原装卫衣："" 和 "hoodie" 一样
         assert_eq!(layers_for(Face::Idle, "hoodie", &[]), layers_for(Face::Idle, "", &[]));
         assert_eq!(layers_for(Face::Shy, "hoodie", &[]).base, "sprites/shy.png");
