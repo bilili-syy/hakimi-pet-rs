@@ -1,5 +1,7 @@
 # 哈基米桌宠 🐱
 
+[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-Community-1F2328?style=flat&logo=discourse&logoColor=white)](https://linux.do)
+
 一只住在 Windows 桌面上的哈基米：会走、会睡、会撒娇，能陪你聊天、用自己的声音说话，还会提醒你喝水、下班和备忘事项。
 
 纯 Rust 编写，单个 exe，约 15 MB，常驻占用很低（60 帧下约一个 CPU 核的 1–2%）。
@@ -87,3 +89,7 @@ cargo build --release
 主要模块：`src/behavior`（行为和状态机）、`src/render`（tiny-skia 软渲染、分层窗口）、`src/services`（AI、TTS、音频）、`src/platform`（Win32 窗口、菜单、设置页、场景感知）、`src/core`（配置、存档、备忘、记忆）。
 
 调试：设置环境变量 `HAKIMI_TRACE=1` 会在日志里输出帧率、状态切换和语音延迟。
+
+## 社区与致谢
+
+本项目认可并感谢 [LINUX DO](https://linux.do) 社区的开源分享精神与支持，欢迎各位佬友在社区与仓库中交流使用体验、提交建议或参与贡献。
