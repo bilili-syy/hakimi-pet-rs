@@ -1,16 +1,33 @@
 # 哈基米桌宠 🐱
 
+[![GitHub Release](https://img.shields.io/github/v/release/bilili-syy/hakimi-pet-rs?color=F59E0B&label=Release)](https://github.com/bilili-syy/hakimi-pet-rs/releases/latest)
+[![Platform](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D6?style=flat&logo=windows&logoColor=white)](https://github.com/bilili-syy/hakimi-pet-rs/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/bilili-syy/hakimi-pet-rs/blob/main/LICENSE)
 [![LINUX DO](https://img.shields.io/badge/LINUX%20DO-Community-1F2328?style=flat&logo=discourse&logoColor=white)](https://linux.do)
 
 一只住在 Windows 桌面上的哈基米：会走、会睡、会撒娇，能陪你聊天、用自己的声音说话，还会提醒你喝水、下班和备忘事项。
 
-纯 Rust 编写，单个 exe，约 15 MB，常驻占用很低（60 帧下约一个 CPU 核的 1–2%）。
+纯 Rust + 原生 Win32 编写，单个免安装 `.exe`（约 **19 MB**，其中约 15 MB 为内置 180+ 张立绘与近 400 条离线语音），实测常驻私有内存仅约 **19 MB**、日常动画 CPU 不到 **1%**（全屏游戏/视频自动挂起）。
+
+![哈基米桌宠桌面实机总览](docs/images/hero-desktop.png)
 
 ## 下载
 
-到 [Releases](https://github.com/bilili-syy/hakimi-pet-rs/releases) 下载最新的 `hakimi-pet-vX.Y.Z-windows-x64.exe`，双击运行即可，不用安装。支持 Windows 10 / 11（64 位）。
+到 [Releases](https://github.com/bilili-syy/hakimi-pet-rs/releases/latest) 下载最新的 `hakimi-pet-vX.Y.Z-windows-x64.exe`，双击运行即可，不用安装。支持 Windows 10 / 11（64 位）。
 
 > 第一次运行时 Windows 可能弹出「已保护你的电脑」，点「更多信息 → 仍要运行」。
+
+## 实机预览
+
+### 奶油快捷面板 & 独立音量控制
+右键桌宠直接展开扁平奶油面板，支持 2×4 常用互动一键直达、连点衣橱换装不关面板、语音/音乐独立双滑块（以及悬停 `Ctrl + 滚轮` 盲调音量）；托盘与菜单内置 **「🔄 检查更新」** 并支持启动后台静默检测新版本。
+
+![奶油快捷面板与功能亮点](docs/images/quick-panel-showcase.png)
+
+### 8 套穿搭 & 32 种灵动表情
+内置水手服、原装卫衣、猫耳睡衣、女仆装、JK 水手服、偶像演出服、泳装、圣诞小红裙与圆眼镜配饰，还支持将自定义立绘打成 `.zip` 角色包直接拖到桌宠身上热切换。
+
+![全套 8 款穿搭与代表表情图鉴](docs/images/outfits-gallery.png)
 
 ## 能做什么
 
