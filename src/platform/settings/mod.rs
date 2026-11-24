@@ -984,6 +984,15 @@ impl Dlg {
         set_checked(self.c(ID_STREAM_PRIVACY), c.stream_privacy);
         self.update_roast();
         self.update_coding_hooks(None);
+        if let Some(info) = crate::services::update::cached_newer() {
+            UPDATE_FOUND.store(true, Ordering::Relaxed);
+            set_text(self.c(ID_UPDATE), "去下载新版本");
+            set_text(self.c(ID_UPDATE_RESULT), &format!("有新版本 {}！点按钮去下载", info.tag));
+        } else {
+            UPDATE_FOUND.store(false, Ordering::Relaxed);
+            set_text(self.c(ID_UPDATE), "检查更新");
+            set_text(self.c(ID_UPDATE_RESULT), &format!("当前版本 v{}", crate::services::update::CURRENT));
+        }
         combo_set(self.c(ID_SCALE), nearest_scale(c.scale));
         combo_set(self.c(ID_FPS), FPS.iter().position(|x| x.0 == crate::core::config::clamp_fps(c.fps)).unwrap_or(1));
         set_text(self.c(ID_CITY), &c.weather_city);
@@ -1555,7 +1564,10 @@ fn destroy(hwnd: HWND) {
 fn start_update(hwnd: HWND) {
     // 已经查到新版本：再点一次就打开下载页
     if UPDATE_FOUND.load(Ordering::Relaxed) {
-        super::sys::open_url(crate::services::update::RELEASES_URL);
+        let url = crate::services::update::cached_newer()
+            .map(|r| r.url)
+            .unwrap_or_else(|| crate::services::update::RELEASES_URL.to_string());
+        super::sys::open_url(&url);
         return;
     }
     let Some(tag) = with(|d| {
@@ -1569,12 +1581,12 @@ fn start_update(hwnd: HWND) {
     let h = hwnd.0 as isize;
     let spawned = std::thread::Builder::new().name("hakimi-update".into()).spawn(move || {
         let cur = crate::services::update::CURRENT;
-        let (ok, text) = match crate::services::update::check() {
-            Ok((t, true)) => {
+        let (ok, text) = match crate::services::update::check_info() {
+            Ok(chk) if chk.newer => {
                 UPDATE_FOUND.store(true, Ordering::Relaxed);
-                (true, format!("有新版本 {t}！再点一次去下载"))
+                (true, format!("有新版本 {}！再点一次去下载", chk.info.tag))
             }
-            Ok((_, false)) => (true, format!("v{cur} 已经是最新版")),
+            Ok(_) => (true, format!("v{cur} 已经是最新版")),
             Err(e) => (false, format!("✘ {e}")),
         };
         post_result(h, ID_UPDATE_RESULT, tag, ok, text);
@@ -1709,7 +1721,10 @@ fn on_results() {
             if id == ID_UPDATE_RESULT {
                 if tag == d.update_gen {
                     set_text(d.c(id), &text);
-                    if UPDATE_FOUND.load(Ordering::Relaxed) { set_text(d.c(ID_UPDATE), "去下载新版本"); }
+                    if UPDATE_FOUND.load(Ordering::Relaxed) {
+                        set_text(d.c(ID_UPDATE), "去下载新版本");
+                        super::menu::refresh();
+                    }
                     enable(d.c(ID_UPDATE), true);
                 }
                 continue;

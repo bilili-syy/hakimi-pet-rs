@@ -124,6 +124,7 @@ pub const MENU: &[Node] = &[
     Sep,
     Sub(VOLUME_TITLE, VOLUME),
     Item("settings", "⚙️ 设置…"),
+    Item("update", "🔄 检查更新"),
     Item("visible", "🙈 先藏起来"),
     Item("quit", "退出"),
 ];
@@ -150,6 +151,8 @@ pub struct Ctx {
     pub music_pct: u8,
     /// 是否处于一键总静音
     pub muted: bool,
+    /// 已检测到可更新的新版本 tag（如 "v1.5.0"）
+    pub update_tag: Option<String>,
 }
 
 /// 勾选项现在该不该勾
@@ -198,6 +201,10 @@ pub fn label(id: &str, c: &Ctx) -> Option<String> {
         TOOLS_TITLE => Some(match c.pomo_left {
             Some(m) => format!("🧰 工具（🍅 剩 {m} 分钟）"),
             None => TOOLS_TITLE.into(),
+        }),
+        "update" => Some(match &c.update_tag {
+            Some(tag) => format!("🆕 发现新版本 {tag}（去下载）"),
+            None => format!("🔄 检查更新（当前 v{}）", crate::services::update::CURRENT),
         }),
         _ => None,
     }
@@ -440,6 +447,7 @@ fn ctx_now() -> Ctx {
         voice_pct,
         music_pct,
         muted,
+        update_tag: crate::services::update::cached_newer().map(|r| r.tag),
     }
 }
 
@@ -466,9 +474,10 @@ pub fn refresh() {
             }
         }
         if let Some(t) = &m.tray {
-            let tip = match c.pomo_left {
-                Some(m) => format!("哈基米 · 🍅 番茄钟还剩 {m} 分钟（双击打开设置）"),
-                None => "哈基米（双击打开设置）".into(),
+            let tip = match (&c.update_tag, c.pomo_left) {
+                (Some(tag), _) => format!("哈基米 · 🆕 有新版本 {tag}（右键检查更新）"),
+                (None, Some(m)) => format!("哈基米 · 🍅 番茄钟还剩 {m} 分钟（双击打开设置）"),
+                (None, None) => "哈基米（双击打开设置）".into(),
             };
             let _ = t.set_tooltip(Some(&tip));
         }
@@ -550,6 +559,7 @@ pub fn parse_id(id: &str, checked: impl Fn(&str) -> bool) -> Option<MenuAction> 
         "pomo:stop" => A::PomodoroStop,
         "outfit:clear" => A::ClearOutfit,
         "settings" | "settings:open" => A::OpenSettings,
+        "update" => A::CheckUpdate,
         "settings:file" => A::OpenConfigFile,
         "settings:reload" => A::ReloadSettings,
         "tts" => A::Tts(checked(id)),
@@ -634,9 +644,9 @@ mod tests {
             assert!(seen.insert(id.clone()), "duplicate menu id {id}");
             assert!(parse_id(id, |_| false).is_some(), "menu id {id} has no action");
         }
-        // 顶层（不算分隔线）不超过 11 项
+        // 顶层（不算分隔线）不超过 12 项
         let top = MENU.iter().filter(|n| !matches!(n, Sep)).count();
-        assert!(top <= 11, "top level has {top} entries");
+        assert!(top <= 12, "top level has {top} entries");
         // 换装表和 COSTUMES / OUTFITS 一致
         for (c, _) in crate::core::costume::COSTUMES {
             assert!(ids.contains(&format!("costume:{c}")));
@@ -680,7 +690,13 @@ mod tests {
             voice_pct: 75,
             music_pct: 75,
             muted: false,
+            update_tag: None,
         };
+        assert_eq!(parse_id("update", |_| false), Some(A::CheckUpdate));
+        assert!(label("update", &c).unwrap().contains("检查更新"));
+        c.update_tag = Some("v9.9.9".into());
+        assert_eq!(label("update", &c).unwrap(), "🆕 发现新版本 v9.9.9（去下载）");
+        c.update_tag = None;
         assert!(checked("vol:75", &c) && !checked("vol:50", &c) && !checked("vol:mute", &c));
         assert_eq!(label(VOLUME_TITLE, &c).unwrap(), "🔊 音量（75%）");
         c.muted = true;

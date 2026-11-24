@@ -141,6 +141,8 @@ pub enum MenuAction {
     VolumeMute(bool),
     /// 快捷音量预设（0..=100，同时设语音与音乐音量并解除静音）
     VolumePreset(u8),
+    /// 「🔄 检查更新」：后台检查 GitHub 最新 Release 并弹窗提示下载
+    CheckUpdate,
 }
 
 // ---------------------------------------------------------------- 事件

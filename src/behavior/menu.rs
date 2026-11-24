@@ -155,7 +155,7 @@ impl Behavior {
             // 平台层自己处理：番茄钟（会发 AppEvent::Pomodoro）、叫到中间（还会发 Peek）、
             // 打开文件/文件夹、自启、退出（会调 Handler::quit）
             MenuAction::PomodoroStart(_) | MenuAction::PomodoroStop | MenuAction::OpenSongDir | MenuAction::OpenSettings
-            | MenuAction::OpenConfigFile
+            | MenuAction::OpenConfigFile | MenuAction::CheckUpdate
             | MenuAction::OpenDataDir | MenuAction::AutoStart(_)
             | MenuAction::Quit => {}
         }

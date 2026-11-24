@@ -41,7 +41,7 @@ use chat::Chat;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use timers::{LocalTime, Pomodoro, Reminders};
 use watch::Supervisor;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -62,6 +62,7 @@ pub(crate) const WM_APP_SECOND: u32 = WM_APP + 3;
 const WM_APP_DPI: u32 = WM_APP + 4;
 const WM_APP_CLEAR_MIND: u32 = WM_APP + 5;
 const WM_APP_IMPORT_SKIN: u32 = WM_APP + 6;
+const WM_APP_UPDATE: u32 = WM_APP + 7;
 /// 自动化/自测用：PostMessage(hwnd, WM_APP+9, i, 0) 等于点了 DEBUG_MENU[i] 那个菜单项
 const WM_APP_DEBUG_MENU: u32 = WM_APP + 9;
 /// 10 = 打开设置窗口，11 = 打开聊天框，12 = 导入角色包(.zip)，13 = 切回内置哈基米，14 = 打开音量调节条
@@ -101,6 +102,9 @@ static SCALE_BITS: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0f32
 static DPI_BITS: AtomicU32 = AtomicU32::new(0x3f80_0000);
 static EVENT_QUEUE: Mutex<VecDeque<AppEvent>> = Mutex::new(VecDeque::new());
 pub(crate) static MENU_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static UPDATE_QUEUE: Mutex<VecDeque<(bool, Result<crate::services::update::UpdateCheck, String>)>> =
+    Mutex::new(VecDeque::new());
+static UPDATE_CHECKING: AtomicBool = AtomicBool::new(false);
 /// 番茄钟结束时间（GetTickCount64 单调毫秒，计入睡眠/休眠时间），0 = 没开
 static POMO_END: AtomicU64 = AtomicU64::new(0);
 static MOYU_TODAY_SEC: AtomicU32 = AtomicU32::new(0);
@@ -362,6 +366,7 @@ pub fn run(make: impl FnOnce(EventSender) -> Box<dyn Handler>) {
     roast::sync_hotkey(hwnd);
     hrtimer::init();
     rearm();
+    spawn_startup_update_check();
 
     unsafe {
         let mut msg = MSG::default();
@@ -873,6 +878,7 @@ fn after(a: MenuAction) {
         }
         MenuAction::AutoStart(on) => sys::set_autostart(on),
         MenuAction::OpenSettings => settings::open(0),
+        MenuAction::CheckUpdate => trigger_update_check(true),
         MenuAction::OpenConfigFile => {
             let f = crate::core::paths::config_file();
             if !f.exists() {
@@ -953,6 +959,122 @@ fn after(a: MenuAction) {
     }
     menu::refresh();
     quick_panel::sync_if_open();
+}
+
+/// 启动后后台静默检查一次更新（失败不打扰；发现新版本自动刷新托盘/菜单与设置页提示）
+fn spawn_startup_update_check() {
+    let _ = std::thread::Builder::new().name("hakimi-update-boot".into()).spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(12));
+        if main_hwnd().is_none() {
+            return;
+        }
+        trigger_update_check(false);
+    });
+}
+
+/// 发起检查更新；manual = true 时弹出中文结果对话框，false 时仅静默更新菜单/托盘提示
+pub(crate) fn trigger_update_check(manual: bool) {
+    if manual && let Some(info) = crate::services::update::cached_newer() {
+        UPDATE_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((true, Ok(crate::services::update::UpdateCheck { info, newer: true })));
+        if let Some(h) = main_hwnd() {
+            unsafe {
+                let _ = PostMessageW(Some(h), WM_APP_UPDATE, WPARAM(0), LPARAM(0));
+            }
+        }
+        return;
+    }
+    if UPDATE_CHECKING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("hakimi-update-check".into()).spawn(move || {
+        let res = crate::services::update::check_info();
+        UPDATE_CHECKING.store(false, Ordering::Release);
+        UPDATE_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push_back((manual, res));
+        if let Some(h) = main_hwnd() {
+            unsafe {
+                let _ = PostMessageW(Some(h), WM_APP_UPDATE, WPARAM(0), LPARAM(0));
+            }
+        }
+    });
+    if spawned.is_err() {
+        UPDATE_CHECKING.store(false, Ordering::Release);
+    }
+}
+
+fn on_update_results() {
+    let items: Vec<_> = UPDATE_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+    for (manual, res) in items {
+        menu::refresh();
+        let owner = main_hwnd();
+        let cur = crate::services::update::CURRENT;
+        match res {
+            Ok(chk) if chk.newer => {
+                crate::core::log::log(&format!("update available: {} (current v{})", chk.info.tag, cur));
+                if manual {
+                    let body = if chk.info.notes.is_empty() {
+                        format!(
+                            "发现新版本 {}（当前 v{}）！\n\n是否现在打开 GitHub Releases 下载最新版？",
+                            chk.info.tag, cur
+                        )
+                    } else {
+                        format!(
+                            "发现新版本 {}（当前 v{}）！\n\n更新内容：\n{}\n\n是否现在打开 GitHub Releases 下载最新版？",
+                            chk.info.tag, cur, chk.info.notes
+                        )
+                    };
+                    let title = sys::wide("哈基米桌宠 · 发现新版本");
+                    let msg = sys::wide(&body);
+                    let r = unsafe {
+                        MessageBoxW(
+                            owner,
+                            windows::core::PCWSTR(msg.as_ptr()),
+                            windows::core::PCWSTR(title.as_ptr()),
+                            MB_YESNO | MB_ICONINFORMATION,
+                        )
+                    };
+                    if r == IDYES {
+                        sys::open_url(&chk.info.url);
+                    }
+                }
+            }
+            Ok(chk) => {
+                if manual {
+                    let body = format!("当前 v{cur} 已经是最新版本啦（GitHub 最新：{}）。", chk.info.tag);
+                    let title = sys::wide("哈基米桌宠 · 检查更新");
+                    let msg = sys::wide(&body);
+                    unsafe {
+                        let _ = MessageBoxW(
+                            owner,
+                            windows::core::PCWSTR(msg.as_ptr()),
+                            windows::core::PCWSTR(title.as_ptr()),
+                            MB_OK | MB_ICONINFORMATION,
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                if manual {
+                    let body = format!("检查更新失败：{e}\n\n是否直接打开 GitHub Releases 页面手动查看？");
+                    let title = sys::wide("哈基米桌宠 · 检查更新");
+                    let msg = sys::wide(&body);
+                    let r = unsafe {
+                        MessageBoxW(
+                            owner,
+                            windows::core::PCWSTR(msg.as_ptr()),
+                            windows::core::PCWSTR(title.as_ptr()),
+                            MB_YESNO | MB_ICONWARNING,
+                        )
+                    };
+                    if r == IDYES {
+                        sys::open_url(crate::services::update::RELEASES_URL);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 弹出 .zip 选择框（支持测试环境变量 `HAKIMI_IMPORT_ZIP_PATH` 免弹窗注入）
@@ -1693,6 +1815,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(p) = pick_skin_zip(main_hwnd()) {
                     import_skin_zip_and_activate(&p);
                 }
+                LRESULT(0)
+            }
+            WM_APP_UPDATE => {
+                on_update_results();
                 LRESULT(0)
             }
             WM_DROPFILES => {
